@@ -51,11 +51,18 @@ function fmtUsd(n){
   if(abs>=1000) return (n<0?'-':'')+'$'+(abs/1000).toFixed(2)+'K';
   return (n<0?'-':'')+'$'+abs.toFixed(abs<1?4:2);
 }
+const SUBSCRIPT_DIGITS = {'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉'};
 function fmtPrice(p){
-  if(!p||isNaN(p)) return '$0.00';
+  if(!p||isNaN(p)||p<=0) return '$0.00';
   if(p>=1) return '$'+p.toFixed(4);
-  if(p>=0.0001) return '$'+p.toFixed(6);
-  return '$'+p.toExponential(2);
+  if(p>=0.01) return '$'+p.toFixed(4);
+  const exp = Math.floor(Math.log10(p));         // e.g. -8 for 3e-8
+  const leadingZeros = -exp - 1;                  // zeros between the decimal point and first sig. digit
+  if(leadingZeros <= 3) return '$'+p.toFixed(6);   // still readable without special notation
+  const mantissa = p / Math.pow(10, exp);          // 1.000–9.999
+  const sig = mantissa.toFixed(1).replace('.','');  // 2 significant digits, e.g. "30" for 3.0
+  const zeroStr = String(leadingZeros).split('').map(d=>SUBSCRIPT_DIGITS[d]).join('');
+  return `$0.0${zeroStr}${sig}`;                    // e.g. $0.0₇30
 }
 function fmtTok(n){
   if(n===undefined||n===null||isNaN(n)) n=0;
@@ -97,6 +104,26 @@ function esc(s){ const d=document.createElement('div'); d.textContent = s==null?
 function priceOf(coin){ return coin.solReserve / coin.tokenReserve; }
 function marketCapOf(coin){ return priceOf(coin) * INITIAL_TOKEN_RESERVE; }
 function circulatingOf(coin){ return INITIAL_TOKEN_RESERVE - coin.tokenReserve; }
+
+// Standard constant-product swap math, computed directly from current reserves rather than
+// via newSol = coin.solReserve+v; newTok = K/newSol; tokensOut = coin.tokenReserve-newTok.
+// That older approach subtracted two huge nearly-equal numbers (both ~1e9) to get a tiny
+// difference, which loses almost all precision in floating point — small trades would come
+// back as effectively 0 tokens and get rejected as "too small" even though $0.01 is a
+// perfectly valid trade. This formula computes the output directly with no cancellation.
+function ammBuy(coin, usdAmount){
+  const tokensOut = (coin.tokenReserve * usdAmount) / (coin.solReserve + usdAmount);
+  const newSol = coin.solReserve + usdAmount;
+  const newTok = coin.tokenReserve - tokensOut;
+  return { tokensOut, newSol, newTok, newPrice: newSol/newTok };
+}
+function ammSell(coin, tokenAmount){
+  const usdOut = (coin.solReserve * tokenAmount) / (coin.tokenReserve + tokenAmount);
+  const newTok = coin.tokenReserve + tokenAmount;
+  const newSol = coin.solReserve - usdOut;
+  return { usdOut, newSol, newTok, newPrice: newSol/newTok };
+}
+
 function pctChange(history){
   if(!history || history.length<2) return 0;
   const first = history[0].p, last = history[history.length-1].p;
@@ -517,20 +544,16 @@ async function wireTradePanel(coin){
     if(updatedCoin) liveCoin = updatedCoin;
     const v = parseFloat(input.value)||0;
     state.tradeAmount = v;
+    if(v<=0){ estOut.textContent = state.tradeMode==='buy'? ('0 '+liveCoin.ticker) : '$0.00'; estImpact.textContent='0.00%'; return; }
     if(state.tradeMode==='buy'){
-      const newSol = liveCoin.solReserve+v;
-      const newTok = K/newSol;
-      const tokensOut = liveCoin.tokenReserve-newTok;
+      const { tokensOut, newPrice } = ammBuy(liveCoin, v);
       estOut.textContent = fmtTok(Math.max(0,tokensOut))+' '+liveCoin.ticker;
-      const oldPrice = priceOf(liveCoin), newPrice = newSol/newTok;
+      const oldPrice = priceOf(liveCoin);
       estImpact.textContent = (oldPrice? (((newPrice-oldPrice)/oldPrice)*100).toFixed(2):'0.00')+'%';
     } else {
-      const tokIn = v;
-      const newTok = liveCoin.tokenReserve+tokIn;
-      const newSol = K/newTok;
-      const usdOut = liveCoin.solReserve-newSol;
+      const { usdOut, newPrice } = ammSell(liveCoin, v);
       estOut.textContent = fmtUsd(Math.max(0,usdOut));
-      const oldPrice = priceOf(liveCoin), newPrice = newSol/newTok;
+      const oldPrice = priceOf(liveCoin);
       estImpact.textContent = (oldPrice? (((newPrice-oldPrice)/oldPrice)*100).toFixed(2):'0.00')+'%';
     }
   }
@@ -633,11 +656,8 @@ async function doBuy(coinId, usdAmount){
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
       if(user.balance < usdAmount) throw new Error("You don't have enough balance.");
-      const newSol = coin.solReserve + usdAmount;
-      const newTok = K / newSol;
-      const tokensOut = coin.tokenReserve - newTok;
-      if(tokensOut<=0) throw new Error('Trade too small.');
-      const newPrice = newSol/newTok;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
+      if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
@@ -666,11 +686,8 @@ async function doSell(coinId, tokenAmount){
       const user = userSnap.data(); const coin = coinSnap.data();
       const owned = holdSnap.exists()? holdSnap.data().tokens:0;
       if(tokenAmount > owned+0.0000001) throw new Error("You don't own that many tokens.");
-      const newTok = coin.tokenReserve + tokenAmount;
-      const newSol = K / newTok;
-      const usdOut = coin.solReserve - newSol;
-      if(usdOut<=0) throw new Error('Trade too small.');
-      const newPrice = newSol/newTok;
+      const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
+      if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
@@ -706,10 +723,8 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coinSnap = await tx.get(coinRef);
       if(!coinSnap.exists()) return;
       const coin = coinSnap.data();
-      const newSol = coin.solReserve + usdAmount;
-      const newTok = K / newSol;
-      const tokensOut = coin.tokenReserve - newTok;
-      if(tokensOut<=0) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
+      if(!(tokensOut>0)) return;
       const newPrice = newSol/newTok;
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
