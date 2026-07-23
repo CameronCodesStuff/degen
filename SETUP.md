@@ -36,7 +36,9 @@ service cloud.firestore {
     }
 
     match /usernames/{name} {
-      allow read: if isSignedIn();
+      // must be public: the app checks username availability BEFORE the
+      // user is signed in, so isSignedIn() here would block every signup
+      allow read: if true;
       allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
       allow update, delete: if false;
     }
@@ -68,9 +70,16 @@ Drop all three files (`index.html`, `style.css`, `script.js`) into a GitHub Page
 ---
 
 ## How the exchange actually works
-- Every coin launches with a **virtual bonding curve** (constant-product AMM, same style pump.fun uses): $30 virtual liquidity vs. 1B token supply.
+- Every coin launches with a **virtual bonding curve** (constant-product AMM, same style pump.fun uses): $4,200 virtual liquidity vs. 1B token supply, giving a realistic ~$4K starting market cap instead of ballooning wildly on the first trade.
 - Price = liquidity ÷ tokens remaining in the curve. As people buy, liquidity goes up and tokens in the curve go down, so price rises — and vice versa on sells.
-- There are **no bots and no scheduled price changes** — a coin's price only ever moves when a real user submits a buy or sell.
-- Coins "graduate" 🎓 cosmetically once market cap crosses $69,000 (just a fun badge, no extra mechanics).
+- Coins "graduate" 🎓 cosmetically once market cap crosses $69,000 (a nod to pump.fun's real graduation threshold — just a badge here, no extra mechanics).
 - Launching a coin costs a $5 fee (from the $100 starting balance) to discourage spam.
 - Avatars and coin logos are plain image URLs — paste a link to any hosted image (e.g. Imgur), or leave it blank for an auto-generated default.
+- The chart has **1m / 1h / 1d / all** ranges and updates live in place (no page flicker, no losing whatever you were typing in the buy/sell box) whenever anyone trades.
+
+### Bots
+There's no server here — it's a static site on Firestore — so "bots" are simulated trades that any currently-open browser tab occasionally submits under fake trader names (whale_watcher, ape_annie, etc.), targeting coins launched in the last ~8 minutes:
+- ~22% chance per coin per 14s tick: a small bot buy ($4–$44)
+- ~3.5% chance: a big "explosion" buy ($300–$1,200) that spikes the price hard
+- Bots never touch a real user's balance or holdings — they only move a coin's own price curve, and they leave a 🤖 marker in the trade feed so it's clear it wasn't a real trader.
+- Because this runs client-side, bot activity only happens while at least one browser tab has the app open. That's a real limitation of a no-backend/no-Cloud-Functions setup — if you want bots to run 24/7 even with nobody online, that logic would need to move to a scheduled Cloud Function instead.

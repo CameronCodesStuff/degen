@@ -5,7 +5,7 @@ import {
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
 import {
   getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection,
-  query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField
+  query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyCMDe_UPrNTjKnEoO2ngTe7wE6P7_G06ms",
@@ -22,9 +22,13 @@ const db = getFirestore(app);
 /* ===================== CONSTANTS ===================== */
 const STARTING_BALANCE = 100;
 const CREATE_FEE = 5;
-const INITIAL_SOL_RESERVE = 30;       // virtual "liquidity" seed
+// Market cap on a constant-product curve works out to marketCap = solReserve^2 / INITIAL_SOL_RESERVE.
+// With too little starting liquidity (the old $30), a single small buy could 5-10x the market cap
+// instantly, which read as "broken". $4,200 gives a realistic ~$4K starting mcap (like a freshly
+// launched real memecoin) and means a normal $20-100 trade only moves mcap a few percent.
+const INITIAL_SOL_RESERVE = 4200;     // virtual "liquidity" seed (USD)
 const INITIAL_TOKEN_RESERVE = 1_000_000_000; // 1B token supply per coin
-const GRAD_MARKET_CAP = 69000;        // fun homage threshold
+const GRAD_MARKET_CAP = 69000;        // fun homage threshold — pump.fun's real graduation mcap
 const K = INITIAL_SOL_RESERVE * INITIAL_TOKEN_RESERVE;
 
 /* ===================== STATE ===================== */
@@ -178,10 +182,12 @@ onAuthStateChanged(auth, async (user)=>{
     listenUserDoc();
     listenTickerTape();
     navigate('home');
+    startBots();
   } else {
     state.uid = null; state.userDoc = null;
     document.getElementById('app').classList.add('hidden');
     document.getElementById('authScreen').classList.remove('hidden');
+    stopBots();
   }
 });
 
@@ -313,29 +319,34 @@ function renderCoinGrid(coins){
 }
 
 /* ===================== COIN DETAIL ===================== */
-let coinUnsub = null, chartRange='all';
+let coinUnsub = null, chartRange='1h', shellCoinId=null, currentRecalc=null;
 function renderCoinDetail(coinId){
   if(coinUnsub) coinUnsub();
-  state.tradeMode='buy'; state.tradeAmount=0;
+  if(state.chart){ state.chart.destroy(); state.chart=null; }
+  state.tradeMode='buy'; state.tradeAmount=0; shellCoinId=null; currentRecalc=null;
   const view = document.getElementById('view');
   view.innerHTML = `<div class="spinner" style="margin-top:60px;"></div>`;
   coinUnsub = onSnapshot(doc(db,'coins',coinId), snap=>{
     if(!snap.exists()){ view.innerHTML = `<div class="empty"><div class="em-ic">💀</div>This coin no longer exists.</div>`; return; }
     const coin = {id:snap.id, ...snap.data()};
     state.coinsCache.set(coin.id, coin);
-    paintCoinDetail(coin);
+    if(shellCoinId !== coin.id){
+      shellCoinId = coin.id;
+      buildCoinDetailShell(coin); // full DOM build — only happens once per coin visit
+    } else {
+      updateCoinDetailLive(coin); // cheap in-place refresh — keeps inputs/focus intact
+    }
   });
   state.unsubs.push(coinUnsub);
 }
 
-function paintCoinDetail(coin){
+function buildCoinDetailShell(coin){
   const view = document.getElementById('view');
   const price = priceOf(coin);
   const chg = pctChange(coin.priceHistory||[]);
   const up = chg>=0;
   const mc = marketCapOf(coin);
   const gradPct = Math.min(100, (mc/GRAD_MARKET_CAP)*100);
-  const isOwn = coin.creatorUid===state.uid;
   const trades = (coin.recentTrades||[]).slice().reverse();
 
   view.innerHTML = `
@@ -345,29 +356,30 @@ function paintCoinDetail(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker">$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}</div>
             <div class="detail-name">${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}</div>
           </div>
         </div>
         <div class="price-row">
           <div class="price-big mono" id="livePrice">${fmtPrice(price)}</div>
-          <div class="coin-chg ${up?'up':'down'}">${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%</div>
+          <div class="coin-chg ${up?'up':'down'}" id="liveChg">${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%</div>
+          <span style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--txt-faint);"><span style="width:7px;height:7px;border-radius:50%;background:var(--lime);display:inline-block;animation:spin 2s linear infinite;"></span>LIVE</span>
         </div>
         <div class="panel">
           <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-            <div><div style="font-size:11.5px;color:var(--txt-dim);">MARKET CAP</div><div class="mono" style="font-weight:600;">${fmtUsd(mc)}</div></div>
+            <div><div style="font-size:11.5px;color:var(--txt-dim);">MARKET CAP</div><div class="mono" style="font-weight:600;" id="liveMcap">${fmtUsd(mc)}</div></div>
             <div><div style="font-size:11.5px;color:var(--txt-dim);">SUPPLY</div><div class="mono" style="font-weight:600;">${fmtTok(INITIAL_TOKEN_RESERVE)}</div></div>
-            <div><div style="font-size:11.5px;color:var(--txt-dim);">HOLDERS TRADED</div><div class="mono" style="font-weight:600;">${(coin.tradeCount||0)}</div></div>
+            <div><div style="font-size:11.5px;color:var(--txt-dim);">TRADES</div><div class="mono" style="font-weight:600;" id="liveTradeCount">${(coin.tradeCount||0)}</div></div>
           </div>
           <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
           <div class="range-row" id="rangeRow">
-            ${['1H','1D','ALL'].map(r=>`<div class="range-btn ${r.toLowerCase()===chartRange?'active':''}" data-range="${r.toLowerCase()}">${r}</div>`).join('')}
+            ${['1M','1H','1D','ALL'].map(r=>`<div class="range-btn ${r.toLowerCase()===chartRange?'active':''}" data-range="${r.toLowerCase()}">${r}</div>`).join('')}
           </div>
-          <div style="margin-top:14px;">
+          <div style="margin-top:14px;" id="gradWrap">
             <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--txt-dim);margin-bottom:4px;">
-              <span>Bonding curve progress</span><span>${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K</span>
+              <span>Bonding curve progress</span><span id="gradPctText">${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K</span>
             </div>
-            <div class="progress-track"><div class="progress-fill" style="width:${gradPct}%"></div></div>
+            <div class="progress-track"><div class="progress-fill" id="gradFill" style="width:${gradPct}%"></div></div>
           </div>
         </div>
 
@@ -377,19 +389,13 @@ function paintCoinDetail(coin){
           <div class="meta-row">
             <span class="meta-tag">🎟️ ${esc(coin.ticker)}</span>
             <span class="meta-tag">👤 @${esc(coin.creatorUsername)}</span>
-            <span class="meta-tag">💧 Virtual liquidity ${fmtUsd(coin.solReserve)}</span>
+            <span class="meta-tag" id="liveLiquidity">💧 Virtual liquidity ${fmtUsd(coin.solReserve)}</span>
           </div>
         </div>
 
         <div class="panel" style="margin-top:16px;">
           <div style="font-weight:700;margin-bottom:10px;">Recent Trades</div>
-          ${trades.length? trades.slice(0,12).map(t=>`
-            <div class="holder-line">
-              <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
-              <span>@${esc(t.username)}</span>
-              <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
-              <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
-            </div>`).join('') : '<div class="empty" style="padding:20px;">No trades yet — be the first!</div>'}
+          <div id="recentTradesList">${recentTradesHtml(trades)}</div>
         </div>
       </div>
 
@@ -399,20 +405,65 @@ function paintCoinDetail(coin){
             <div class="trade-tab buy ${state.tradeMode==='buy'?'active':''}" data-mode="buy">Buy</div>
             <div class="trade-tab sell ${state.tradeMode==='sell'?'active':''}" data-mode="sell">Sell</div>
           </div>
-          ${state.tradeMode==='buy'? buyPanelHtml(coin) : sellPanelHtml(coin)}
+          <div id="tradePanelInner">${state.tradeMode==='buy'? buyPanelHtml(coin) : sellPanelHtml(coin)}</div>
         </div>
       </div>
     </div>
   `;
 
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('home'));
-  drawChart(coin);
+  drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
-    b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin); });
+    b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin, true); });
   });
   document.querySelectorAll('.trade-tab').forEach(t=>{
-    t.addEventListener('click', ()=>{ state.tradeMode=t.dataset.mode; state.tradeAmount=0; paintCoinDetail(coin); });
+    t.addEventListener('click', ()=>{ state.tradeMode=t.dataset.mode; state.tradeAmount=0; rebuildTradePanel(coin); });
   });
+  wireTradePanel(coin);
+}
+
+function recentTradesHtml(trades){
+  if(!trades.length) return '<div class="empty" style="padding:20px;">No trades yet — be the first!</div>';
+  return trades.slice(0,14).map(t=>`
+    <div class="holder-line">
+      <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
+      <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}</span>
+      <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
+      <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
+    </div>`).join('');
+}
+
+// Cheap refresh used on every live snapshot after the shell already exists.
+// Never touches the trade amount input, so typing isn't interrupted by other users' trades.
+function updateCoinDetailLive(coin){
+  const price = priceOf(coin);
+  const chg = pctChange(coin.priceHistory||[]);
+  const up = chg>=0;
+  const mc = marketCapOf(coin);
+  const gradPct = Math.min(100, (mc/GRAD_MARKET_CAP)*100);
+
+  const priceEl = document.getElementById('livePrice');
+  if(priceEl){ priceEl.textContent = fmtPrice(price); priceEl.classList.remove('flash-up','flash-down'); void priceEl.offsetWidth; priceEl.classList.add(up?'flash-up':'flash-down'); }
+  const chgEl = document.getElementById('liveChg');
+  if(chgEl){ chgEl.className = 'coin-chg '+(up?'up':'down'); chgEl.textContent = `${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%`; }
+  const mcapEl = document.getElementById('liveMcap'); if(mcapEl) mcapEl.textContent = fmtUsd(mc);
+  const tcEl = document.getElementById('liveTradeCount'); if(tcEl) tcEl.textContent = coin.tradeCount||0;
+  const liqEl = document.getElementById('liveLiquidity'); if(liqEl) liqEl.textContent = `💧 Virtual liquidity ${fmtUsd(coin.solReserve)}`;
+  const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
+  const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
+  const tickerEl = document.getElementById('detailTicker');
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}`;
+  const tradesEl = document.getElementById('recentTradesList');
+  if(tradesEl) tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse());
+
+  drawChart(coin, false);
+  if(currentRecalc) currentRecalc(coin);
+}
+
+function rebuildTradePanel(coin){
+  const box = document.getElementById('tradePanelInner');
+  document.querySelectorAll('.trade-tab').forEach(t=> t.classList.toggle('active', t.dataset.mode===state.tradeMode));
+  box.innerHTML = state.tradeMode==='buy'? buyPanelHtml(coin) : sellPanelHtml(coin);
   wireTradePanel(coin);
 }
 
@@ -436,7 +487,7 @@ function sellPanelHtml(coin){
   const holding = state.myHolding || 0;
   return `
     <div class="amt-display"><input id="tradeAmt" inputmode="decimal" placeholder="0" value="${state.tradeAmount||''}"></div>
-    <div class="amt-sub">You own: ${fmtTok(holding)} ${esc(coin.ticker)}</div>
+    <div class="amt-sub" id="sellSub">You own: ${fmtTok(holding)} ${esc(coin.ticker)}</div>
     <div class="quick-row">
       <div class="quick-btn" data-pct=".25">25%</div>
       <div class="quick-btn" data-pct=".5">50%</div>
@@ -450,37 +501,42 @@ function sellPanelHtml(coin){
 }
 
 async function wireTradePanel(coin){
+  let liveCoin = coin;
   // fetch my holding for sell mode
   if(state.tradeMode==='sell'){
     const hSnap = await getDoc(doc(db,'users',state.uid,'holdings',coin.id));
     state.myHolding = hSnap.exists()? hSnap.data().tokens : 0;
-    const sub = document.getElementById('amt-sub');
+    const subEl = document.getElementById('sellSub');
+    if(subEl) subEl.textContent = `You own: ${fmtTok(state.myHolding)} ${coin.ticker}`;
   }
   const input = document.getElementById('tradeAmt');
   const estOut = document.getElementById('estOut');
   const estImpact = document.getElementById('estImpact');
-  function recalc(){
+  if(!input) return; // panel not in DOM (mode switched again before this resolved)
+  function recalc(updatedCoin){
+    if(updatedCoin) liveCoin = updatedCoin;
     const v = parseFloat(input.value)||0;
     state.tradeAmount = v;
     if(state.tradeMode==='buy'){
-      const newSol = coin.solReserve+v;
+      const newSol = liveCoin.solReserve+v;
       const newTok = K/newSol;
-      const tokensOut = coin.tokenReserve-newTok;
-      estOut.textContent = fmtTok(Math.max(0,tokensOut))+' '+coin.ticker;
-      const oldPrice = priceOf(coin), newPrice = newSol/newTok;
+      const tokensOut = liveCoin.tokenReserve-newTok;
+      estOut.textContent = fmtTok(Math.max(0,tokensOut))+' '+liveCoin.ticker;
+      const oldPrice = priceOf(liveCoin), newPrice = newSol/newTok;
       estImpact.textContent = (oldPrice? (((newPrice-oldPrice)/oldPrice)*100).toFixed(2):'0.00')+'%';
     } else {
       const tokIn = v;
-      const newTok = coin.tokenReserve+tokIn;
+      const newTok = liveCoin.tokenReserve+tokIn;
       const newSol = K/newTok;
-      const usdOut = coin.solReserve-newSol;
+      const usdOut = liveCoin.solReserve-newSol;
       estOut.textContent = fmtUsd(Math.max(0,usdOut));
-      const oldPrice = priceOf(coin), newPrice = newSol/newTok;
+      const oldPrice = priceOf(liveCoin), newPrice = newSol/newTok;
       estImpact.textContent = (oldPrice? (((newPrice-oldPrice)/oldPrice)*100).toFixed(2):'0.00')+'%';
     }
   }
-  input.addEventListener('input', recalc);
+  input.addEventListener('input', ()=>recalc());
   recalc();
+  currentRecalc = recalc; // let live snapshot updates recompute against fresh reserves
 
   document.querySelectorAll('.quick-btn').forEach(b=>{
     b.addEventListener('click', ()=>{
@@ -494,23 +550,47 @@ async function wireTradePanel(coin){
     });
   });
 
-  document.getElementById('tradeSubmit').addEventListener('click', ()=>{
+  const submitBtn = document.getElementById('tradeSubmit');
+  submitBtn.addEventListener('click', ()=>{
     if(state.tradeMode==='buy') doBuy(coin.id, parseFloat(input.value)||0);
     else doSell(coin.id, parseFloat(input.value)||0);
   });
 }
 
-function drawChart(coin){
+function rangeMs(){
+  if(chartRange==='1m') return 60000;
+  if(chartRange==='1h') return 3600000;
+  if(chartRange==='1d') return 86400000;
+  return Infinity;
+}
+
+function drawChart(coin, forceRebuild){
   const ctx = document.getElementById('priceChart');
   if(!ctx) return;
+  // Chart.js failing to load (CDN blocked, etc.) should never break buying/selling —
+  // fail quietly here instead of throwing.
+  if(typeof Chart === 'undefined'){
+    if(!ctx.dataset.warned){ ctx.dataset.warned='1'; ctx.parentElement.insertAdjacentHTML('beforeend','<div style="text-align:center;color:var(--txt-faint);font-size:12px;padding-top:10px;">Chart library failed to load — trading still works fine.</div>'); }
+    return;
+  }
+  const window_ = rangeMs();
   let hist = coin.priceHistory||[];
-  if(chartRange==='1h') hist = hist.filter(p=> p.t && (Date.now()-toMillis(p.t)) <= 3600000);
-  else if(chartRange==='1d') hist = hist.filter(p=> p.t && (Date.now()-toMillis(p.t)) <= 86400000);
-  if(hist.length===0) hist = coin.priceHistory||[{p:priceOf(coin),t:Date.now()}];
-  const labels = hist.map(p=> new Date(toMillis(p.t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}));
-  const prices = hist.map(p=>p.p);
+  let windowed = window_===Infinity ? hist : hist.filter(p=> p.t && (Date.now()-toMillis(p.t)) <= window_);
+  if(windowed.length===0) windowed = hist.length? [hist[hist.length-1]] : [{p:priceOf(coin),t:Date.now()}];
+  if(windowed.length===1) windowed = [{p:windowed[0].p, t:toMillis(windowed[0].t)-1000}, windowed[0]];
+  const labels = windowed.map(p=> new Date(toMillis(p.t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second: chartRange==='1m'?'2-digit':undefined}));
+  const prices = windowed.map(p=>p.p);
   const up = prices[prices.length-1] >= prices[0];
   const color = up? '#C6FF3D' : '#FF4D6D';
+
+  if(state.chart && !forceRebuild){
+    // live update: patch data in place for a smooth, non-flickery redraw
+    state.chart.data.labels = labels;
+    state.chart.data.datasets[0].data = prices;
+    state.chart.data.datasets[0].borderColor = color;
+    state.chart.update('none');
+    return;
+  }
   if(state.chart) state.chart.destroy();
   state.chart = new Chart(ctx, {
     type:'line',
@@ -525,7 +605,7 @@ function drawChart(coin){
       }
     }]},
     options:{
-      responsive:true, maintainAspectRatio:false,
+      responsive:true, maintainAspectRatio:false, animation:{duration:300},
       plugins:{ legend:{display:false}, tooltip:{ mode:'index', intersect:false,
         backgroundColor:'#161425', borderColor:'rgba(255,255,255,0.1)', borderWidth:1, padding:10,
         callbacks:{ label:(c)=> fmtPrice(c.parsed.y) } } },
@@ -603,6 +683,66 @@ async function doSell(coinId, tokenAmount){
   }catch(err){ toast(err.message, 'err'); }
   if(btn){ btn.disabled=false; }
 }
+
+/* ===================== BOT ACTIVITY ===================== */
+// There's no backend here — this app is 100% static Firestore + client JS, so "bots" are
+// just simulated trades that any currently-open browser tab occasionally submits on behalf
+// of a pool of fake trader names. They only touch a coin's own reserves/price history —
+// never a real user's balance or holdings — and only target coins launched in the last
+// few minutes, so a coin gets some early liquidity/action before it goes quiet.
+const BOT_NAMES = ['whale_watcher','ape_annie','moon_chaser','fomo_fred','diamond_dan','snipe_master','paper_hands_pete','degen_dana','yolo_yusuf','rekt_ronnie','pump_patrol','satoshi_jr'];
+const BOT_YOUNG_MS = 8*60*1000;      // bots only touch coins younger than this
+const BOT_TICK_MS = 14000;           // how often this tab rolls the dice
+const BOT_BUY_CHANCE = 0.22;         // per young coin, per tick
+const BOT_EXPLODE_CHANCE = 0.035;    // per young coin, per tick — a dramatic pump
+let botInterval = null;
+
+function randBotName(){ return BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)]; }
+
+async function botBuyOnCoin(coinId, usdAmount, isExplosion){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const coinSnap = await tx.get(coinRef);
+      if(!coinSnap.exists()) return;
+      const coin = coinSnap.data();
+      const newSol = coin.solReserve + usdAmount;
+      const newTok = K / newSol;
+      const tokensOut = coin.tokenReserve - newTok;
+      if(tokensOut<=0) return;
+      const newPrice = newSol/newTok;
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+    });
+    if(isExplosion) toast(`💥 A whale just aped into a new coin!`, 'ok');
+  }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
+}
+
+async function botTick(){
+  try{
+    const cutoff = Timestamp.fromDate(new Date(Date.now()-BOT_YOUNG_MS));
+    const q = query(collection(db,'coins'), where('createdAt','>',cutoff), limit(15));
+    const snap = await getDocs(q);
+    snap.docs.forEach(d=>{
+      const coin = d.data();
+      const mc = marketCapOf({...coin});
+      if(mc >= GRAD_MARKET_CAP) return; // graduated coins are left alone
+      if(Math.random() < BOT_EXPLODE_CHANCE){
+        botBuyOnCoin(d.id, 300+Math.random()*900, true);
+      } else if(Math.random() < BOT_BUY_CHANCE){
+        botBuyOnCoin(d.id, 4+Math.random()*40, false);
+      }
+    });
+  }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+}
+
+function startBots(){
+  if(botInterval) return;
+  botInterval = setInterval(botTick, BOT_TICK_MS);
+  setTimeout(botTick, 3000); // one early tick shortly after load
+}
+function stopBots(){ if(botInterval){ clearInterval(botInterval); botInterval=null; } }
 
 /* ===================== CREATE COIN ===================== */
 function renderCreate(){
