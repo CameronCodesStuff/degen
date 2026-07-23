@@ -725,7 +725,6 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coin = coinSnap.data();
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       if(!(tokensOut>0)) return;
-      const newPrice = newSol/newTok;
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
