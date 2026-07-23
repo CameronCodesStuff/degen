@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DEGEN — Virtual Memecoin Exchange</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚀</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="loadscreen" class="loadscreen"><div class="spinner"></div></div>
+
+<!-- AUTH -->
+<div id="authScreen" class="hidden">
+  <div class="auth-glow"></div>
+  <div class="auth-card">
+    <div class="auth-logo"><span class="mark">🚀</span><span class="word">DEGEN</span></div>
+    <div class="auth-sub">A virtual memecoin exchange. No real money, all the chaos.</div>
+    <div class="auth-tabs">
+      <div class="auth-tab active" data-tab="login">Log In</div>
+      <div class="auth-tab" data-tab="signup">Sign Up</div>
+    </div>
+    <div class="auth-error" id="authError"></div>
+
+    <form id="loginForm">
+      <div class="fgroup"><label class="flabel">Email</label><input required type="email" class="field" id="loginEmail" placeholder="you@example.com"></div>
+      <div class="fgroup"><label class="flabel">Password</label><input required type="password" class="field" id="loginPass" placeholder="••••••••"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="loginBtn">Log In</button>
+    </form>
+
+    <form id="signupForm" class="hidden">
+      <div class="fgroup"><label class="flabel">Username</label><input required minlength="3" maxlength="20" pattern="[a-zA-Z0-9_]+" class="field" id="suUsername" placeholder="degenlord99"></div>
+      <div class="fgroup"><label class="flabel">Email</label><input required type="email" class="field" id="suEmail" placeholder="you@example.com"></div>
+      <div class="fgroup"><label class="flabel">Password</label><input required minlength="6" type="password" class="field" id="suPass" placeholder="min. 6 characters"></div>
+      <button type="submit" class="btn btn-primary btn-block" id="signupBtn">Create Account</button>
+    </form>
+
+    <div class="auth-perk">🎁 New accounts start with <b>$100.00</b> virtual cash</div>
+  </div>
+</div>
+
+<!-- APP -->
+<div id="app" class="hidden">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand" data-nav="home"><span class="mark">🚀</span><span class="word">DEGEN</span></div>
+      <div class="ticker-tape"><div class="ticker-track" id="tickerTrack"></div></div>
+      <div class="topbar-right">
+        <div class="balance-pill">💵 <span id="balanceDisplay">$0.00</span></div>
+        <img class="avatar" id="topAvatar" data-nav="profile" src="" alt="profile">
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidenav" id="sidenav">
+      <div class="nav-item" data-nav="home"><span class="ic">🏠</span>Explore</div>
+      <div class="nav-item" data-nav="portfolio"><span class="ic">💼</span>Portfolio</div>
+      <div class="nav-item" data-nav="profile"><span class="ic">👤</span>Profile</div>
+      <button class="btn btn-lime btn-block nav-cta" data-nav="create">+ Launch a Coin</button>
+    </nav>
+
+    <main id="view"></main>
+  </div>
+
+  <nav class="bottomnav">
+    <div class="bn-item" data-nav="home"><span class="ic">🏠</span>Explore</div>
+    <div class="bn-item" data-nav="portfolio"><span class="ic">💼</span>Portfolio</div>
+    <div class="bn-item" data-nav="create"><span class="ic">➕</span>Launch</div>
+    <div class="bn-item" data-nav="profile"><span class="ic">👤</span>Profile</div>
+  </nav>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script type="module" src="script.js"></script>
+</body>
+</html>
