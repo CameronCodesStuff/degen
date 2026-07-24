@@ -47,14 +47,19 @@ updateOfflineBanner();
 const STARTING_BALANCE = 100;
 const CREATE_FEE = 5;
 // Market cap on a constant-product curve works out to marketCap = solReserve^2 / INITIAL_SOL_RESERVE.
-// With too little starting liquidity (the old $30), a single small buy could 5-10x the market cap
-// instantly, which read as "broken". $4,200 gives a realistic ~$4K starting mcap (like a freshly
-// launched real memecoin) and means a normal $20-100 trade only moves mcap a few percent.
-const INITIAL_SOL_RESERVE = 4200;     // virtual "liquidity" seed (USD)
+// With too little starting liquidity (the old $30, then $4,200), a modest buy could scoop up a huge
+// slice of the supply in one shot (e.g. ~$95 buying 2%+ of the whole 1B supply at $4,200 depth) and
+// swing market cap hard on a single trade. $8,000 virtual depth cuts how many tokens/how much price
+// impact a given dollar amount buys roughly in half versus the old setting, while still giving a
+// realistic few-thousand-dollar starting mcap like a freshly launched real memecoin.
+const INITIAL_SOL_RESERVE = 8000;     // virtual "liquidity" seed (USD)
 const INITIAL_TOKEN_RESERVE = 1_000_000_000; // 1B token supply per coin
 const GRAD_MARKET_CAP = 69000;        // fun homage threshold — pump.fun's real graduation mcap
 const K = INITIAL_SOL_RESERVE * INITIAL_TOKEN_RESERVE;
-const MAX_OWNERSHIP_PCT = 0.8;         // no single wallet can hold more than 80% of a coin's supply
+// No single wallet can hold more than 35% of a coin's supply (down from 80%) — a much lower cap
+// means no one buyer can dominate the curve, so price stays driven by many people trading rather
+// than one whale's bag, and it keeps any single position's exit slippage from being catastrophic.
+const MAX_OWNERSHIP_PCT = 0.35;
 const MAX_OWNERSHIP_TOKENS = INITIAL_TOKEN_RESERVE * MAX_OWNERSHIP_PCT;
 
 // Client-side "pump" easter egg, gated to one specific account. Like the rest of this demo
@@ -161,6 +166,17 @@ function ammSell(coin, tokenAmount){
   return { usdOut, newSol, newTok, newPrice: newSol/newTok };
 }
 
+// What a holding is actually worth if you sold it right now — i.e. run it through the same
+// slippage math the real sell transaction uses, instead of tokens*spotPrice. Spot price is only
+// the price of the next infinitesimal token; once you own a meaningful share of a shallow curve,
+// dumping your whole bag moves the price a lot on the way out, so tokens*spotPrice can wildly
+// overstate what you'd actually walk away with (this was the "shows $1k, only get $100" bug).
+function sellValue(coin, tokens){
+  if(!(tokens>0) || !coin) return 0;
+  const capped = Math.min(tokens, coin.tokenReserve*0.999999); // can't drain the whole reserve
+  const { usdOut } = ammSell(coin, capped);
+  return Math.max(0, usdOut||0);
+}
 function pctChange(history){
   if(!history || history.length<2) return 0;
   const first = history[0].p, last = history[history.length-1].p;
@@ -296,7 +312,17 @@ function navigate(name, param=null){
   else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
+  else if(name==='user') renderUserProfile(param);
+  else if(name==='activity') renderActivity();
   window.scrollTo(0,0);
+}
+
+// Shared "go to this person's profile" helper used from the leaderboard, activity feed, and
+// trade lists — sends you to your own editable profile if it's you, otherwise the read-only
+// public profile view. Bots (uid 'bot' or missing) aren't real accounts, so this is a no-op.
+function openProfile(uid){
+  if(!uid || uid==='bot') return;
+  navigate(uid===state.uid ? 'profile' : 'user', uid);
 }
 
 /* ===================== ADMIN "PUMP" EASTER EGG ===================== */
@@ -497,7 +523,7 @@ function buildCoinDetailShell(coin){
           <div class="desc-text">${esc(coin.description)||'No description provided.'}</div>
           <div class="meta-row">
             <span class="meta-tag">🎟️ ${esc(coin.ticker)}</span>
-            <span class="meta-tag">👤 @${esc(coin.creatorUsername)}</span>
+            <span class="meta-tag user-link" data-uid="${coin.creatorUid||''}" style="cursor:pointer;">👤 @${esc(coin.creatorUsername)}</span>
             <span class="meta-tag" id="liveLiquidity">💧 Virtual liquidity ${fmtUsd(coin.solReserve)}</span>
           </div>
         </div>
@@ -521,6 +547,7 @@ function buildCoinDetailShell(coin){
   `;
 
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('home'));
+  wireUserLinks(view);
   drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
     b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin, true); });
@@ -535,11 +562,19 @@ function recentTradesHtml(trades){
   if(!trades.length) return '<div class="empty" style="padding:20px;">No trades yet — be the first!</div>';
   return trades.slice(0,14).map(t=>`
     <div class="holder-line">
-      <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
-      <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
+      <div class="user-link" data-uid="${t.isBot?'':(t.uid||'')}" style="display:flex;align-items:center;gap:8px;${t.isBot?'':'cursor:pointer;'}">
+        <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
+        <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
+      </div>
       <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
       <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
     </div>`).join('');
+}
+function wireUserLinks(container){
+  container.querySelectorAll('.user-link[data-uid]').forEach(el=>{
+    if(!el.dataset.uid) return;
+    el.addEventListener('click', ()=> openProfile(el.dataset.uid));
+  });
 }
 
 // Cheap refresh used on every live snapshot after the shell already exists.
@@ -563,7 +598,7 @@ function updateCoinDetailLive(coin){
   const tickerEl = document.getElementById('detailTicker');
   if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}`;
   const tradesEl = document.getElementById('recentTradesList');
-  if(tradesEl) tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse());
+  if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
   drawChart(coin, false);
   if(currentRecalc) currentRecalc(coin);
@@ -809,7 +844,22 @@ async function doBuy(coinId, usdAmount){
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance - finalUsd });
-      tx.set(holdRef, { tokens: prevTokens+tokensOut, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'', updatedAt: Date.now() }, {merge:true});
+      // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
+      const prevHold = holdSnap.exists()? holdSnap.data() : {};
+      tx.set(holdRef, {
+        tokens: prevTokens+tokensOut, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'',
+        costBasis: (prevHold.costBasis||0) + finalUsd,
+        totalBoughtUsd: (prevHold.totalBoughtUsd||0) + finalUsd,
+        totalSoldUsd: prevHold.totalSoldUsd||0, realizedPnl: prevHold.realizedPnl||0,
+        updatedAt: Date.now()
+      }, {merge:true});
+      const activityRef = doc(collection(db,'activity'));
+      tx.set(activityRef, {
+        uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
+        type:'buy', usdAmount: finalUsd, tokenAmount: tokensOut,
+        coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
+        createdAt: serverTimestamp()
+      });
       return { tokensOut, wasCapped, finalUsd };
     });
     if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at 80% ownership, rest refunded.`, 'ok');
@@ -840,7 +890,27 @@ async function doSell(coinId, tokenAmount){
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance + usdOut });
-      tx.set(holdRef, { tokens: owned-tokenAmount, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'', updatedAt: Date.now() }, {merge:true});
+      // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
+      // so open positions (unrealized) and closed positions (realized) can both be shown accurately.
+      const prevHold = holdSnap.exists()? holdSnap.data() : {};
+      const prevCostBasis = prevHold.costBasis||0;
+      const avgCost = owned>0 ? prevCostBasis/owned : 0;
+      const costRemoved = Math.min(prevCostBasis, avgCost*tokenAmount);
+      tx.set(holdRef, {
+        tokens: owned-tokenAmount, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'',
+        costBasis: Math.max(0, prevCostBasis-costRemoved),
+        totalBoughtUsd: prevHold.totalBoughtUsd||0,
+        totalSoldUsd: (prevHold.totalSoldUsd||0) + usdOut,
+        realizedPnl: (prevHold.realizedPnl||0) + (usdOut-costRemoved),
+        updatedAt: Date.now()
+      }, {merge:true});
+      const activityRef = doc(collection(db,'activity'));
+      tx.set(activityRef, {
+        uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
+        type:'sell', usdAmount: usdOut, tokenAmount,
+        coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
+        createdAt: serverTimestamp()
+      });
       return usdOut;
     });
     toast(`Sold for ${fmtUsd(result)}!`, 'ok');
@@ -862,7 +932,7 @@ async function refreshNetWorthSnapshot(){
     for(const h of holdings){
       let coin = state.coinsCache.get(h.id);
       if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()) coin = {id:cs.id,...cs.data()}; }
-      if(coin) holdingsVal += h.tokens*priceOf(coin);
+      if(coin) holdingsVal += sellValue(coin, h.tokens);
     }
     const uSnap = await getDoc(doc(db,'users',state.uid));
     if(!uSnap.exists()) return;
@@ -885,10 +955,17 @@ async function refreshNetWorthSnapshot(){
 // few minutes, so a coin gets some early liquidity/action before it goes quiet.
 const BOT_YOUNG_MS = 8*60*1000;      // bots only touch coins younger than this
 const BOT_TICK_MS = 14000;           // how often this tab rolls the dice
-const BOT_EXPLODE_CHANCE = 0.035;    // per young coin, per tick — a dramatic pump
+// Buy/sell and explode/dump use matching chance + size ranges on purpose. Bots don't have real
+// balances — a bot "buy" just pushes solReserve up as if real money arrived, and a real user who
+// sells after can walk away with that virtual liquidity as actual spendable balance. If bot buying
+// outweighs bot selling even slightly, every young coin's reserve drifts upward for free over time,
+// which is easy money that isn't backed by anything — a big part of how balances snowballed too
+// fast. Symmetric chances/sizes keep the long-run drift at ~zero: still plenty of chart chaos,
+// no ambient free liquidity.
+const BOT_EXPLODE_CHANCE = 0.03;     // per young coin, per tick — a dramatic pump
 const BOT_DUMP_CHANCE    = 0.03;     // per young coin, per tick — a dramatic sell-off (the "drop" half of a spike)
-const BOT_BUY_CHANCE     = 0.22;     // per young coin, per tick — small buy pressure
-const BOT_SELL_CHANCE    = 0.17;     // per young coin, per tick — small profit-taking, keeps the line from only ever going up
+const BOT_BUY_CHANCE     = 0.2;      // per young coin, per tick — small buy pressure
+const BOT_SELL_CHANCE    = 0.2;      // per young coin, per tick — small profit-taking, keeps the line from only ever going up
 let botInterval = null;
 
 function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
@@ -949,13 +1026,13 @@ async function botTick(){
       const r = Math.random();
       let acc = 0;
       if(r < (acc += BOT_EXPLODE_CHANCE)){
-        botBuyOnCoin(d.id, 300+Math.random()*900, true);
+        botBuyOnCoin(d.id, 200+Math.random()*500, true);
       } else if(r < (acc += BOT_DUMP_CHANCE)){
-        botSellOnCoin(d.id, 250+Math.random()*700, true);
+        botSellOnCoin(d.id, 200+Math.random()*500, true);
       } else if(r < (acc += BOT_BUY_CHANCE)){
-        botBuyOnCoin(d.id, 4+Math.random()*40, false);
+        botBuyOnCoin(d.id, 4+Math.random()*36, false);
       } else if(r < (acc += BOT_SELL_CHANCE)){
-        botSellOnCoin(d.id, 3+Math.random()*35, false);
+        botSellOnCoin(d.id, 4+Math.random()*36, false);
       }
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
@@ -1051,9 +1128,11 @@ async function renderPortfolio(){
     if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()) coin = {id:cs.id,...cs.data()}; }
     if(!coin) continue;
     const price = priceOf(coin);
-    const val = h.tokens*price;
+    const val = sellValue(coin, h.tokens);
+    const costBasis = h.costBasis||0;
+    const pnl = val-costBasis;
     holdingsVal += val;
-    rows.push({h, coin, price, val});
+    rows.push({h, coin, price, val, pnl});
   }
   const cash = state.userDoc?.balance||0;
   document.getElementById('pfTotal').textContent = fmtUsd(cash+holdingsVal);
@@ -1063,7 +1142,9 @@ async function renderPortfolio(){
 
   const list = document.getElementById('holdingsList');
   if(rows.length===0){ list.innerHTML = `<div class="empty"><div class="em-ic">📭</div>No holdings yet. Head to Explore and buy your first coin!</div>`; return; }
-  list.innerHTML = rows.map(r=>`
+  list.innerHTML = rows.map(r=>{
+    const up = r.pnl>=0;
+    return `
     <div class="hold-row" data-coin="${r.coin.id}">
       <img class="coin-logo" src="${coinLogoFor(r.coin.ticker,r.coin.imageURL)}">
       <div class="hold-info">
@@ -1072,10 +1153,50 @@ async function renderPortfolio(){
       </div>
       <div class="hold-right">
         <div class="hold-val mono">${fmtUsd(r.val)}</div>
-        <div style="font-size:11.5px;color:var(--txt-dim);">${fmtPrice(r.price)}/tok</div>
+        <div class="mono" style="font-size:11.5px;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.pnl))}</div>
       </div>
-    </div>`).join('');
+    </div>`;}).join('');
   list.querySelectorAll('.hold-row').forEach(el=> el.addEventListener('click', ()=> navigate('coin', el.dataset.coin)));
+}
+
+/* ===================== ACTIVITY FEED ===================== */
+// Global feed of real trades (buys/sells) across every coin, newest first. Written to the
+// top-level `activity` collection inside the same transaction as each real doBuy/doSell — bot
+// trades aren't logged here, since this is specifically about what real people are doing.
+let activityUnsub = null;
+function renderActivity(){
+  const view = document.getElementById('view');
+  view.innerHTML = `
+    <div class="section-title">🕒 Recent Activity</div>
+    <div id="activityList"><div class="spinner" style="margin-top:40px;"></div></div>
+  `;
+  loadActivity();
+}
+function loadActivity(){
+  if(activityUnsub) activityUnsub();
+  const list = document.getElementById('activityList');
+  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(50));
+  activityUnsub = onSnapshot(q, snap=>{
+    if(!list) return;
+    const items = snap.docs.map(d=>({id:d.id,...d.data()}));
+    if(!items.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🕒</div>No trades yet — activity will show up here as people buy and sell.</div>`; return; }
+    list.innerHTML = items.map(t=>`
+      <div class="holder-line">
+        <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
+          <span>@${esc(t.username)}</span>
+        </div>
+        <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
+        <span class="coin-tag" data-coin="${t.coinId||''}" style="cursor:pointer;font-weight:600;">$${esc(t.ticker)}</span>
+        <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
+        <span style="font-size:11px;color:var(--txt-faint);margin-left:8px;">${timeAgo(t.createdAt)}</span>
+      </div>`).join('');
+    wireUserLinks(list);
+    list.querySelectorAll('[data-coin]').forEach(el=>{
+      if(el.dataset.coin) el.addEventListener('click', ()=> navigate('coin', el.dataset.coin));
+    });
+  }, ()=>{ if(list) list.innerHTML = `<div class="empty">Couldn't load activity right now.</div>`; });
+  state.unsubs.push(activityUnsub);
 }
 
 /* ===================== LEADERBOARD ===================== */
@@ -1129,7 +1250,7 @@ async function loadLeaderboard(){
     const snap = await getDocs(query(collection(db,'users'), limit(200)));
     const users = snap.docs.map(d=>({uid:d.id, ...d.data()}));
     const rows = users
-      .map(u=>({ username:u.username, avatarURL:u.avatarURL, current: u.netWorth ?? u.balance ?? STARTING_BALANCE, change: netWorthChange(u, lbCategory) }))
+      .map(u=>({ uid:u.uid, username:u.username, avatarURL:u.avatarURL, current: u.netWorth ?? u.balance ?? STARTING_BALANCE, change: netWorthChange(u, lbCategory) }))
       .filter(r=>r.username)
       .sort((a,b)=> b.change-a.change)
       .slice(0,25);
@@ -1140,14 +1261,126 @@ async function loadLeaderboard(){
       return `
       <div class="holder-line">
         <span style="width:26px;text-align:center;font-weight:700;">${medal}</span>
-        <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
-        <span>@${esc(r.username)}</span>
+        <div class="user-link" data-uid="${r.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
+          <span>@${esc(r.username)}</span>
+        </div>
         <span class="mono" style="margin-left:auto;">${fmtUsd(r.current)}</span>
         <span class="coin-chg ${up?'up':'down'}" style="padding:2px 7px;">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.change))}</span>
       </div>`;
     }).join('');
+    list.querySelectorAll('.user-link').forEach(el=> el.addEventListener('click', ()=> openProfile(el.dataset.uid)));
   }catch(err){
     list.innerHTML = `<div class="empty">Couldn't load the leaderboard: ${esc(err.message)}</div>`;
+  }
+}
+
+/* ===================== POSITIONS (shared by own + public profile) ===================== */
+// Reads a user's holdings subcollection and splits it into open positions (still holding tokens)
+// and closed ones (fully exited at some point, i.e. had activity but zero tokens left now).
+// Requires holdings to be readable by any signed-in user (see updated Firestore rules in
+// SETUP.md) so a public profile can show someone else's positions, not just your own.
+async function loadPositions(uid){
+  const holdSnap = await getDocs(collection(db,'users',uid,'holdings'));
+  const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()}));
+  const open = [], closed = [];
+  for(const h of holdings){
+    const everTraded = (h.totalBoughtUsd||0) > 0;
+    if(!(h.tokens>0.0001) && !everTraded) continue;
+    let coin = state.coinsCache.get(h.id);
+    if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()){ coin = {id:cs.id, ...cs.data()}; state.coinsCache.set(h.id, coin); } }
+    if(h.tokens>0.0001){
+      const val = coin? sellValue(coin, h.tokens) : 0;
+      open.push({ h, coin, val, pnl: val-(h.costBasis||0) });
+    } else if(everTraded){
+      closed.push({ h, coin });
+    }
+  }
+  open.sort((a,b)=> b.val-a.val);
+  closed.sort((a,b)=> (b.h.updatedAt||0)-(a.h.updatedAt||0));
+  return { open, closed };
+}
+function openPositionsHtml(open){
+  if(!open.length) return '<div class="empty" style="padding:16px;">No open positions.</div>';
+  return open.map(r=>{
+    const up = r.pnl>=0;
+    const ticker = r.coin?.ticker || r.h.ticker;
+    return `
+    <div class="hold-row" data-coin="${r.h.id}">
+      <img class="coin-logo" src="${coinLogoFor(ticker, r.coin?.imageURL||r.h.imageURL)}">
+      <div class="hold-info">
+        <div class="coin-ticker">$${esc(ticker)}</div>
+        <div class="coin-name">${fmtTok(r.h.tokens)} tokens</div>
+      </div>
+      <div class="hold-right">
+        <div class="hold-val mono">${fmtUsd(r.val)}</div>
+        <div class="mono" style="font-size:11.5px;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.pnl))}</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+function closedPositionsHtml(closed){
+  if(!closed.length) return '<div class="empty" style="padding:16px;">No closed positions yet.</div>';
+  return closed.map(r=>{
+    const pnl = r.h.realizedPnl||0;
+    const up = pnl>=0;
+    const ticker = r.coin?.ticker || r.h.ticker;
+    return `
+    <div class="hold-row" data-coin="${r.h.id}" style="cursor:pointer;">
+      <img class="coin-logo" src="${coinLogoFor(ticker, r.coin?.imageURL||r.h.imageURL)}">
+      <div class="hold-info">
+        <div class="coin-ticker">$${esc(ticker)}</div>
+        <div class="coin-name">Bought ${fmtUsd(r.h.totalBoughtUsd||0)} · Sold ${fmtUsd(r.h.totalSoldUsd||0)}</div>
+      </div>
+      <div class="hold-right">
+        <div class="mono" style="font-weight:600;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(pnl))}</div>
+        <div style="font-size:11px;color:var(--txt-faint);">realized P&L</div>
+      </div>
+    </div>`;
+  }).join('');
+}
+function wirePositionRows(container){
+  container.querySelectorAll('[data-coin]').forEach(el=>{
+    if(el.dataset.coin) el.addEventListener('click', ()=> navigate('coin', el.dataset.coin));
+  });
+}
+
+/* ===================== PUBLIC PROFILE (someone else's) ===================== */
+async function renderUserProfile(uid){
+  const view = document.getElementById('view');
+  view.innerHTML = `<div class="spinner" style="margin-top:60px;"></div>`;
+  const uSnap = await getDoc(doc(db,'users',uid));
+  if(!uSnap.exists()){ view.innerHTML = `<div class="empty"><div class="em-ic">👻</div>Couldn't find that trader.</div>`; return; }
+  const u = uSnap.data();
+  view.innerHTML = `
+    <div class="back-btn" id="backBtn">← Back</div>
+    <div class="profile-head">
+      <img class="avatar-lg" src="${avatarFor(u.username,u.avatarURL)}">
+      <div>
+        <div class="profile-name">@${esc(u.username)}</div>
+        <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="settings-row" style="border:none;"><span>Cash balance</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+    </div>
+    <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
+    <div id="openPosList"><div class="spinner"></div></div>
+    <div class="section-title" style="font-size:16px;margin-top:20px;">Closed Positions</div>
+    <div id="closedPosList"><div class="spinner"></div></div>
+  `;
+  document.getElementById('backBtn').addEventListener('click', ()=> navigate('leaderboard'));
+  try{
+    const { open, closed } = await loadPositions(uid);
+    const openEl = document.getElementById('openPosList');
+    const closedEl = document.getElementById('closedPosList');
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
+    if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
+  }catch(err){
+    const openEl = document.getElementById('openPosList');
+    if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
+    const closedEl = document.getElementById('closedPosList');
+    if(closedEl) closedEl.innerHTML = '';
   }
 }
 
@@ -1169,11 +1402,24 @@ function renderProfile(){
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
       <div class="settings-row" style="border:none;"><span>Cash balance</span><b class="mono">${fmtUsd(u.balance)}</b></div>
     </div>
+    <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
+    <div id="openPosList"><div class="spinner"></div></div>
+    <div class="section-title" style="font-size:16px;margin-top:20px;">Closed Positions</div>
+    <div id="closedPosList"><div class="spinner"></div></div>
     <button class="btn btn-ghost btn-block" style="margin-top:20px;color:var(--down);" id="logoutBtn">Log Out</button>
   `;
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
+  loadPositions(state.uid).then(({open, closed})=>{
+    const openEl = document.getElementById('openPosList');
+    const closedEl = document.getElementById('closedPosList');
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
+    if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
+  }).catch(err=>{
+    const openEl = document.getElementById('openPosList');
+    if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
+  });
 }
 
 function openAvatarModal(){
