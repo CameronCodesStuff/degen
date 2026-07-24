@@ -7,7 +7,7 @@ import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   doc, getDoc, setDoc, updateDoc, onSnapshot, collection, collectionGroup,
   query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp,
-  getCountFromServer, writeBatch, deleteDoc
+  getCountFromServer, writeBatch, deleteDoc, setLogLevel
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyCMDe_UPrNTjKnEoO2ngTe7wE6P7_G06ms",
@@ -19,6 +19,13 @@ const firebaseConfig = {
 };
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
+// The Firestore SDK logs a full RPC payload dump to console on every transaction retry/conflict
+// (visible as those huge "RestConnection RPC 'Commit' failed" blocks) — with the bot economy
+// generating a steady stream of trades, that's enough console volume for DevTools itself to
+// start lagging the page. None of it is actionable for normal use (bot-vs-bot contention is
+// already handled silently in code), so it's turned off at the source rather than just cleaned
+// up after the fact.
+setLogLevel('error');
 // Local persistent cache (IndexedDB-backed) lets the app keep working — viewing cached
 // prices/balances, queueing trades — when the connection drops, and syncs back up
 // automatically once it returns. Falls back to in-memory-only if the browser can't support
@@ -265,11 +272,13 @@ onAuthStateChanged(auth, async (user)=>{
     listenTickerTape();
     navigate('home');
     startBots();
+    startConsoleAutoClear();
   } else {
     state.uid = null; state.userDoc = null;
     document.getElementById('app').classList.add('hidden');
     document.getElementById('authScreen').classList.remove('hidden');
     stopBots();
+    stopConsoleAutoClear();
   }
 });
 
@@ -1575,6 +1584,15 @@ async function botTick(){
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
 }
 
+// Belt-and-suspenders on top of setLogLevel above: periodically clear the console so it can't
+// silently build up a huge scrollback over a long session (e.g. from the app's own toasts/errors,
+// or anything else that logs) even with Firestore's own noise already turned off.
+let consoleClearInterval = null;
+function startConsoleAutoClear(){
+  if(consoleClearInterval) return;
+  consoleClearInterval = setInterval(()=>{ try{ console.clear(); }catch(err){} }, 60000);
+}
+
 function startBots(){
   if(botRunning) return;
   botRunning = true;
@@ -1593,6 +1611,7 @@ function startBots(){
   scheduleNext(botCoinTick, BOT_TICK_MS);
 }
 function stopBots(){ botRunning = false; }
+function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
 
 /* ===================== CREATE COIN ===================== */
 function renderCreate(){
