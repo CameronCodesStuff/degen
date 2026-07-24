@@ -334,38 +334,10 @@ function listenUserDoc(){
     state.userDoc = snap.data();
     document.getElementById('balanceDisplay').textContent = fmtUsd(state.userDoc.balance);
     document.getElementById('topAvatar').src = avatarFor(state.userDoc.username, state.userDoc.avatarURL);
-    updatePortfolioVignette(state.userDoc);
     if(state.route.name==='profile') renderProfile();
     if(state.route.name==='portfolio') renderPortfolio();
   });
   state.unsubs.push(un);
-}
-
-/* ===================== PORTFOLIO VIGNETTE ===================== */
-// A subtle full-screen pulsing edge glow that reflects how your day is going — red when you're
-// deep in the red, green when you're way up. Only kicks in once today's swing is dramatic enough
-// (±12%) so it's not just always-on background noise for normal fluctuations.
-let vignetteEl = null;
-function updatePortfolioVignette(u){
-  if(!vignetteEl){
-    vignetteEl = document.createElement('div');
-    vignetteEl.id = 'portfolioVignette';
-    document.body.appendChild(vignetteEl);
-  }
-  const { pct } = todaysChange(u);
-  const THRESHOLD = 12;
-  if(pct >= THRESHOLD){
-    const intensity = Math.min(1, (pct-THRESHOLD)/40);
-    vignetteEl.className = 'vignette-up';
-    vignetteEl.style.opacity = (0.35+intensity*0.5).toFixed(2);
-  } else if(pct <= -THRESHOLD){
-    const intensity = Math.min(1, (Math.abs(pct)-THRESHOLD)/40);
-    vignetteEl.className = 'vignette-down';
-    vignetteEl.style.opacity = (0.35+intensity*0.5).toFixed(2);
-  } else {
-    vignetteEl.className = '';
-    vignetteEl.style.opacity = '0';
-  }
 }
 
 function listenTickerTape(){
@@ -1974,6 +1946,7 @@ async function renderPortfolio(){
     holdingsVal += val;
     rows.push({h, coin, price, val, pnl});
   }
+  if(state.route.name!=='portfolio') return; // navigated away while the above was loading
   const cash = state.userDoc?.balance||0;
   document.getElementById('pfTotal').textContent = fmtUsd(cash+holdingsVal);
   document.getElementById('pfCash').textContent = fmtUsd(cash);
