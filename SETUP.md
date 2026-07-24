@@ -97,7 +97,10 @@ service cloud.firestore {
 
     match /activity/{tradeId} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && request.resource.data.uid == request.auth.uid;
+      // Real trades are tagged with the actual signed-in user. Whale-sized BOT trades are also
+      // logged here now (to power the platform-wide whale alert), always tagged uid:'bot' —
+      // same pattern as bot-spawned coins.
+      allow create: if isSignedIn() && (request.resource.data.uid == request.auth.uid || request.resource.data.uid == 'bot');
       allow update: if false;
       allow delete: if isAdmin(); // wiping the global feed is part of a full economy reset
     }
@@ -196,6 +199,16 @@ The same "Net Worth Over Time" line chart appears in three places now: the Portf
 
 ### Recent Activity feed
 A new "Activity" tab shows a live, global feed of real buys and sells across every coin (bot trades are excluded — this is about real people). Each real trade is written to a new top-level `activity` Firestore collection inside the same transaction as the trade itself. Clicking a username in the feed opens that person's profile, and clicking a ticker jumps to that coin.
+
+### Intensity pass: confetti, whale alerts, streaks, chart avatars
+A batch of feel/feedback features, all built on data that was already being tracked:
+- **Milestone confetti** — a lightweight vanilla-JS particle burst (no external library) fires once each for: your first profitable trade, first $1,000 net worth, and your biggest single win. Tracked via a `milestones` map on your user doc so each only fires once, ever.
+- **Portfolio vignette** — a pulsing full-screen edge glow, red or green, that only kicks in once today's net worth swing passes ±12% (so it's reserved for genuinely dramatic days, not constant background noise), intensity scaling with how extreme it is.
+- **Whale alerts, actually platform-wide** — real trades were already logged to the global `activity` feed; bot trades weren't, so a huge bot pump only ever showed a toast in the one tab that happened to run it. Bot trades $500+ now also write to `activity` (tagged `uid:'bot'`, same pattern as bot-spawned coins), and a global listener — started once at sign-in, independent of what page you're on — shows a clickable toast for real *and* bot whale trades alike, for everyone online. Clicking it jumps straight to the coin. **Needs the updated `activity` rules above** (bot trades need their own create clause, same as bot coin creation did).
+- **Fake viewer count** — "N watching" on a coin's page. Deterministic per coin+20-second time-bucket (same hash trick used for bot coin mood) rather than pure random every refresh, so it drifts naturally instead of visibly jumping, and scales up with how much trading activity a coin has seen.
+- **Win streak & Diamond/Paper Hands** — both computed straight from your closed-positions history (already being recorded). Streak counts consecutive profitable sells from most recent backward. Hands badge classifies you by average hold time — needs a new `firstBuyAt` field on holdings (set once per position, resets when you fully exit and start fresh) and a `heldMs` field recorded on each closed-position entry at sell time. Thresholds (15 min = diamond) are tuned to this app's pace, not real-market scale.
+- **Rank-overtake toast** — after every trade, a lightweight top-10-by-net-worth check (no new index needed, single-field `orderBy`) compares your rank to last time; if you climbed, you get a toast naming whoever you just passed.
+- **Avatar markers on the chart** — buy/sell trades from a coin's `recentTrades` are now plotted as small circular avatars directly on the price chart, positioned by matching each trade's timestamp to the nearest visible price point (they land at essentially the same instant already, since the price point and the trade write happen in the same transaction). Lime ring = buy, red ring = sell. Click one to jump to that trader's profile (bot avatars are unclickable, matching how bot accounts work everywhere else). Limited to the last 14 trades per coin, same as the Recent Trades list, since that's all `recentTrades` retains.
 
 ### Public profiles
 Clicking any username — on the leaderboard, in a coin's recent trades, in the Activity feed, or on the "launched by" tag on a coin's page — opens that person's profile (or your own editable one, if it's you). A profile shows:

@@ -139,15 +139,60 @@ function coinLogoFor(ticker, url){
   const seed = encodeURIComponent(ticker||'coin');
   return `https://api.dicebear.com/9.x/shapes/svg?seed=${seed}&backgroundColor=8B6BFF,FF3DAE,3DE0FF`;
 }
-function toast(msg, type=''){
+function toast(msg, type='', onClick=null){
   const c = document.getElementById('toastContainer');
   const el = document.createElement('div');
-  el.className = 'toast '+type;
+  el.className = 'toast '+type+(onClick?' toast-clickable':'');
   el.textContent = msg;
+  if(onClick) el.addEventListener('click', onClick);
   c.appendChild(el);
-  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='.3s'; setTimeout(()=>el.remove(),300); }, 3200);
+  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='.3s'; setTimeout(()=>el.remove(),300); }, onClick?5200:3200);
 }
 function esc(s){ const d=document.createElement('div'); d.textContent = s==null?'':s; return d.innerHTML; }
+
+/* ===================== CONFETTI (milestones) ===================== */
+function confettiBurst(){
+  const canvas = document.createElement('canvas');
+  canvas.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:400;';
+  canvas.width = window.innerWidth; canvas.height = window.innerHeight;
+  document.body.appendChild(canvas);
+  const ctx = canvas.getContext('2d');
+  const colors = ['#C6FF3D','#FF4D6D','#8B6BFF','#FFD166','#4DD9FF'];
+  const N = 90;
+  const particles = Array.from({length:N}, ()=>({
+    x: canvas.width/2 + (Math.random()-0.5)*120,
+    y: canvas.height*0.35 + (Math.random()-0.5)*60,
+    vx: (Math.random()-0.5)*14,
+    vy: -Math.random()*14-4,
+    size: 4+Math.random()*5,
+    color: colors[Math.floor(Math.random()*colors.length)],
+    rot: Math.random()*Math.PI*2,
+    vrot: (Math.random()-0.5)*0.4,
+    life: 1
+  }));
+  const gravity = 0.35;
+  let running = true;
+  function tick(){
+    if(!running) return;
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    let alive = false;
+    particles.forEach(p=>{
+      if(p.life<=0) return;
+      p.vy += gravity; p.x += p.vx; p.y += p.vy; p.rot += p.vrot; p.life -= 0.012;
+      if(p.life<=0) return;
+      alive = true;
+      ctx.save();
+      ctx.translate(p.x,p.y); ctx.rotate(p.rot); ctx.globalAlpha = Math.max(0,p.life);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size/2,-p.size/2,p.size,p.size*0.6);
+      ctx.restore();
+    });
+    if(alive) requestAnimationFrame(tick);
+    else { running=false; canvas.remove(); }
+  }
+  requestAnimationFrame(tick);
+  setTimeout(()=>{ running=false; canvas.remove(); }, 4000); // safety net
+}
 
 /* AMM math */
 function priceOf(coin){ return coin.solReserve / coin.tokenReserve; }
@@ -270,6 +315,7 @@ onAuthStateChanged(auth, async (user)=>{
     document.getElementById('app').classList.remove('hidden');
     listenUserDoc();
     listenTickerTape();
+    listenWhaleAlerts();
     navigate('home');
     startBots();
     startConsoleAutoClear();
@@ -288,10 +334,38 @@ function listenUserDoc(){
     state.userDoc = snap.data();
     document.getElementById('balanceDisplay').textContent = fmtUsd(state.userDoc.balance);
     document.getElementById('topAvatar').src = avatarFor(state.userDoc.username, state.userDoc.avatarURL);
+    updatePortfolioVignette(state.userDoc);
     if(state.route.name==='profile') renderProfile();
     if(state.route.name==='portfolio') renderPortfolio();
   });
   state.unsubs.push(un);
+}
+
+/* ===================== PORTFOLIO VIGNETTE ===================== */
+// A subtle full-screen pulsing edge glow that reflects how your day is going — red when you're
+// deep in the red, green when you're way up. Only kicks in once today's swing is dramatic enough
+// (±12%) so it's not just always-on background noise for normal fluctuations.
+let vignetteEl = null;
+function updatePortfolioVignette(u){
+  if(!vignetteEl){
+    vignetteEl = document.createElement('div');
+    vignetteEl.id = 'portfolioVignette';
+    document.body.appendChild(vignetteEl);
+  }
+  const { pct } = todaysChange(u);
+  const THRESHOLD = 12;
+  if(pct >= THRESHOLD){
+    const intensity = Math.min(1, (pct-THRESHOLD)/40);
+    vignetteEl.className = 'vignette-up';
+    vignetteEl.style.opacity = (0.35+intensity*0.5).toFixed(2);
+  } else if(pct <= -THRESHOLD){
+    const intensity = Math.min(1, (Math.abs(pct)-THRESHOLD)/40);
+    vignetteEl.className = 'vignette-down';
+    vignetteEl.style.opacity = (0.35+intensity*0.5).toFixed(2);
+  } else {
+    vignetteEl.className = '';
+    vignetteEl.style.opacity = '0';
+  }
 }
 
 function listenTickerTape(){
@@ -313,6 +387,7 @@ function listenTickerTape(){
 /* ===================== ROUTER ===================== */
 function navigate(name, param=null){
   state.route = {name, param};
+  if(name!=='coin') stopViewerCount();
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
   });
@@ -668,6 +743,7 @@ function buildCoinDetailShell(coin){
             <span class="meta-tag">🎟️ ${esc(coin.ticker)}</span>
             <span class="meta-tag ${coin.isBotCoin?'':'user-link'}" data-uid="${coin.creatorUid||''}" style="${coin.isBotCoin?'':'cursor:pointer;'}">👤 @${esc(coin.creatorUsername)}</span>
             <span class="meta-tag" id="liveLiquidity">💧 Virtual liquidity ${fmtUsd(coin.solReserve)}</span>
+            <span class="meta-tag" id="viewerCount">👀 — watching</span>
           </div>
         </div>
 
@@ -697,6 +773,7 @@ function buildCoinDetailShell(coin){
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('home'));
   wireUserLinks(view);
   loadTopHolders(coin.id);
+  startViewerCount(coin);
   drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
     b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin, true); });
@@ -719,6 +796,32 @@ function recentTradesHtml(trades){
       <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
     </div>`).join('');
 }
+/* ===================== FAKE VIEWER COUNT ===================== */
+// A plausible-looking "N people watching" that's deterministic per coin+time-bucket (same
+// hash-bucket trick used for bot coin mood) rather than pure Math.random every refresh — so it
+// drifts naturally instead of visibly jumping around, and hotter coins (by trade count) tend to
+// show more watchers.
+let viewerCountInterval = null;
+function estimateViewers(coin){
+  const bucket = Math.floor(Date.now()/20000); // shifts every 20s
+  const seed = Math.abs(Math.sin(hashStr((coin.id||'')+':'+bucket)))*10000;
+  const roll = seed-Math.floor(seed); // 0..1
+  const heat = Math.min(1, (coin.tradeCount||0)/2000);
+  const base = 1 + heat*14;
+  return Math.max(1, Math.round(base + (roll-0.5)*4));
+}
+function startViewerCount(coin){
+  stopViewerCount();
+  const update = ()=>{
+    const el = document.getElementById('viewerCount');
+    if(!el){ stopViewerCount(); return; }
+    el.textContent = `👀 ${estimateViewers(coin)} watching`;
+  };
+  update();
+  viewerCountInterval = setInterval(update, 8000);
+}
+function stopViewerCount(){ if(viewerCountInterval){ clearInterval(viewerCountInterval); viewerCountInterval=null; } }
+
 function wireUserLinks(container){
   container.querySelectorAll('.user-link[data-uid]').forEach(el=>{
     if(!el.dataset.uid) return;
@@ -890,6 +993,78 @@ function rangeMs(){
   return Infinity;
 }
 
+// Cache of loaded <img> elements per avatar URL, reused across every chart redraw instead of
+// re-fetching/re-decoding on every tick. Triggers a redraw once an image finishes loading so a
+// marker doesn't just silently stay invisible until the next live update happens to fire.
+const avatarImgCache = new Map();
+function getAvatarImg(url){
+  if(!url) return null;
+  let img = avatarImgCache.get(url);
+  if(!img){
+    img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.src = url;
+    img.onload = ()=>{ if(state.chart) state.chart.update('none'); };
+    avatarImgCache.set(url, img);
+  }
+  return img;
+}
+// Matches each recent trade to the nearest visible chart point by timestamp (trades land a
+// price point at the same instant, via the same transaction, so this is normally an exact or
+// near-exact match) — only kept if it actually falls within the current time window/range.
+function buildTradeMarkers(coin, windowed, windowMs){
+  const trades = coin.recentTrades||[];
+  if(!trades.length || !windowed.length) return [];
+  const now = Date.now();
+  const markers = [];
+  trades.forEach(t=>{
+    const tMs = toMillis(t.t);
+    if(windowMs!==Infinity && (now-tMs)>windowMs) return;
+    let bestIdx = 0, bestDiff = Infinity;
+    windowed.forEach((p,i)=>{
+      const diff = Math.abs(toMillis(p.t)-tMs);
+      if(diff<bestDiff){ bestDiff=diff; bestIdx=i; }
+    });
+    markers.push({ index:bestIdx, trade:t, img:getAvatarImg(t.avatarURL) });
+  });
+  return markers;
+}
+// Draws a small clipped-circle avatar at each matched trade's chart position — lime ring for a
+// buy, red ring for a sell — and records where each ended up so canvas clicks can hit-test them
+// (see the click listener set up at chart creation, below).
+const tradeAvatarsPlugin = {
+  id:'tradeAvatars',
+  afterDatasetsDraw(chart, args, opts){
+    if(!opts || !opts.markers || !opts.markers.length) return;
+    const {ctx, scales, chartArea} = chart;
+    const R = 10;
+    const positions = [];
+    // Stagger markers that land on/near the same x index so they don't fully overlap.
+    const seenAtIndex = {};
+    opts.markers.forEach(m=>{
+      if(!m.img || !m.img.complete || !m.img.naturalWidth) { positions.push(null); return; }
+      const p = scales.y.getPixelForValue(chart.data.datasets[0].data[m.index]);
+      let x = scales.x.getPixelForValue(m.index);
+      const bump = (seenAtIndex[m.index]||0); seenAtIndex[m.index]=bump+1;
+      x += bump*16;
+      const y = p - R - 10 - (bump%2)*22; // float just above the line, alternate row on stack
+      if(x<chartArea.left-R || x>chartArea.right+R){ positions.push(null); return; }
+      const isSell = m.trade.type==='sell';
+      ctx.save();
+      ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2); ctx.closePath();
+      ctx.strokeStyle = isSell? '#FF4D6D' : '#C6FF3D';
+      ctx.lineWidth = 2.5; ctx.stroke();
+      ctx.save();
+      ctx.beginPath(); ctx.arc(x,y,R-2,0,Math.PI*2); ctx.closePath(); ctx.clip();
+      ctx.drawImage(m.img, x-(R-2), y-(R-2), (R-2)*2, (R-2)*2);
+      ctx.restore();
+      ctx.restore();
+      positions.push({x,y,r:R,trade:m.trade});
+    });
+    chart.$tradeAvatarPositions = positions.filter(Boolean);
+  }
+};
+
 function drawChart(coin, forceRebuild){
   const ctx = document.getElementById('priceChart');
   if(!ctx) return;
@@ -924,6 +1099,7 @@ function drawChart(coin, forceRebuild){
     return 0;
   });
   const pointColors = prices.map((p,i)=> i===0? UP : (p>=prices[i-1]? UP:DOWN));
+  const tradeMarkers = buildTradeMarkers(coin, windowed, window_);
 
   if(state.chart && !forceRebuild){
     // live update: patch data in place for a smooth, non-flickery redraw
@@ -934,6 +1110,7 @@ function drawChart(coin, forceRebuild){
     state.chart.data.datasets[0].pointBackgroundColor = pointColors;
     state.chart.options.plugins.currentPriceLine.price = prices[prices.length-1];
     state.chart.options.plugins.currentPriceLine.color = color;
+    state.chart.options.plugins.tradeAvatars.markers = tradeMarkers;
     state.chart.update('none');
     return;
   }
@@ -979,6 +1156,7 @@ function drawChart(coin, forceRebuild){
     options:{
       responsive:true, maintainAspectRatio:false, animation:{duration:300},
       plugins:{ legend:{display:false}, currentPriceLine:{price: prices[prices.length-1], color},
+        tradeAvatars:{ markers: tradeMarkers },
         tooltip:{ mode:'index', intersect:false,
         backgroundColor:'#161425', borderColor:'rgba(255,255,255,0.1)', borderWidth:1, padding:10,
         callbacks:{ label:(c)=> fmtPrice(c.parsed.y) } } },
@@ -988,8 +1166,20 @@ function drawChart(coin, forceRebuild){
       },
       interaction:{mode:'nearest',axis:'x',intersect:false}
     },
-    plugins:[currentPriceLinePlugin]
+    plugins:[currentPriceLinePlugin, tradeAvatarsPlugin]
   });
+
+  // Click a trade avatar to jump to that trader's profile — hit-tests against the positions the
+  // plugin recorded on its last draw (see tradeAvatarsPlugin.afterDatasetsDraw above).
+  ctx.onclick = (e)=>{
+    const positions = state.chart?.$tradeAvatarPositions;
+    if(!positions || !positions.length) return;
+    const rect = ctx.getBoundingClientRect();
+    const mx = e.clientX-rect.left, my = e.clientY-rect.top;
+    for(const p of positions){
+      if(Math.hypot(mx-p.x, my-p.y) <= p.r+3){ openProfile(p.trade.uid); return; }
+    }
+  };
 }
 function toMillis(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
 
@@ -1092,6 +1282,7 @@ async function doBuy(coinId, usdAmount){
         costBasis: (prevHold.costBasis||0) + finalUsd,
         totalBoughtUsd: (prevHold.totalBoughtUsd||0) + finalUsd,
         totalSoldUsd: prevHold.totalSoldUsd||0, realizedPnl: prevHold.realizedPnl||0,
+        firstBuyAt: prevTokens>0.0001 ? (prevHold.firstBuyAt||Date.now()) : Date.now(),
         updatedAt: Date.now()
       }, {merge:true});
       const activityRef = doc(collection(db,'activity'));
@@ -1106,7 +1297,9 @@ async function doBuy(coinId, usdAmount){
     if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at ${Math.round(MAX_OWNERSHIP_PCT*100)}% ownership, rest refunded.`, 'ok');
     else toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
     state.tradeAmount = 0;
-    refreshNetWorthSnapshot();
+    const nw = await refreshNetWorthSnapshot();
+    checkMilestones(null, nw);
+    checkRankOvertake();
   }catch(err){ toast(err.message, 'err'); }
   coinsWithPendingUserTrade.delete(coinId);
   if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
@@ -1171,13 +1364,16 @@ async function doSell(coinId, tokenAmount){
       tx.set(closedRef, {
         coinId: coin.id||coinId, ticker: coin.ticker, name: coin.name, imageURL: coin.imageURL||'',
         tokensSold: tokenAmount, costBasis: costRemoved, proceeds: usdOut, pnl: usdOut-costRemoved,
+        heldMs: Date.now() - (prevHold.firstBuyAt || Date.now()),
         closedAt: Date.now()
       });
-      return usdOut;
+      return { usdOut, pnl: usdOut-costRemoved };
     });
-    toast(`Sold for ${fmtUsd(result)}!`, 'ok');
+    toast(`Sold for ${fmtUsd(result.usdOut)}!`, 'ok');
     state.tradeAmount = 0;
-    refreshNetWorthSnapshot();
+    const nw = await refreshNetWorthSnapshot();
+    checkMilestones(result.pnl, nw);
+    checkRankOvertake();
   }catch(err){ toast(err.message, 'err'); }
   coinsWithPendingUserTrade.delete(coinId);
   if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
@@ -1198,7 +1394,7 @@ async function refreshNetWorthSnapshot(){
       if(coin) holdingsVal += sellValue(coin, h.tokens);
     }
     const uSnap = await getDoc(doc(db,'users',state.uid));
-    if(!uSnap.exists()) return;
+    if(!uSnap.exists()) return null;
     const u = uSnap.data();
     const netWorth = (u.balance||0) + holdingsVal;
     const now = Date.now();
@@ -1207,7 +1403,54 @@ async function refreshNetWorthSnapshot(){
     hist.push({t:now, nw:netWorth});
     if(hist.length>300) hist = hist.slice(-300);
     await updateDoc(doc(db,'users',state.uid), { netWorth, netWorthHistory: hist });
-  }catch(err){ /* leaderboard snapshotting is best-effort */ }
+    return netWorth;
+  }catch(err){ return null; /* leaderboard snapshotting is best-effort */ }
+}
+
+/* ===================== MILESTONES (confetti) ===================== */
+// First profitable trade, first $1,000 net worth, biggest single win — each fires once (tracked
+// via flags on the user doc) and triggers a confetti burst + toast. pnlThisSale is null for buys
+// (which can still trigger the net-worth milestone via unrealized gains, just not the P&L ones).
+async function checkMilestones(pnlThisSale, netWorth){
+  const u = state.userDoc; if(!u) return;
+  const ms = u.milestones||{};
+  const updates = {};
+  const fired = [];
+  netWorth = netWorth ?? (u.netWorth ?? u.balance ?? STARTING_BALANCE);
+  if(pnlThisSale!=null && pnlThisSale>0 && !ms.firstProfit){
+    updates['milestones.firstProfit'] = true;
+    fired.push('🎉 First profitable trade!');
+  }
+  if(netWorth>=1000 && !ms.first1k){
+    updates['milestones.first1k'] = true;
+    fired.push('💰 You hit $1,000 net worth!');
+  }
+  if(pnlThisSale!=null && pnlThisSale>(ms.bestWinPnl||0)){
+    updates['milestones.bestWinPnl'] = pnlThisSale;
+    if(pnlThisSale>0) fired.push(`🏆 New biggest win: ${fmtUsd(pnlThisSale)}!`);
+  }
+  if(Object.keys(updates).length){
+    try{ await updateDoc(doc(db,'users',state.uid), updates); }catch(err){}
+  }
+  fired.forEach(msg=>{ confettiBurst(); toast(msg, 'ok'); });
+}
+
+/* ===================== RANK OVERTAKE TOAST ===================== */
+let lastKnownRank = null, lastKnownRankRows = null;
+async function checkRankOvertake(){
+  try{
+    const snap = await getDocs(query(collection(db,'users'), orderBy('netWorth','desc'), limit(10)));
+    const rows = snap.docs.map((d,i)=>({uid:d.id, username:d.data().username, rank:i+1}));
+    const myRow = rows.find(r=>r.uid===state.uid);
+    if(!myRow){ lastKnownRank = null; lastKnownRankRows = rows; return; }
+    if(lastKnownRank!=null && myRow.rank<lastKnownRank){
+      const prevOccupant = (lastKnownRankRows||[]).find(r=>r.rank===myRow.rank && r.uid!==state.uid);
+      if(prevOccupant?.username) toast(`🚀 You just overtook @${prevOccupant.username} for #${myRow.rank}!`, 'ok', ()=> navigate('leaderboard'));
+      else toast(`🚀 You climbed to #${myRow.rank} on the leaderboard!`, 'ok', ()=> navigate('leaderboard'));
+    }
+    lastKnownRank = myRow.rank;
+    lastKnownRankRows = rows;
+  }catch(err){ /* best-effort — never blocks the trade flow */ }
 }
 
 /* ===================== BOT ACTIVITY ===================== */
@@ -1233,8 +1476,11 @@ let botRunning = false;
 
 function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
+const WHALE_THRESHOLD = 500; // usd — triggers a platform-wide whale alert toast for anyone online
+
 async function botBuyOnCoin(coinId, usdAmount, isExplosion){
   try{
+    let whaleInfo = null;
     await runTransaction(db, async (tx)=>{
       const coinRef = doc(db,'coins',coinId);
       const coinSnap = await tx.get(coinRef);
@@ -1242,11 +1488,13 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coin = coinSnap.data();
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       if(!(tokensOut>0)) return;
+      const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
+      if(usdAmount>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount, type:'buy' };
     });
-    if(isExplosion) toast(`💥 A whale just aped into a new coin!`, 'ok');
+    if(whaleInfo) await writeWhaleActivity(coinId, whaleInfo);
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
@@ -1256,6 +1504,7 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
 // ever ratchets price upward, which reads as fake; real memecoin charts pump AND dump.
 async function botSellOnCoin(coinId, usdAmount, isDump){
   try{
+    let whaleInfo = null;
     await runTransaction(db, async (tx)=>{
       const coinRef = doc(db,'coins',coinId);
       const coinSnap = await tx.get(coinRef);
@@ -1268,12 +1517,28 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
       if(tokenAmount > maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) return;
+      const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
+      if(usdOut>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount:usdOut, type:'sell' };
     });
-    if(isDump) toast(`📉 Paper hands are dumping a coin!`, 'err');
+    if(whaleInfo) await writeWhaleActivity(coinId, whaleInfo);
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
+}
+
+// Writes a bot whale trade to the global activity feed (tagged uid:'bot', mirroring the pattern
+// already used for bot-spawned coins) so the platform-wide whale alert listener picks it up for
+// everyone currently online — not just a toast in whichever tab happened to run this bot tick.
+async function writeWhaleActivity(coinId, info){
+  try{
+    await setDoc(doc(collection(db,'activity')), {
+      uid:'bot', username: info.username, avatarURL:'', isBot:true,
+      type: info.type, usdAmount: info.usdAmount, tokenAmount: 0,
+      coinId, ticker: info.ticker, coinName: info.coinName, coinImage: info.coinImage,
+      createdAt: serverTimestamp()
+    });
+  }catch(err){ /* silent */ }
 }
 
 /* ===================== BOT MARKET COINS ===================== */
@@ -1739,6 +2004,28 @@ async function renderPortfolio(){
 // top-level `activity` collection inside the same transaction as each real doBuy/doSell — bot
 // trades aren't logged here, since this is specifically about what real people are doing.
 let activityUnsub = null;
+/* ===================== WHALE ALERTS (platform-wide) ===================== */
+// Watches the global activity feed for anything at/above WHALE_THRESHOLD — real trades or bot
+// whale trades alike (see writeWhaleActivity above) — and surfaces a clickable toast for
+// EVERYONE currently online, not just whoever triggered the trade. Starts once at sign-in,
+// independent of whatever page you're on.
+let whaleAlertsReady = false;
+function listenWhaleAlerts(){
+  whaleAlertsReady = false;
+  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(5));
+  const un = onSnapshot(q, snap=>{
+    if(!whaleAlertsReady){ whaleAlertsReady = true; return; } // skip the initial existing batch
+    snap.docChanges().forEach(change=>{
+      if(change.type!=='added') return;
+      const t = change.doc.data();
+      if(!(t.usdAmount>=WHALE_THRESHOLD)) return;
+      const verb = t.type==='buy' ? 'dropped' : 'pulled';
+      toast(`🐋 @${t.username} just ${verb} ${fmtUsd(t.usdAmount)} ${t.type==='buy'?'into':'out of'} $${t.ticker}!`, 'ok', ()=> navigate('coin', t.coinId));
+    });
+  }, ()=>{ /* silent — non-critical */ });
+  state.unsubs.push(un);
+}
+
 function renderActivity(){
   const view = document.getElementById('view');
   view.innerHTML = `
@@ -2008,7 +2295,9 @@ async function renderUserProfile(uid){
     <div class="panel">
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
-      <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
+      <div class="settings-row"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
+      <div class="settings-row"><span>Streak</span><b class="mono" id="winStreakStat">—</b></div>
+      <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
     </div>
     <div class="panel" style="margin-top:16px;">
       <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
@@ -2028,6 +2317,8 @@ async function renderUserProfile(uid){
     if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
+    const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
+    const hEl = document.getElementById('handsStat'); if(hEl) hEl.textContent = handsBadgeText(closed);
   }catch(err){
     const openEl = document.getElementById('openPosList');
     if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
@@ -2040,6 +2331,28 @@ function winRateText(closed){
   if(!closed.length) return 'No sells yet';
   const wins = closed.filter(c=>(c.pnl||0)>0).length;
   return `${Math.round(wins/closed.length*100)}% (${wins}/${closed.length})`;
+}
+// closed is sorted most-recent-first (see loadPositions) — counts consecutive profitable sells
+// starting from the most recent one.
+function winStreakText(closed){
+  if(!closed.length) return '—';
+  let streak = 0;
+  for(const c of closed){
+    if((c.pnl||0)>0) streak++;
+    else break;
+  }
+  return streak>0 ? `🔥 ${streak} in a row` : 'No active streak';
+}
+// Average hold time across closed positions, classified into a fun badge. Thresholds are tuned
+// to this app's pace (bot coins can swing meaningfully within minutes), not real-market scale.
+function handsBadgeText(closed){
+  if(!closed.length) return '—';
+  const withDuration = closed.filter(c=>c.heldMs!=null);
+  if(!withDuration.length) return '—';
+  const avgMs = withDuration.reduce((sum,c)=>sum+c.heldMs,0)/withDuration.length;
+  const avgMin = avgMs/60000;
+  if(avgMin>=15) return `💎 Diamond Hands (avg ${avgMin>=60?(avgMin/60).toFixed(1)+'h':Math.round(avgMin)+'m'} hold)`;
+  return `🧻 Paper Hands (avg ${avgMin<1?Math.round(avgMs/1000)+'s':Math.round(avgMin)+'m'} hold)`;
 }
 /* ===================== PROFILE ===================== */
 function renderProfile(){
@@ -2062,7 +2375,9 @@ function renderProfile(){
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
-      <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
+      <div class="settings-row"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
+      <div class="settings-row"><span>Streak</span><b class="mono" id="winStreakStat">—</b></div>
+      <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
     </div>
     <div class="panel" style="margin-top:16px;">
       <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
@@ -2084,6 +2399,8 @@ function renderProfile(){
     if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
+    const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
+    const hEl = document.getElementById('handsStat'); if(hEl) hEl.textContent = handsBadgeText(closed);
   }).catch(err=>{
     const openEl = document.getElementById('openPosList');
     if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
