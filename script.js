@@ -1142,10 +1142,20 @@ async function spawnBotCoin(){
 let botCoinSpawnCheckCounter = 0;
 async function maybeSpawnBotCoin(){
   botCoinSpawnCheckCounter++;
-  if(botCoinSpawnCheckCounter % 4 !== 0) return; // only actually check roughly once a minute
+  const isFirstCheck = botCoinSpawnCheckCounter === 1;
+  if(!isFirstCheck && botCoinSpawnCheckCounter % 4 !== 0) return; // otherwise only check roughly once a minute
   try{
     const countSnap = await getCountFromServer(query(collection(db,'coins'), where('isBotCoin','==',true)));
-    if(countSnap.data().count >= BOT_COIN_POOL_CAP) return;
+    const count = countSnap.data().count;
+    if(count >= BOT_COIN_POOL_CAP) return;
+    // Bootstrap: if the pool is completely empty (e.g. first time this feature has ever run),
+    // spawn a handful right away instead of waiting on the ~5%-per-minute probabilistic trickle —
+    // otherwise Bot Market can sit empty for 15-20+ minutes before showing anything.
+    if(count===0){
+      const toSpawn = Math.min(5, BOT_COIN_POOL_CAP);
+      for(let i=0;i<toSpawn;i++) spawnBotCoin();
+      return;
+    }
     if(Math.random() < BOT_COIN_SPAWN_CHANCE) spawnBotCoin();
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
 }
