@@ -409,18 +409,14 @@ document.addEventListener('click', (e)=>{
   triggerPump(el.dataset.coin);
 }, true);
 
-// While a coin is in this map with a future timestamp, bot ticks (both the young-coin loop and
-// the Bot Market loop) skip any sell/dump roll on it entirely — real user sells are untouched,
-// this only mutes bot-generated sell pressure so a pump doesn't get immediately undone by the
-// same bots that would otherwise dump it right back down.
-const pumpSellSuppressUntil = new Map();
-
 function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
   const botCount = 10 + Math.floor(Math.random()*41); // 10-50
   const durationMs = 10000;
-  pumpSellSuppressUntil.set(coinId, Date.now()+5*60*1000); // 5 minutes of no bot sells on this coin
+  // Written to the coin doc itself (not local JS state) so it survives a hard refresh and is
+  // visible to every client checking this coin, not just the tab that triggered the pump.
+  updateDoc(doc(db,'coins',coinId), { pumpSellSuppressUntil: Date.now()+5*60*1000 }).catch(()=>{});
   toast(`🚀 Pump activated — ${botCount} bots aping in over the next 10 seconds (no bot sells on this coin for 5 min)`, 'ok');
   for(let i=0;i<botCount;i++){
     const delay = Math.random()*durationMs;
@@ -981,7 +977,6 @@ function getAvatarImg(url){
   let img = avatarImgCache.get(url);
   if(!img){
     img = new Image();
-    img.crossOrigin = 'anonymous';
     img.src = url;
     img.onload = ()=>{ if(state.chart) state.chart.update('none'); };
     avatarImgCache.set(url, img);
@@ -1455,7 +1450,7 @@ let botRunning = false;
 
 function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
-const WHALE_THRESHOLD = 500; // usd — triggers a platform-wide whale alert toast for anyone online
+const WHALE_THRESHOLD = 2500; // usd — triggers a platform-wide whale alert toast for anyone online
 
 async function botBuyOnCoin(coinId, usdAmount, isExplosion){
   try{
@@ -1755,7 +1750,7 @@ async function botCoinTick(){
       setTimeout(()=>{
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-        else if((pumpSellSuppressUntil.get(d.id)||0) <= Date.now()) botSellOnCoin(d.id, usd, big);
+        else if((coin.pumpSellSuppressUntil||0) <= Date.now()) botSellOnCoin(d.id, usd, big);
       }, Math.random()*12000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
@@ -1817,7 +1812,7 @@ async function botTick(){
       // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
       // take ages or look stuck when a lot of bot activity landed on the same coin at once.
       const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*12000);
-      const sellsSuppressed = (pumpSellSuppressUntil.get(d.id)||0) > Date.now();
+      const sellsSuppressed = (coin.pumpSellSuppressUntil||0) > Date.now();
       if(r < (acc += BOT_EXPLODE_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
@@ -2018,10 +2013,14 @@ function renderActivity(){
 function loadActivity(){
   if(activityUnsub) activityUnsub();
   const list = document.getElementById('activityList');
-  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(50));
+  // Fetch a bit more than we show — bot whale trades also live in this collection now (to power
+  // the whale alert listener) but shouldn't appear in the feed itself, which is specifically
+  // about real people. Filtering client-side and over-fetching a little compensates for however
+  // many of the most recent 50 get filtered out.
+  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(80));
   activityUnsub = onSnapshot(q, snap=>{
     if(!list) return;
-    const items = snap.docs.map(d=>({id:d.id,...d.data()}));
+    const items = snap.docs.map(d=>({id:d.id,...d.data()})).filter(t=>!t.isBot).slice(0,50);
     if(!items.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🕒</div>No trades yet — activity will show up here as people buy and sell.</div>`; return; }
     list.innerHTML = items.map(t=>`
       <div class="holder-line">
