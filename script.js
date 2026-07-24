@@ -5,9 +5,9 @@ import {
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
-  doc, getDoc, setDoc, updateDoc, onSnapshot, collection,
+  doc, getDoc, setDoc, updateDoc, onSnapshot, collection, collectionGroup,
   query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp,
-  getCountFromServer
+  getCountFromServer, writeBatch, deleteDoc
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyCMDe_UPrNTjKnEoO2ngTe7wE6P7_G06ms",
@@ -61,7 +61,6 @@ const K = INITIAL_SOL_RESERVE * INITIAL_TOKEN_RESERVE;
 // means no one buyer can dominate the curve, so price stays driven by many people trading rather
 // than one whale's bag, and it keeps any single position's exit slippage from being catastrophic.
 const MAX_OWNERSHIP_PCT = 0.35;
-const MAX_OWNERSHIP_TOKENS = INITIAL_TOKEN_RESERVE * MAX_OWNERSHIP_PCT;
 
 // Client-side "pump" easter egg, gated to one specific account. Like the rest of this demo
 // (see SETUP.md), this is enforced in the browser, not by Firestore rules — a determined user
@@ -145,8 +144,9 @@ function esc(s){ const d=document.createElement('div'); d.textContent = s==null?
 
 /* AMM math */
 function priceOf(coin){ return coin.solReserve / coin.tokenReserve; }
-function marketCapOf(coin){ return priceOf(coin) * INITIAL_TOKEN_RESERVE; }
-function circulatingOf(coin){ return INITIAL_TOKEN_RESERVE - coin.tokenReserve; }
+function totalSupplyOf(coin){ return coin.totalSupply||INITIAL_TOKEN_RESERVE; }
+function marketCapOf(coin){ return priceOf(coin) * totalSupplyOf(coin); }
+function circulatingOf(coin){ return totalSupplyOf(coin) - coin.tokenReserve; }
 
 // Standard constant-product swap math, computed directly from current reserves rather than
 // via newSol = coin.solReserve+v; newTok = K/newSol; tokensOut = coin.tokenReserve-newTok.
@@ -369,6 +369,109 @@ function triggerPump(coinId){
   setTimeout(()=> activePumps.delete(coinId), durationMs+3000);
 }
 
+/* ===================== ADMIN "RESET ECONOMY" CONTROL ===================== */
+// Hold Right Shift (only does anything for the gated admin account) to reveal a floating button
+// that wipes every user-launched coin, clears the global activity feed, and resets every account's
+// balance/holdings/closed positions back to a clean start. Bot Market coins are left untouched.
+// The client-side isPumpAdmin() check just decides whether to SHOW the button — the real security
+// boundary is in Firestore rules, which only grant delete/cross-account-write power to the auth
+// token whose *verified* email matches the admin account (see isAdmin() in firestore.rules), so
+// this can't be exercised by spoofing local state the way the pump feature technically could be.
+let rightShiftDown = false;
+let resetFabEl = null;
+function showResetFab(){
+  if(resetFabEl) return;
+  resetFabEl = document.createElement('button');
+  resetFabEl.className = 'admin-reset-fab';
+  resetFabEl.textContent = '☢️ Reset Economy';
+  resetFabEl.addEventListener('click', openResetConfirmModal);
+  document.body.appendChild(resetFabEl);
+}
+function hideResetFab(){ if(resetFabEl){ resetFabEl.remove(); resetFabEl = null; } }
+
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ShiftRight') return;
+  rightShiftDown = true;
+  if(isPumpAdmin()) showResetFab();
+});
+document.addEventListener('keyup', (e)=>{
+  if(e.code!=='ShiftRight') return;
+  rightShiftDown = false;
+  hideResetFab();
+});
+window.addEventListener('blur', ()=>{ rightShiftDown=false; hideResetFab(); });
+
+function openResetConfirmModal(){
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box">
+      <h3>☢️ Reset the entire economy?</h3>
+      <p style="color:var(--txt-dim);font-size:13.5px;line-height:1.6;margin:10px 0 16px;">
+        This permanently deletes every user-launched coin and frees up their tickers, clears the
+        global Activity feed, and resets <b>every</b> account's cash, holdings, and closed positions
+        back to a fresh $${STARTING_BALANCE}. Bot Market coins are left alone. This cannot be undone.
+      </p>
+      <label class="flabel">Type RESET to confirm</label>
+      <input class="field" id="resetConfirmInput" placeholder="RESET" autocomplete="off">
+      <div style="display:flex;gap:10px;margin-top:16px;">
+        <button class="btn btn-ghost btn-block" id="resetCancel">Cancel</button>
+        <button class="btn btn-block" id="resetConfirmBtn" style="background:var(--down);color:#fff;" disabled>Reset Everything</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  const input = document.getElementById('resetConfirmInput');
+  const confirmBtn = document.getElementById('resetConfirmBtn');
+  input.addEventListener('input', ()=>{ confirmBtn.disabled = input.value.trim().toUpperCase()!=='RESET'; });
+  document.getElementById('resetCancel').addEventListener('click', ()=> overlay.remove());
+  confirmBtn.addEventListener('click', async ()=>{
+    overlay.remove(); hideResetFab();
+    await performAdminReset();
+  });
+}
+
+async function performAdminReset(){
+  toast('☢️ Resetting the economy — this may take a moment…', 'ok');
+  try{
+    let batch = writeBatch(db), ops = 0;
+    const commit = async ()=>{ if(ops>0){ await batch.commit(); batch = writeBatch(db); ops = 0; } };
+    const queueDelete = async (ref)=>{ batch.delete(ref); ops++; if(ops>=450) await commit(); };
+    const queueUpdate = async (ref, data)=>{ batch.update(ref, data); ops++; if(ops>=450) await commit(); };
+
+    // Delete every user-launched coin (and its ticker doc, freeing the name) — Bot Market left alone.
+    const coinsSnap = await getDocs(collection(db,'coins'));
+    for(const d of coinsSnap.docs){
+      const c = d.data();
+      if(c.isBotCoin) continue;
+      await queueDelete(d.ref);
+      if(c.ticker) await queueDelete(doc(db,'tickers',c.ticker));
+    }
+
+    // Wipe the global activity feed.
+    const actSnap = await getDocs(collection(db,'activity'));
+    for(const d of actSnap.docs) await queueDelete(d.ref);
+
+    // Reset every account: balance/net worth back to start, and wipe holdings + closed positions.
+    const usersSnap = await getDocs(collection(db,'users'));
+    for(const uDoc of usersSnap.docs){
+      await queueUpdate(uDoc.ref, {
+        balance: STARTING_BALANCE, netWorth: STARTING_BALANCE,
+        netWorthHistory: [{t:Date.now(), nw:STARTING_BALANCE}]
+      });
+      const holdSnap = await getDocs(collection(db,'users',uDoc.id,'holdings'));
+      for(const h of holdSnap.docs) await queueDelete(h.ref);
+      const closedSnap = await getDocs(collection(db,'users',uDoc.id,'closedPositions'));
+      for(const c of closedSnap.docs) await queueDelete(c.ref);
+    }
+
+    await commit();
+    toast('☢️ Economy reset — everyone is back to $'+STARTING_BALANCE+'.', 'ok');
+  }catch(err){
+    toast('Reset failed: '+err.message, 'err');
+  }
+}
+
 
 let homeUnsub = null, homeSort='new', homeCategory='user';
 function renderHome(){
@@ -468,7 +571,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -522,7 +625,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED — delisting soon</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -534,7 +637,7 @@ function buildCoinDetailShell(coin){
         <div class="panel">
           <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
             <div><div style="font-size:11.5px;color:var(--txt-dim);">MARKET CAP</div><div class="mono" style="font-weight:600;" id="liveMcap">${fmtUsd(mc)}</div></div>
-            <div><div style="font-size:11.5px;color:var(--txt-dim);">SUPPLY</div><div class="mono" style="font-weight:600;">${fmtTok(INITIAL_TOKEN_RESERVE)}</div></div>
+            <div><div style="font-size:11.5px;color:var(--txt-dim);">SUPPLY</div><div class="mono" style="font-weight:600;">${fmtTok(totalSupplyOf(coin))}</div></div>
             <div><div style="font-size:11.5px;color:var(--txt-dim);">TRADES</div><div class="mono" style="font-weight:600;" id="liveTradeCount">${(coin.tradeCount||0)}</div></div>
           </div>
           <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
@@ -560,6 +663,11 @@ function buildCoinDetailShell(coin){
         </div>
 
         <div class="panel" style="margin-top:16px;">
+          <div style="font-weight:700;margin-bottom:10px;">Top Holders</div>
+          <div id="topHoldersList"><div class="spinner" style="margin:10px 0;"></div></div>
+        </div>
+
+        <div class="panel" style="margin-top:16px;">
           <div style="font-weight:700;margin-bottom:10px;">Recent Trades</div>
           <div id="recentTradesList">${recentTradesHtml(trades)}</div>
         </div>
@@ -579,6 +687,7 @@ function buildCoinDetailShell(coin){
 
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('home'));
   wireUserLinks(view);
+  loadTopHolders(coin.id);
   drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
     b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin, true); });
@@ -608,6 +717,38 @@ function wireUserLinks(container){
   });
 }
 
+// Uses a Firestore collection-group query across every user's `holdings` subcollection, filtered
+// to this one coin — only works for holdings written after coinId/username/avatarURL started
+// being denormalized onto each holding doc, so older untouched holdings just won't show up here
+// until that holder trades again. Needs a collection-group composite index (coinId + tokens) —
+// see SETUP.md.
+async function loadTopHolders(coinId){
+  const list = document.getElementById('topHoldersList');
+  if(!list) return;
+  try{
+    const snap = await getDocs(query(collectionGroup(db,'holdings'), where('coinId','==',coinId), orderBy('tokens','desc'), limit(15)));
+    const coin = state.coinsCache.get(coinId);
+    const totalSupply = coin ? totalSupplyOf(coin) : INITIAL_TOKEN_RESERVE;
+    const holders = snap.docs.map(d=>({ uid: d.ref.parent.parent.id, ...d.data() })).filter(h=>h.tokens>0.0001);
+    if(!holders.length){ list.innerHTML = '<div class="empty" style="padding:16px;">No holders yet.</div>'; return; }
+    list.innerHTML = holders.map(h=>{
+      const pct = totalSupply? (h.tokens/totalSupply)*100 : 0;
+      return `
+      <div class="holder-line">
+        <div class="user-link" data-uid="${h.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <img class="avatar-sm" src="${avatarFor(h.username, h.avatarURL)}" style="border-radius:50%;">
+          <span>@${esc(h.username||'anon')}</span>
+        </div>
+        <span class="mono" style="margin-left:auto;">${fmtTok(h.tokens)}</span>
+        <span style="font-size:11.5px;color:var(--txt-dim);min-width:44px;text-align:right;">${pct.toFixed(1)}%</span>
+      </div>`;
+    }).join('');
+    wireUserLinks(list);
+  }catch(err){
+    list.innerHTML = `<div class="empty">Couldn't load holders${err.code==='failed-precondition'?' — needs a Firestore index (see SETUP.md)':''}.</div>`;
+  }
+}
+
 // Cheap refresh used on every live snapshot after the shell already exists.
 // Never touches the trade amount input, so typing isn't interrupted by other users' trades.
 function updateCoinDetailLive(coin){
@@ -627,7 +768,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED — delisting soon</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -644,6 +785,9 @@ function rebuildTradePanel(coin){
 
 function buyPanelHtml(coin){
   const bal = state.userDoc?.balance||0;
+  if(coin.ruggedAt){
+    return `<div class="empty" style="padding:24px 12px;">💀 This coin got rugged and is being delisted. You can still sell to exit, but buying is disabled.</div>`;
+  }
   return `
     <div class="amt-display"><input id="tradeAmt" inputmode="decimal" placeholder="$0" value="${state.tradeAmount||''}"></div>
     <div class="amt-sub">Balance: ${fmtUsd(bal)}</div>
@@ -838,6 +982,45 @@ function drawChart(coin, forceRebuild){
 }
 function toMillis(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
 
+let pfChartInstance = null;
+function drawPortfolioChart(){
+  const ctx = document.getElementById('pfChart');
+  if(!ctx) return;
+  if(typeof Chart === 'undefined'){
+    ctx.parentElement.insertAdjacentHTML('beforeend','<div style="text-align:center;color:var(--txt-faint);font-size:12px;padding-top:10px;">Chart library failed to load.</div>');
+    return;
+  }
+  if(pfChartInstance){ pfChartInstance.destroy(); pfChartInstance = null; }
+  let hist = (state.userDoc?.netWorthHistory||[]).slice().sort((a,b)=>a.t-b.t);
+  if(!hist.length) hist = [{t:Date.now(), nw:STARTING_BALANCE}];
+  if(hist.length===1) hist = [{t:hist[0].t-1000, nw:hist[0].nw}, hist[0]];
+  const labels = hist.map(h=> new Date(h.t).toLocaleDateString([], {month:'short', day:'numeric'}));
+  const values = hist.map(h=>h.nw);
+  const up = values[values.length-1] >= values[0];
+  const color = up? '#C6FF3D' : '#FF4D6D';
+  pfChartInstance = new Chart(ctx, {
+    type:'line',
+    data:{ labels, datasets:[{
+      data: values, borderColor: color, borderWidth:2, tension:.15, pointRadius:0, pointHoverRadius:4,
+      fill:true,
+      backgroundColor:(context)=>{
+        const g = context.chart.ctx.createLinearGradient(0,0,0,180);
+        g.addColorStop(0, up? 'rgba(198,255,61,0.2)':'rgba(255,77,109,0.2)');
+        g.addColorStop(1, 'rgba(0,0,0,0)');
+        return g;
+      }
+    }]},
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:{duration:300},
+      plugins:{ legend:{display:false}, tooltip:{ backgroundColor:'#161425', borderColor:'rgba(255,255,255,0.1)', borderWidth:1, padding:10, callbacks:{ label:(c)=>fmtUsd(c.parsed.y) } } },
+      scales:{
+        x:{ grid:{display:false}, ticks:{ color:'#615C7D', maxTicksLimit:5, font:{size:10} } },
+        y:{ grid:{color:'rgba(255,255,255,0.05)'}, ticks:{ color:'#615C7D', font:{size:10}, callback:(v)=>fmtUsd(v) } }
+      }
+    }
+  });
+}
+
 /* ===================== TRADE EXECUTION ===================== */
 async function doBuy(coinId, usdAmount){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
@@ -853,15 +1036,16 @@ async function doBuy(coinId, usdAmount){
       const user = userSnap.data(); const coin = coinSnap.data();
       if(user.balance < usdAmount) throw new Error("You don't have enough balance.");
       const prevTokens = holdSnap.exists()? holdSnap.data().tokens:0;
-      if(prevTokens >= MAX_OWNERSHIP_TOKENS) throw new Error("You already hold the max allowed 80% of this coin's supply.");
+      const maxOwnershipTokens = totalSupplyOf(coin)*MAX_OWNERSHIP_PCT;
+      if(prevTokens >= maxOwnershipTokens) throw new Error(`You already hold the max allowed ${Math.round(MAX_OWNERSHIP_PCT*100)}% of this coin's supply.`);
 
       let { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       let finalUsd = usdAmount, wasCapped = false;
 
-      // If this buy would push the buyer over 80% of total supply, only fill it up to the cap
+      // If this buy would push the buyer over the ownership cap, only fill it up to the cap
       // and charge/refund accordingly instead of rejecting the whole trade outright.
-      if(prevTokens + tokensOut > MAX_OWNERSHIP_TOKENS){
-        const capTokens = MAX_OWNERSHIP_TOKENS - prevTokens;
+      if(prevTokens + tokensOut > maxOwnershipTokens){
+        const capTokens = maxOwnershipTokens - prevTokens;
         const denom = coin.tokenReserve - capTokens;
         if(!(capTokens>0) || denom<=0) throw new Error("Not enough of this coin left in the curve to buy more.");
         finalUsd = (capTokens*coin.solReserve)/denom;
@@ -873,12 +1057,13 @@ async function doBuy(coinId, usdAmount){
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
       const prevHold = holdSnap.exists()? holdSnap.data() : {};
       tx.set(holdRef, {
         tokens: prevTokens+tokensOut, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'',
+        coinId, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
         costBasis: (prevHold.costBasis||0) + finalUsd,
         totalBoughtUsd: (prevHold.totalBoughtUsd||0) + finalUsd,
         totalSoldUsd: prevHold.totalSoldUsd||0, realizedPnl: prevHold.realizedPnl||0,
@@ -919,7 +1104,7 @@ async function doSell(coinId, tokenAmount){
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       tx.update(userRef, { balance: user.balance + usdOut });
       // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
       // so open positions (unrealized) and closed positions (realized) can both be shown accurately.
@@ -929,6 +1114,7 @@ async function doSell(coinId, tokenAmount){
       const costRemoved = Math.min(prevCostBasis, avgCost*tokenAmount);
       tx.set(holdRef, {
         tokens: owned-tokenAmount, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'',
+        coinId, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
         costBasis: Math.max(0, prevCostBasis-costRemoved),
         totalBoughtUsd: prevHold.totalBoughtUsd||0,
         totalSoldUsd: (prevHold.totalSoldUsd||0) + usdOut,
@@ -1021,7 +1207,7 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       if(!(tokensOut>0)) return;
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
     });
     if(isExplosion) toast(`💥 A whale just aped into a new coin!`, 'ok');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
@@ -1047,7 +1233,7 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
       if(!(usdOut>0)) return;
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-20);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
     });
     if(isDump) toast(`📉 Paper hands are dumping a coin!`, 'err');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
@@ -1060,8 +1246,16 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
 // practice reading — no waiting around for real people to launch and trade something.
 const BOT_COIN_POOL_CAP = 18;         // don't let the pool of bot coins grow unbounded
 const BOT_COIN_SPAWN_CHANCE = 0.05;   // rolled roughly once a minute (see spawnCheckCounter below)
-const BOT_COIN_TRADE_CHANCE = 0.65;   // per bot coin, per 14s tick — much livelier than young-coin noise
+const BOT_COIN_TRADE_CHANCE = 0.75;   // per bot coin, per 14s tick — much livelier than young-coin noise
 const BOT_COIN_QUERY_LIMIT = 30;
+// Rare, dramatic crash-and-delist event — mirrors how real memecoins actually behave, and gives
+// holding a bot coin genuine stakes instead of it just being a risk-free chart to watch. ~0.15%
+// chance per coin per tick means most coins live a good while, but over a long enough run it's
+// basically guaranteed eventually. After the crash, the coin sticks around briefly (so the crash
+// is actually visible/tradeable) before being delisted to make room for a fresh spawn.
+const BOT_COIN_RUG_CHANCE = 0.0015;
+const BOT_COIN_RUG_MIN_AGE_MS = 15*60*1000; // too unfair to rug something seconds after it's born
+const BOT_COIN_RUG_CLEANUP_MS = 45*1000;    // how long a rugged coin lingers, crashed, before delisting
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -1069,26 +1263,35 @@ const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster'
 function hashStr(s){ let h=0; for(let i=0;i<s.length;i++){ h=(h*31+s.charCodeAt(i))|0; } return h; }
 // Deterministic pseudo-random "mood" for a given coin over a short window, so price action has
 // believable runs (trending up, then down) instead of pure tick-to-tick noise — same idea real
-// charts show, without needing any server-side state to track it. Shorter bucket than before
-// (2.5 min) so the mood flips more often, giving snappier up/down swings rather than long flats.
-function botCoinTrendBias(coinId){
-  const bucket = Math.floor(Date.now()/(2.5*60*1000));
+// charts show, without needing any server-side state to track it. Short bucket (90s) so the mood
+// flips often, giving frequent up/down reversals rather than long flat stretches.
+function botCoinTrendBias(coinId, atMs){
+  const bucket = Math.floor((atMs??Date.now())/(90*1000));
   const x = Math.abs(Math.sin(hashStr(coinId+':'+bucket)))*10000;
   return (x-Math.floor(x))*2-1; // -1..1
 }
 function botCoinTradeSize(){
   const r = Math.random();
-  if(r<0.10) return 800+Math.random()*4200;  // whale-sized swing — real volatility spikes
-  if(r<0.40) return 100+Math.random()*450;   // medium
-  return 8+Math.random()*90;                  // typical small/medium
+  if(r<0.16) return 1200+Math.random()*6800;  // whale-sized swing — big, real volatility spikes
+  if(r<0.50) return 150+Math.random()*650;    // medium
+  return 10+Math.random()*120;                 // typical small/medium
 }
 
 // Fabricates a plausible "this coin has been live for hours" backstory at spawn time: a wobbly
 // random-walk price history, a trade count already in the thousands, and a handful of recent
 // trades — so a freshly-spawned bot coin immediately looks like an established, volatile market
 // instead of starting flat at zero like a brand new launch.
+// Bot coins deliberately use a small, human-scale supply (thousands to tens of millions, chosen
+// per coin) instead of the 1B/fraction-of-a-cent scale community coins use. That's what keeps a
+// normal $50 buy landing on a modest, plausible number of tokens instead of millions — with a 1B
+// supply, millions of tokens per dollar is unavoidable math, not a bug, so the fix is a smaller
+// supply, not a deeper curve.
+const BOT_COIN_SUPPLY_CHOICES = [100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000];
+
 function simulateBotCoinLaunch(){
-  const initPrice = INITIAL_SOL_RESERVE/INITIAL_TOKEN_RESERVE;
+  const totalSupply = BOT_COIN_SUPPLY_CHOICES[Math.floor(Math.random()*BOT_COIN_SUPPLY_CHOICES.length)];
+  const startMcap = 2000+Math.random()*78000; // wide spread — some tiny, some near graduation-scale
+  const initPrice = startMcap/totalSupply;
   const steps = 90;
   const stepGapMs = Math.floor((3+Math.random()*6)*3600000/steps); // spread over a fake 3-9hr past
   let p = initPrice;
@@ -1096,9 +1299,11 @@ function simulateBotCoinLaunch(){
   const now = Date.now();
   for(let i=0;i<steps;i++){
     let mult;
-    if(Math.random()<0.08) mult = 1 + (Math.random()<0.5?-1:1)*(0.25+Math.random()*0.35); // occasional big jump
-    else mult = 1 + (Math.random()-0.5)*0.12; // normal wobble
-    p = Math.max(initPrice*0.05, p*mult);
+    // Bigger and more frequent moves than a community coin's organic trading — this is what's
+    // "priced in" as the coin's whole simulated history, so it should already look properly wild.
+    if(Math.random()<0.14) mult = 1 + (Math.random()<0.5?-1:1)*(0.35+Math.random()*0.55); // big jump
+    else mult = 1 + (Math.random()-0.5)*0.22; // energetic wobble
+    p = Math.max(initPrice*0.03, p*mult);
     priceHistory.push({ p, t: now-(steps-i)*stepGapMs });
   }
   const recentTrades = [];
@@ -1106,11 +1311,11 @@ function simulateBotCoinLaunch(){
     const isBuy = Math.random()<0.5;
     recentTrades.push({
       uid:'bot', username: randBotName(), type: isBuy?'buy':'sell',
-      usdAmount: 8+Math.random()*300, tokenAmount: 1000+Math.random()*500000,
+      usdAmount: 8+Math.random()*300, tokenAmount: 20+Math.random()*5000,
       t: now-(14-i)*(stepGapMs/3), isBot:true
     });
   }
-  return { priceHistory, currentPrice: p, tradeCountSeed: 900+Math.floor(Math.random()*5200), recentTrades };
+  return { priceHistory, currentPrice: p, tradeCountSeed: 900+Math.floor(Math.random()*5200), recentTrades, totalSupply };
 }
 
 async function makeUniqueBotTicker(){
@@ -1131,28 +1336,30 @@ async function spawnBotCoin(){
     const picked = await makeUniqueBotTicker();
     if(!picked) return;
     const { name, ticker } = picked;
-    const { priceHistory, currentPrice, tradeCountSeed, recentTrades } = simulateBotCoinLaunch();
+    const { priceHistory, currentPrice, tradeCountSeed, recentTrades, totalSupply } = simulateBotCoinLaunch();
     // Liquidity depth is chosen directly in dollar terms (same order of magnitude as a real
     // community coin's $8,000 depth) rather than derived from the fabricated price walk. Deriving
     // it from price meant a coin whose random walk happened to land low ended up with almost no
     // liquidity (e.g. a coin sitting at a fraction of a cent could have only ~$900 in reserve),
     // so a completely ordinary $95 buy could scoop up tens of millions of tokens. Picking depth
     // independently, then solving tokenReserve = solReserve / price, keeps token payout per
-    // dollar sane regardless of where the price walk ended up.
+    // dollar sane regardless of where the price walk ended up. tokenReserve is clamped against
+    // THIS coin's own totalSupply (not the 1B community-coin constant) — bot coins run on a much
+    // smaller, human-scale supply, see BOT_COIN_SUPPLY_CHOICES above.
     let solReserve = 4000+Math.random()*12000;
     let tokenReserve = solReserve/currentPrice;
-    const MIN_TOK = INITIAL_TOKEN_RESERVE*0.05, MAX_TOK = INITIAL_TOKEN_RESERVE*0.95;
+    const MIN_TOK = totalSupply*0.05, MAX_TOK = totalSupply*0.95;
     if(tokenReserve < MIN_TOK) tokenReserve = MIN_TOK;
     if(tokenReserve > MAX_TOK) tokenReserve = MAX_TOK;
     solReserve = currentPrice*tokenReserve; // keep price = solReserve/tokenReserve consistent after clamping
     const coinRef = doc(collection(db,'coins'));
     await setDoc(coinRef, {
       name, ticker, description:'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
-      imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true,
+      imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
-      price: currentPrice, marketCap: currentPrice*INITIAL_TOKEN_RESERVE,
+      price: currentPrice, marketCap: currentPrice*totalSupply,
       priceHistory, recentTrades, tradeCount: tradeCountSeed,
-      createdAt: serverTimestamp()
+      createdAt: serverTimestamp(), lastTickAt: Date.now()
     });
     await setDoc(doc(db,'tickers',ticker), { coinId: coinRef.id });
   }catch(err){ /* silent — e.g. a rare ticker race; next spawn check will just try again */ }
@@ -1179,21 +1386,123 @@ async function maybeSpawnBotCoin(){
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
 }
 
+// This is a static site with no server — literally nothing can move while zero browser tabs are
+// open anywhere. What we CAN do: the moment any tab reopens, check how long it's been since a
+// bot coin last ticked and replay that whole gap as a compressed batch of simulated ticks (same
+// trade logic as the live loop, same trend-bias sequence so it reads as one coherent stretch of
+// history, not random static) — then write the result in a single update. From the person's
+// perspective their bot-coin holdings really did drift while they were away; it's just computed
+// in one lump sum on return rather than trickling in continuously.
+const BOT_COIN_CATCHUP_MAX_TICKS = 350; // cap ~80 min worth of simulated ticks per coin per catch-up
+function toMillisLoose(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
+
+async function catchUpBotCoin(coinId, coin){
+  const lastTs = toMillisLoose(coin.lastTickAt || (coin.priceHistory?.length ? coin.priceHistory[coin.priceHistory.length-1].t : Date.now()));
+  const elapsed = Date.now()-lastTs;
+  const ticksOwed = Math.floor(elapsed/BOT_TICK_MS);
+  if(ticksOwed < 3) return; // not stale enough to bother — the live loop will pick it up shortly anyway
+  const steps = Math.min(ticksOwed, BOT_COIN_CATCHUP_MAX_TICKS);
+  let solReserve = coin.solReserve, tokenReserve = coin.tokenReserve;
+  let hist = (coin.priceHistory||[]).slice();
+  let trades = (coin.recentTrades||[]).slice();
+  let tradeCount = coin.tradeCount||0;
+  for(let i=0;i<steps;i++){
+    if(Math.random() >= BOT_COIN_TRADE_CHANCE) continue;
+    const simTime = lastTs + (i+1)*BOT_TICK_MS;
+    const bias = botCoinTrendBias(coinId, simTime);
+    const buyChance = Math.min(0.95, Math.max(0.05, 0.5+bias*0.5));
+    const usd = botCoinTradeSize();
+    if(Math.random() < buyChance){
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy({solReserve,tokenReserve}, usd);
+      if(tokensOut>0){
+        solReserve=newSol; tokenReserve=newTok; tradeCount++;
+        hist.push({p:newPrice,t:simTime});
+        trades.push({uid:'bot',username:randBotName(),type:'buy',usdAmount:usd,tokenAmount:tokensOut,t:simTime,isBot:true});
+      }
+    } else {
+      const price = solReserve/tokenReserve;
+      let tokenAmount = usd/price;
+      const maxSellable = tokenReserve*0.05;
+      if(tokenAmount>maxSellable) tokenAmount = maxSellable;
+      const { usdOut, newSol, newTok, newPrice } = ammSell({solReserve,tokenReserve}, tokenAmount);
+      if(usdOut>0){
+        solReserve=newSol; tokenReserve=newTok; tradeCount++;
+        hist.push({p:newPrice,t:simTime});
+        trades.push({uid:'bot',username:randBotName(),type:'sell',usdAmount:usdOut,tokenAmount,t:simTime,isBot:true});
+      }
+    }
+  }
+  hist = hist.slice(-160); trades = trades.slice(-20);
+  const newPrice = solReserve/tokenReserve;
+  try{
+    await updateDoc(doc(db,'coins',coinId), {
+      solReserve, tokenReserve, price:newPrice, marketCap:newPrice*totalSupplyOf(coin),
+      priceHistory:hist, recentTrades:trades, tradeCount, lastTickAt: Date.now()
+    });
+  }catch(err){ /* another tab may have just done the same catch-up — fine either way */ }
+}
+
+async function catchUpAllBotCoins(){
+  try{
+    const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT)));
+    for(const d of snap.docs) await catchUpBotCoin(d.id, d.data());
+  }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+}
+
 async function botCoinTick(){
   try{
     const q = query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT));
     const snap = await getDocs(q);
     snap.docs.forEach(d=>{
+      const coin = d.data();
+      if(coin.ruggedAt){
+        if(Date.now()-toMillisLoose(coin.ruggedAt) > BOT_COIN_RUG_CLEANUP_MS) cleanupRuggedCoin(d.id, coin);
+        return;
+      }
+      const ageMs = Date.now()-toMillisLoose(coin.createdAt);
+      if(ageMs > BOT_COIN_RUG_MIN_AGE_MS && Math.random() < BOT_COIN_RUG_CHANCE){ ruggedCoinEvent(d.id); return; }
       if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
       const bias = botCoinTrendBias(d.id);
-      const buyChance = Math.min(0.9, Math.max(0.1, 0.5+bias*0.4));
+      const buyChance = Math.min(0.95, Math.max(0.05, 0.5+bias*0.5));
       const usd = botCoinTradeSize();
-      const big = usd>600;
+      const big = usd>800;
       if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
       else botSellOnCoin(d.id, usd, big);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
+}
+
+async function ruggedCoinEvent(coinId){
+  let ticker = '';
+  try{
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const c = snap.data();
+      if(c.ruggedAt) return; // already rugged by another tab racing this same tick
+      ticker = c.ticker;
+      const crashFactor = 0.02+Math.random()*0.08; // keep 2-10% of liquidity → 90-98% price crash
+      const newSol = c.solReserve*crashFactor;
+      const newPrice = newSol/c.tokenReserve;
+      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-20);
+      tx.update(coinRef, {
+        solReserve:newSol, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
+        priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1,
+        ruggedAt: Date.now(), lastTickAt: Date.now()
+      });
+    });
+    if(ticker) toast(`💀 $${ticker} just got rugged — crashed ~90%+ in seconds.`, 'err');
+  }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
+}
+
+async function cleanupRuggedCoin(coinId, coin){
+  try{
+    await deleteDoc(doc(db,'coins',coinId));
+    if(coin.ticker) await deleteDoc(doc(db,'tickers',coin.ticker)).catch(()=>{});
+  }catch(err){ /* another tab may already be cleaning this one up — fine either way */ }
 }
 
 async function botTick(){
@@ -1229,6 +1538,7 @@ async function botTick(){
 function startBots(){
   if(botRunning) return;
   botRunning = true;
+  catchUpAllBotCoins(); // fast-forward anything that went stale while nobody had a tab open
   // Self-scheduling with jitter (±3s) rather than a fixed setInterval — if two tabs (or, before
   // the fix above, two loops in the same tab) both tick on a perfectly synced clock, they're far
   // more likely to race to update the same document at the same instant. Randomized spacing
@@ -1289,7 +1599,7 @@ async function submitCreateCoin(){
     await setDoc(coinRef, {
       name, ticker, description:desc, imageURL,
       creatorUid: state.uid, creatorUsername: state.userDoc.username, isBotCoin:false,
-      solReserve: INITIAL_SOL_RESERVE, tokenReserve: INITIAL_TOKEN_RESERVE,
+      solReserve: INITIAL_SOL_RESERVE, tokenReserve: INITIAL_TOKEN_RESERVE, totalSupply: INITIAL_TOKEN_RESERVE,
       price: initPrice, marketCap: initPrice*INITIAL_TOKEN_RESERVE,
       priceHistory: [{p:initPrice, t:Date.now()}], recentTrades: [], tradeCount:0,
       createdAt: serverTimestamp()
@@ -1315,9 +1625,14 @@ async function renderPortfolio(){
         <div class="pf-stat"><div class="n mono" id="pfCoinsCount">—</div><div class="l">Coins Held</div></div>
       </div>
     </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
+      <div class="chart-wrap" style="height:180px;"><canvas id="pfChart"></canvas></div>
+    </div>
     <div class="section-title" style="font-size:16px;">Your Holdings</div>
     <div id="holdingsList"><div class="spinner"></div></div>
   `;
+  drawPortfolioChart();
   const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
   let holdingsVal = 0;
@@ -1409,6 +1724,8 @@ function renderLeaderboard(){
   const view = document.getElementById('view');
   view.innerHTML = `
     <div class="section-title">🏆 Leaderboard</div>
+    <div class="searchbar"><span>🔍</span><input id="userSearch" placeholder="Find a trader by username..."></div>
+    <div id="userSearchResults"></div>
     <div class="chip-row" id="lbChips">
       <div class="chip" data-cat="daily">📅 Daily</div>
       <div class="chip" data-cat="weekly">🗓️ Weekly</div>
@@ -1416,6 +1733,12 @@ function renderLeaderboard(){
     </div>
     <div id="lbList"><div class="spinner" style="margin-top:40px;"></div></div>
   `;
+  const searchInput = document.getElementById('userSearch');
+  let searchDebounce = null;
+  searchInput.addEventListener('input', ()=>{
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(()=> runUserSearch(searchInput.value.trim()), 250);
+  });
   document.querySelectorAll('#lbChips .chip').forEach(c=>{
     c.classList.toggle('active', c.dataset.cat===lbCategory);
     c.addEventListener('click', ()=>{
@@ -1426,6 +1749,31 @@ function renderLeaderboard(){
     });
   });
   loadLeaderboard();
+}
+
+// Prefix search on usernameLower (already stored on every user doc for signup uniqueness checks).
+// A true fuzzy/substring search isn't practical with Firestore's query model, but prefix search
+// covers "jump straight to someone's profile by username" well enough for a friends-scale app.
+async function runUserSearch(term){
+  const box = document.getElementById('userSearchResults');
+  if(!box) return;
+  if(!term){ box.innerHTML = ''; return; }
+  const termLower = term.toLowerCase();
+  box.innerHTML = '<div class="spinner" style="margin:10px 0;"></div>';
+  try{
+    const snap = await getDocs(query(collection(db,'users'), orderBy('usernameLower'), where('usernameLower','>=',termLower), where('usernameLower','<',termLower+'\uf8ff'), limit(8)));
+    const results = snap.docs.map(d=>({uid:d.id, ...d.data()}));
+    if(!results.length){ box.innerHTML = '<div class="empty" style="padding:14px;">No traders found.</div>'; return; }
+    box.innerHTML = `<div class="panel" style="margin-bottom:16px;">` + results.map(u=>`
+      <div class="holder-line user-link" data-uid="${u.uid}" style="cursor:pointer;">
+        <img class="avatar-sm" src="${avatarFor(u.username, u.avatarURL)}" style="border-radius:50%;">
+        <span>@${esc(u.username)}</span>
+        <span class="mono" style="margin-left:auto;color:var(--txt-dim);font-size:12.5px;">${fmtUsd(u.netWorth ?? u.balance)}</span>
+      </div>`).join('') + `</div>`;
+    wireUserLinks(box);
+  }catch(err){
+    box.innerHTML = `<div class="empty" style="padding:14px;">Search failed: ${esc(err.message)}</div>`;
+  }
 }
 
 function netWorthChange(u, category){
@@ -1439,6 +1787,39 @@ function netWorthChange(u, category){
   if(!baseline) baseline = hist.length ? hist.reduce((a,b)=> a.t<b.t?a:b) : {nw:STARTING_BALANCE};
   return current - baseline.nw;
 }
+// Same baseline logic as the daily leaderboard, but also returns a percentage — used for the
+// green/red "today" indicator on profile pages.
+function todaysChange(u){
+  const current = u.netWorth ?? u.balance ?? STARTING_BALANCE;
+  const cutoff = Date.now() - 86400000;
+  const hist = u.netWorthHistory||[];
+  let baseline = null;
+  for(const h of hist){ if(h.t<=cutoff && (!baseline || h.t>baseline.t)) baseline = h; }
+  if(!baseline) baseline = hist.length ? hist.reduce((a,b)=> a.t<b.t?a:b) : {nw:STARTING_BALANCE};
+  const change = current-baseline.nw;
+  const pct = baseline.nw ? (change/baseline.nw)*100 : 0;
+  return { change, pct };
+}
+
+// Read-only "catch-up" for the leaderboard: rather than trusting each user's stored netWorth
+// field (which only updates when THEY trade — see the class comment above), recompute cash +
+// realizable holdings value fresh, on the spot, whenever the leaderboard loads. This doesn't
+// write anything back (unlike the bot-coin catch-up), so it's cheap and can't race with anyone
+// else's data — it just freshens what's displayed.
+async function liveNetWorthFor(uid, cashBalance){
+  try{
+    const holdSnap = await getDocs(collection(db,'users',uid,'holdings'));
+    let holdingsVal = 0;
+    for(const d of holdSnap.docs){
+      const h = d.data();
+      if(!(h.tokens>0.0001)) continue;
+      let coin = state.coinsCache.get(d.id);
+      if(!coin){ const cs = await getDoc(doc(db,'coins',d.id)); if(cs.exists()){ coin = {id:cs.id,...cs.data()}; state.coinsCache.set(d.id, coin); } }
+      if(coin) holdingsVal += sellValue(coin, h.tokens);
+    }
+    return (cashBalance||0) + holdingsVal;
+  }catch(err){ return cashBalance||0; }
+}
 
 async function loadLeaderboard(){
   const list = document.getElementById('lbList');
@@ -1447,12 +1828,16 @@ async function loadLeaderboard(){
   try{
     refreshNetWorthSnapshot(); // keep our own row fresh; doesn't block the rest of the list
     const snap = await getDocs(query(collection(db,'users'), limit(200)));
-    const users = snap.docs.map(d=>({uid:d.id, ...d.data()}));
-    const rows = users
-      .map(u=>({ uid:u.uid, username:u.username, avatarURL:u.avatarURL, current: u.netWorth ?? u.balance ?? STARTING_BALANCE, change: netWorthChange(u, lbCategory) }))
-      .filter(r=>r.username)
-      .sort((a,b)=> b.change-a.change)
-      .slice(0,25);
+    const users = snap.docs.map(d=>({uid:d.id, ...d.data()})).filter(u=>u.username);
+    // Recomputing live value for everyone fetched could mean a lot of reads if the userbase
+    // grows — bound it to a reasonable candidate pool (ranked by last-known value) rather than
+    // doing it for all 200.
+    const candidates = users.slice().sort((a,b)=> (b.netWorth??b.balance??0)-(a.netWorth??a.balance??0)).slice(0,60);
+    const rowsRaw = await Promise.all(candidates.map(async u=>{
+      const live = await liveNetWorthFor(u.uid, u.balance);
+      return { uid:u.uid, username:u.username, avatarURL:u.avatarURL, current: live, change: netWorthChange({...u, netWorth: live}, lbCategory) };
+    }));
+    const rows = rowsRaw.sort((a,b)=> b.change-a.change).slice(0,25);
     if(!rows.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🏆</div>No traders yet.</div>`; return; }
     list.innerHTML = rows.map((r,i)=>{
       const up = r.change>=0;
@@ -1492,7 +1877,7 @@ async function loadPositions(uid){
   open.sort((a,b)=> b.val-a.val);
   // Every sell writes its own record here, so this is a running list of individual sales —
   // not just coins you've fully exited — sorted most recent first.
-  const closedSnap = await getDocs(query(collection(db,'users',uid,'closedPositions'), orderBy('closedAt','desc'), limit(50)));
+  const closedSnap = await getDocs(query(collection(db,'users',uid,'closedPositions'), orderBy('closedAt','desc'), limit(100)));
   const closed = closedSnap.docs.map(d=>({id:d.id,...d.data()}));
   return { open, closed };
 }
@@ -1547,6 +1932,8 @@ async function renderUserProfile(uid){
   const uSnap = await getDoc(doc(db,'users',uid));
   if(!uSnap.exists()){ view.innerHTML = `<div class="empty"><div class="em-ic">👻</div>Couldn't find that trader.</div>`; return; }
   const u = uSnap.data();
+  const today = todaysChange(u);
+  const todayUp = today.change>=0;
   view.innerHTML = `
     <div class="back-btn" id="backBtn">← Back</div>
     <div class="profile-head">
@@ -1554,11 +1941,13 @@ async function renderUserProfile(uid){
       <div>
         <div class="profile-name">@${esc(u.username)}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
+        <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
     </div>
     <div class="panel">
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
-      <div class="settings-row" style="border:none;"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
     </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
@@ -1572,6 +1961,7 @@ async function renderUserProfile(uid){
     const closedEl = document.getElementById('closedPosList');
     if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
+    const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
   }catch(err){
     const openEl = document.getElementById('openPosList');
     if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
@@ -1580,10 +1970,17 @@ async function renderUserProfile(uid){
   }
 }
 
+function winRateText(closed){
+  if(!closed.length) return 'No sells yet';
+  const wins = closed.filter(c=>(c.pnl||0)>0).length;
+  return `${Math.round(wins/closed.length*100)}% (${wins}/${closed.length})`;
+}
 /* ===================== PROFILE ===================== */
 function renderProfile(){
   const u = state.userDoc; if(!u) return;
   const view = document.getElementById('view');
+  const today = todaysChange(u);
+  const todayUp = today.change>=0;
   view.innerHTML = `
     <div class="section-title">Profile</div>
     <div class="profile-head">
@@ -1591,13 +1988,15 @@ function renderProfile(){
       <div>
         <div class="profile-name">@${esc(u.username)}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
+        <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
     </div>
     <div class="panel">
       <div class="settings-row"><span>Avatar image URL</span><button class="btn btn-ghost" id="changeAvatarBtn">Edit</button></div>
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
-      <div class="settings-row" style="border:none;"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
     </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
@@ -1613,6 +2012,7 @@ function renderProfile(){
     const closedEl = document.getElementById('closedPosList');
     if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
+    const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
   }).catch(err=>{
     const openEl = document.getElementById('openPosList');
     if(openEl) openEl.innerHTML = `<div class="empty">Couldn't load positions: ${esc(err.message)}</div>`;
