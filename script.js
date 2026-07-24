@@ -454,7 +454,7 @@ function recentTradesHtml(trades){
   return trades.slice(0,14).map(t=>`
     <div class="holder-line">
       <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
-      <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}</span>
+      <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
       <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
       <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
     </div>`).join('');
@@ -605,20 +605,66 @@ function drawChart(coin, forceRebuild){
   const prices = windowed.map(p=>p.p);
   const up = prices[prices.length-1] >= prices[0];
   const color = up? '#C6FF3D' : '#FF4D6D';
+  const UP='#C6FF3D', DOWN='#FF4D6D';
+
+  // Spike markers: any point that jumped >2.5% from the previous one (a real buy/sell impact,
+  // not just noise) gets a visible dot sized by how big the move was — this is what makes a
+  // single whale buy or dump actually read as a spike instead of disappearing into the line.
+  const pointRadii = prices.map((p,i)=>{
+    if(i===0) return 0;
+    const prev = prices[i-1];
+    if(!prev) return 0;
+    const chg = Math.abs((p-prev)/prev);
+    if(chg > .12) return 5.5;
+    if(chg > .05) return 4;
+    if(chg > .025) return 2.5;
+    return 0;
+  });
+  const pointColors = prices.map((p,i)=> i===0? UP : (p>=prices[i-1]? UP:DOWN));
 
   if(state.chart && !forceRebuild){
     // live update: patch data in place for a smooth, non-flickery redraw
     state.chart.data.labels = labels;
     state.chart.data.datasets[0].data = prices;
     state.chart.data.datasets[0].borderColor = color;
+    state.chart.data.datasets[0].pointRadius = pointRadii;
+    state.chart.data.datasets[0].pointBackgroundColor = pointColors;
+    state.chart.options.plugins.currentPriceLine.price = prices[prices.length-1];
+    state.chart.options.plugins.currentPriceLine.color = color;
     state.chart.update('none');
     return;
   }
   if(state.chart) state.chart.destroy();
+
+  // Small local plugin (no extra CDN needed): draws a dashed "last price" reference line,
+  // the way real trading terminals do, so you can see at a glance whether the latest wick
+  // is above or below where price has recently been.
+  const currentPriceLinePlugin = {
+    id:'currentPriceLine',
+    afterDraw(chart, args, opts){
+      if(!opts || !(opts.price>0)) return;
+      const {ctx, chartArea, scales} = chart;
+      const y = scales.y.getPixelForValue(opts.price);
+      if(y < chartArea.top || y > chartArea.bottom) return;
+      ctx.save();
+      ctx.setLineDash([4,4]);
+      ctx.strokeStyle = opts.color || '#C6FF3D';
+      ctx.globalAlpha = 0.55;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(chartArea.left, y);
+      ctx.lineTo(chartArea.right, y);
+      ctx.stroke();
+      ctx.restore();
+    }
+  };
+
   state.chart = new Chart(ctx, {
     type:'line',
     data:{ labels, datasets:[{
-      data: prices, borderColor: color, borderWidth:2.5, pointRadius:0, tension:.25,
+      data: prices, borderColor: color, borderWidth:2, tension:0,
+      pointRadius: pointRadii, pointHoverRadius:5, pointBackgroundColor: pointColors, pointBorderWidth:0,
+      segment:{ borderColor: (c)=> c.p0.parsed.y <= c.p1.parsed.y ? UP : DOWN },
       fill:true,
       backgroundColor: (context)=>{
         const g = context.chart.ctx.createLinearGradient(0,0,0,280);
@@ -629,7 +675,8 @@ function drawChart(coin, forceRebuild){
     }]},
     options:{
       responsive:true, maintainAspectRatio:false, animation:{duration:300},
-      plugins:{ legend:{display:false}, tooltip:{ mode:'index', intersect:false,
+      plugins:{ legend:{display:false}, currentPriceLine:{price: prices[prices.length-1], color},
+        tooltip:{ mode:'index', intersect:false,
         backgroundColor:'#161425', borderColor:'rgba(255,255,255,0.1)', borderWidth:1, padding:10,
         callbacks:{ label:(c)=> fmtPrice(c.parsed.y) } } },
       scales:{
@@ -637,7 +684,8 @@ function drawChart(coin, forceRebuild){
         y:{ grid:{color:'rgba(255,255,255,0.05)'}, ticks:{ color:'#615C7D', font:{size:10}, callback:(v)=>fmtPrice(v) } }
       },
       interaction:{mode:'nearest',axis:'x',intersect:false}
-    }
+    },
+    plugins:[currentPriceLinePlugin]
   });
 }
 function toMillis(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
@@ -658,7 +706,7 @@ async function doBuy(coinId, usdAmount){
       if(user.balance < usdAmount) throw new Error("You don't have enough balance.");
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance - usdAmount });
@@ -688,7 +736,7 @@ async function doSell(coinId, tokenAmount){
       if(tokenAmount > owned+0.0000001) throw new Error("You don't own that many tokens.");
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance + usdOut });
@@ -710,8 +758,10 @@ async function doSell(coinId, tokenAmount){
 const BOT_NAMES = ['whale_watcher','ape_annie','moon_chaser','fomo_fred','diamond_dan','snipe_master','paper_hands_pete','degen_dana','yolo_yusuf','rekt_ronnie','pump_patrol','satoshi_jr'];
 const BOT_YOUNG_MS = 8*60*1000;      // bots only touch coins younger than this
 const BOT_TICK_MS = 14000;           // how often this tab rolls the dice
-const BOT_BUY_CHANCE = 0.22;         // per young coin, per tick
 const BOT_EXPLODE_CHANCE = 0.035;    // per young coin, per tick — a dramatic pump
+const BOT_DUMP_CHANCE    = 0.03;     // per young coin, per tick — a dramatic sell-off (the "drop" half of a spike)
+const BOT_BUY_CHANCE     = 0.22;     // per young coin, per tick — small buy pressure
+const BOT_SELL_CHANCE    = 0.17;     // per young coin, per tick — small profit-taking, keeps the line from only ever going up
 let botInterval = null;
 
 function randBotName(){ return BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)]; }
@@ -725,11 +775,37 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coin = coinSnap.data();
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       if(!(tokensOut>0)) return;
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-80);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
     });
     if(isExplosion) toast(`💥 A whale just aped into a new coin!`, 'ok');
+  }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
+}
+
+// Sell-side bot pressure, mirroring botBuyOnCoin. Bots don't carry real token inventory, so
+// this treats the "sell" purely as curve math (same constant-product formula ammSell uses for
+// real users) — it just pushes price back down instead of up. Without this, bot activity only
+// ever ratchets price upward, which reads as fake; real memecoin charts pump AND dump.
+async function botSellOnCoin(coinId, usdAmount, isDump){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const coinSnap = await tx.get(coinRef);
+      if(!coinSnap.exists()) return;
+      const coin = coinSnap.data();
+      const price = priceOf(coin);
+      if(!(price>0)) return;
+      let tokenAmount = usdAmount/price;
+      const maxSellable = coin.tokenReserve*0.05; // cap so one dump can't crater the curve to near-zero
+      if(tokenAmount > maxSellable) tokenAmount = maxSellable;
+      const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
+      if(!(usdOut>0)) return;
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-20);
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
+    });
+    if(isDump) toast(`📉 Paper hands are dumping a coin!`, 'err');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
@@ -742,10 +818,17 @@ async function botTick(){
       const coin = d.data();
       const mc = marketCapOf({...coin});
       if(mc >= GRAD_MARKET_CAP) return; // graduated coins are left alone
-      if(Math.random() < BOT_EXPLODE_CHANCE){
+      // Single roll split into ranges so buy/sell/explode/dump stay mutually exclusive per tick.
+      const r = Math.random();
+      let acc = 0;
+      if(r < (acc += BOT_EXPLODE_CHANCE)){
         botBuyOnCoin(d.id, 300+Math.random()*900, true);
-      } else if(Math.random() < BOT_BUY_CHANCE){
+      } else if(r < (acc += BOT_DUMP_CHANCE)){
+        botSellOnCoin(d.id, 250+Math.random()*700, true);
+      } else if(r < (acc += BOT_BUY_CHANCE)){
         botBuyOnCoin(d.id, 4+Math.random()*40, false);
+      } else if(r < (acc += BOT_SELL_CHANCE)){
+        botSellOnCoin(d.id, 3+Math.random()*35, false);
       }
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
