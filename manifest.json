@@ -1,0 +1,9 @@
+{
+  "name": "DEGEN — Virtual Memecoin Exchange",
+  "short_name": "DEGEN",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0B0A14",
+  "theme_color": "#0B0A14",
+  "icons": []
+}

@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>DEGEN — Virtual Memecoin Exchange</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚀</text></svg>">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0B0A14">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
@@ -60,6 +62,7 @@
     <nav class="sidenav" id="sidenav">
       <div class="nav-item" data-nav="home"><span class="ic">🏠</span>Explore</div>
       <div class="nav-item" data-nav="portfolio"><span class="ic">💼</span>Portfolio</div>
+      <div class="nav-item" data-nav="leaderboard"><span class="ic">🏆</span>Leaderboard</div>
       <div class="nav-item" data-nav="profile"><span class="ic">👤</span>Profile</div>
       <button class="btn btn-lime btn-block nav-cta" data-nav="create">+ Launch a Coin</button>
     </nav>
@@ -71,9 +74,12 @@
     <div class="bn-item" data-nav="home"><span class="ic">🏠</span>Explore</div>
     <div class="bn-item" data-nav="portfolio"><span class="ic">💼</span>Portfolio</div>
     <div class="bn-item" data-nav="create"><span class="ic">➕</span>Launch</div>
+    <div class="bn-item" data-nav="leaderboard"><span class="ic">🏆</span>Ranks</div>
     <div class="bn-item" data-nav="profile"><span class="ic">👤</span>Profile</div>
   </nav>
 </div>
+
+<div class="offline-banner" id="offlineBanner">📡 You're offline — showing last synced data. Trades will sync once you're back online.</div>
 
 <div class="toast-container" id="toastContainer"></div>
 

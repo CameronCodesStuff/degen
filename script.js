@@ -4,7 +4,8 @@ import {
   onAuthStateChanged, signOut, updateProfile
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js";
 import {
-  getFirestore, doc, getDoc, setDoc, updateDoc, onSnapshot, collection,
+  initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
+  doc, getDoc, setDoc, updateDoc, onSnapshot, collection,
   query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
@@ -17,7 +18,30 @@ const firebaseConfig = {
 };
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
-const db = getFirestore(app);
+// Local persistent cache (IndexedDB-backed) lets the app keep working — viewing cached
+// prices/balances, queueing trades — when the connection drops, and syncs back up
+// automatically once it returns. Falls back to in-memory-only if the browser can't support
+// it (e.g. very old browsers, private browsing in some cases); the app still works either way.
+let db;
+try{
+  db = initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+}catch(err){
+  db = initializeFirestore(app, {});
+}
+
+// App-shell service worker: lets the page itself open even with no network at all.
+if('serviceWorker' in navigator){
+  window.addEventListener('load', ()=>{ navigator.serviceWorker.register('./sw.js').catch(()=>{}); });
+}
+
+function updateOfflineBanner(){
+  const banner = document.getElementById('offlineBanner');
+  if(banner) banner.classList.toggle('show', !navigator.onLine);
+}
+window.addEventListener('online', updateOfflineBanner);
+window.addEventListener('offline', updateOfflineBanner);
+document.addEventListener('DOMContentLoaded', updateOfflineBanner);
+updateOfflineBanner();
 
 /* ===================== CONSTANTS ===================== */
 const STARTING_BALANCE = 100;
@@ -30,6 +54,19 @@ const INITIAL_SOL_RESERVE = 4200;     // virtual "liquidity" seed (USD)
 const INITIAL_TOKEN_RESERVE = 1_000_000_000; // 1B token supply per coin
 const GRAD_MARKET_CAP = 69000;        // fun homage threshold — pump.fun's real graduation mcap
 const K = INITIAL_SOL_RESERVE * INITIAL_TOKEN_RESERVE;
+const MAX_OWNERSHIP_PCT = 0.8;         // no single wallet can hold more than 80% of a coin's supply
+const MAX_OWNERSHIP_TOKENS = INITIAL_TOKEN_RESERVE * MAX_OWNERSHIP_PCT;
+
+// Client-side "pump" easter egg, gated to one specific account. Like the rest of this demo
+// (see SETUP.md), this is enforced in the browser, not by Firestore rules — a determined user
+// could bypass it via devtools. Fine for a for-fun/friends app; not a real access control.
+const PUMP_ADMIN_EMAIL = 'detlaffcameron@gmail.com';
+const PUMP_ADMIN_USERNAME = 'cameron';
+function isPumpAdmin(){
+  const email = (auth.currentUser && auth.currentUser.email || '').toLowerCase();
+  const uname = (state.userDoc && state.userDoc.username || '').toLowerCase();
+  return email===PUMP_ADMIN_EMAIL && uname===PUMP_ADMIN_USERNAME;
+}
 
 /* ===================== STATE ===================== */
 const state = {
@@ -178,7 +215,8 @@ document.getElementById('signupForm').addEventListener('submit', async e=>{
     await updateProfile(cred.user, { displayName: username });
     await setDoc(doc(db,'users',cred.user.uid), {
       username, usernameLower: unameLower, bio:'', avatarURL:'',
-      balance: STARTING_BALANCE, createdAt: serverTimestamp()
+      balance: STARTING_BALANCE, createdAt: serverTimestamp(),
+      netWorth: STARTING_BALANCE, netWorthHistory: [{t:Date.now(), nw:STARTING_BALANCE}]
     });
     await setDoc(unameRef, { uid: cred.user.uid });
   }catch(err){ showAuthError(friendlyAuthErr(err)); }
@@ -255,12 +293,56 @@ function navigate(name, param=null){
   if(name==='home') renderHome();
   else if(name==='create') renderCreate();
   else if(name==='portfolio') renderPortfolio();
+  else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
   window.scrollTo(0,0);
 }
 
-/* ===================== HOME / EXPLORE ===================== */
+/* ===================== ADMIN "PUMP" EASTER EGG ===================== */
+// Hold Right Alt (only does anything for the gated admin account) then click any coin
+// card/row to send a wave of 10-50 bot buys at it, staggered randomly over the next 2 minutes.
+let rightAltDown = false;
+const activePumps = new Set();
+
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='AltRight') return;
+  rightAltDown = true;
+  document.body.classList.toggle('pump-armed', isPumpAdmin());
+});
+document.addEventListener('keyup', (e)=>{
+  if(e.code!=='AltRight') return;
+  rightAltDown = false;
+  document.body.classList.remove('pump-armed');
+});
+window.addEventListener('blur', ()=>{ rightAltDown=false; document.body.classList.remove('pump-armed'); });
+
+// Capture phase so this runs before the coin card's own click handler navigates away.
+document.addEventListener('click', (e)=>{
+  if(!rightAltDown || !isPumpAdmin()) return;
+  const el = e.target.closest('[data-coin]');
+  if(!el || !el.dataset.coin) return;
+  e.preventDefault(); e.stopImmediatePropagation();
+  triggerPump(el.dataset.coin);
+}, true);
+
+function triggerPump(coinId){
+  if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
+  activePumps.add(coinId);
+  const botCount = 10 + Math.floor(Math.random()*41); // 10-50
+  const durationMs = 120000;
+  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 2 minutes`, 'ok');
+  for(let i=0;i<botCount;i++){
+    const delay = Math.random()*durationMs;
+    setTimeout(()=>{
+      const usd = 8 + Math.random()*220;
+      botBuyOnCoin(coinId, usd, usd>150);
+    }, delay);
+  }
+  setTimeout(()=> activePumps.delete(coinId), durationMs+3000);
+}
+
+
 let homeUnsub = null, homeSort='new';
 function renderHome(){
   const view = document.getElementById('view');
@@ -704,18 +786,36 @@ async function doBuy(coinId, usdAmount){
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
       if(user.balance < usdAmount) throw new Error("You don't have enough balance.");
-      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
+      const prevTokens = holdSnap.exists()? holdSnap.data().tokens:0;
+      if(prevTokens >= MAX_OWNERSHIP_TOKENS) throw new Error("You already hold the max allowed 80% of this coin's supply.");
+
+      let { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
+      let finalUsd = usdAmount, wasCapped = false;
+
+      // If this buy would push the buyer over 80% of total supply, only fill it up to the cap
+      // and charge/refund accordingly instead of rejecting the whole trade outright.
+      if(prevTokens + tokensOut > MAX_OWNERSHIP_TOKENS){
+        const capTokens = MAX_OWNERSHIP_TOKENS - prevTokens;
+        const denom = coin.tokenReserve - capTokens;
+        if(!(capTokens>0) || denom<=0) throw new Error("Not enough of this coin left in the curve to buy more.");
+        finalUsd = (capTokens*coin.solReserve)/denom;
+        const capped = ammBuy(coin, finalUsd);
+        tokensOut = capped.tokensOut; newSol = capped.newSol; newTok = capped.newTok; newPrice = capped.newPrice;
+        wasCapped = true;
+      }
+
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
-      tx.update(userRef, { balance: user.balance - usdAmount });
-      const prevTokens = holdSnap.exists()? holdSnap.data().tokens:0;
+      tx.update(userRef, { balance: user.balance - finalUsd });
       tx.set(holdRef, { tokens: prevTokens+tokensOut, ticker:coin.ticker, name:coin.name, imageURL:coin.imageURL||'', updatedAt: Date.now() }, {merge:true});
-      return tokensOut;
+      return { tokensOut, wasCapped, finalUsd };
     });
-    toast(`Bought ${fmtTok(result)} tokens!`, 'ok');
+    if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at 80% ownership, rest refunded.`, 'ok');
+    else toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
     state.tradeAmount = 0;
+    refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
   if(btn){ btn.disabled=false; }
 }
@@ -745,8 +845,36 @@ async function doSell(coinId, tokenAmount){
     });
     toast(`Sold for ${fmtUsd(result)}!`, 'ok');
     state.tradeAmount = 0;
+    refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
   if(btn){ btn.disabled=false; }
+}
+
+// Best-effort snapshot of the current user's total net worth (cash + all holdings at current
+// price), appended to a timestamped history on their user doc. Powers the daily/weekly/all-time
+// leaderboard views. Never blocks or throws into the calling trade flow — if this fails for any
+// reason (offline, etc.) the trade itself has already succeeded.
+async function refreshNetWorthSnapshot(){
+  try{
+    const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
+    const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+    let holdingsVal = 0;
+    for(const h of holdings){
+      let coin = state.coinsCache.get(h.id);
+      if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()) coin = {id:cs.id,...cs.data()}; }
+      if(coin) holdingsVal += h.tokens*priceOf(coin);
+    }
+    const uSnap = await getDoc(doc(db,'users',state.uid));
+    if(!uSnap.exists()) return;
+    const u = uSnap.data();
+    const netWorth = (u.balance||0) + holdingsVal;
+    const now = Date.now();
+    const cutoffKeep = now - 35*86400000; // keep ~5 weeks of history, plenty for daily/weekly lookback
+    let hist = (u.netWorthHistory||[]).filter(h=>h.t>=cutoffKeep);
+    hist.push({t:now, nw:netWorth});
+    if(hist.length>300) hist = hist.slice(-300);
+    await updateDoc(doc(db,'users',state.uid), { netWorth, netWorthHistory: hist });
+  }catch(err){ /* leaderboard snapshotting is best-effort */ }
 }
 
 /* ===================== BOT ACTIVITY ===================== */
@@ -755,7 +883,6 @@ async function doSell(coinId, tokenAmount){
 // of a pool of fake trader names. They only touch a coin's own reserves/price history —
 // never a real user's balance or holdings — and only target coins launched in the last
 // few minutes, so a coin gets some early liquidity/action before it goes quiet.
-const BOT_NAMES = ['whale_watcher','ape_annie','moon_chaser','fomo_fred','diamond_dan','snipe_master','paper_hands_pete','degen_dana','yolo_yusuf','rekt_ronnie','pump_patrol','satoshi_jr'];
 const BOT_YOUNG_MS = 8*60*1000;      // bots only touch coins younger than this
 const BOT_TICK_MS = 14000;           // how often this tab rolls the dice
 const BOT_EXPLODE_CHANCE = 0.035;    // per young coin, per tick — a dramatic pump
@@ -764,7 +891,7 @@ const BOT_BUY_CHANCE     = 0.22;     // per young coin, per tick — small buy p
 const BOT_SELL_CHANCE    = 0.17;     // per young coin, per tick — small profit-taking, keeps the line from only ever going up
 let botInterval = null;
 
-function randBotName(){ return BOT_NAMES[Math.floor(Math.random()*BOT_NAMES.length)]; }
+function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
 async function botBuyOnCoin(coinId, usdAmount, isExplosion){
   try{
@@ -949,6 +1076,79 @@ async function renderPortfolio(){
       </div>
     </div>`).join('');
   list.querySelectorAll('.hold-row').forEach(el=> el.addEventListener('click', ()=> navigate('coin', el.dataset.coin)));
+}
+
+/* ===================== LEADERBOARD ===================== */
+// "Daily"/"Weekly" are computed from each user's netWorthHistory (see refreshNetWorthSnapshot),
+// which only gets a fresh point whenever that user actually trades — so someone who hasn't
+// traded in a while will look frozen at their last snapshot rather than reflecting live price
+// moves on coins they're still holding. Good enough for a friends-group leaderboard; a fully
+// live version would need a backend job continuously repricing every portfolio.
+let lbCategory = 'daily';
+function renderLeaderboard(){
+  const view = document.getElementById('view');
+  view.innerHTML = `
+    <div class="section-title">🏆 Leaderboard</div>
+    <div class="chip-row" id="lbChips">
+      <div class="chip" data-cat="daily">📅 Daily</div>
+      <div class="chip" data-cat="weekly">🗓️ Weekly</div>
+      <div class="chip" data-cat="alltime">👑 All-Time</div>
+    </div>
+    <div id="lbList"><div class="spinner" style="margin-top:40px;"></div></div>
+  `;
+  document.querySelectorAll('#lbChips .chip').forEach(c=>{
+    c.classList.toggle('active', c.dataset.cat===lbCategory);
+    c.addEventListener('click', ()=>{
+      lbCategory = c.dataset.cat;
+      document.querySelectorAll('#lbChips .chip').forEach(x=>x.classList.remove('active'));
+      c.classList.add('active');
+      loadLeaderboard();
+    });
+  });
+  loadLeaderboard();
+}
+
+function netWorthChange(u, category){
+  const current = u.netWorth ?? u.balance ?? STARTING_BALANCE;
+  if(category==='alltime') return current - STARTING_BALANCE;
+  const windowMs = category==='weekly' ? 7*86400000 : 86400000;
+  const cutoff = Date.now() - windowMs;
+  const hist = u.netWorthHistory||[];
+  let baseline = null;
+  for(const h of hist){ if(h.t<=cutoff && (!baseline || h.t>baseline.t)) baseline = h; }
+  if(!baseline) baseline = hist.length ? hist.reduce((a,b)=> a.t<b.t?a:b) : {nw:STARTING_BALANCE};
+  return current - baseline.nw;
+}
+
+async function loadLeaderboard(){
+  const list = document.getElementById('lbList');
+  if(!list) return;
+  list.innerHTML = `<div class="spinner" style="margin-top:40px;"></div>`;
+  try{
+    refreshNetWorthSnapshot(); // keep our own row fresh; doesn't block the rest of the list
+    const snap = await getDocs(query(collection(db,'users'), limit(200)));
+    const users = snap.docs.map(d=>({uid:d.id, ...d.data()}));
+    const rows = users
+      .map(u=>({ username:u.username, avatarURL:u.avatarURL, current: u.netWorth ?? u.balance ?? STARTING_BALANCE, change: netWorthChange(u, lbCategory) }))
+      .filter(r=>r.username)
+      .sort((a,b)=> b.change-a.change)
+      .slice(0,25);
+    if(!rows.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🏆</div>No traders yet.</div>`; return; }
+    list.innerHTML = rows.map((r,i)=>{
+      const up = r.change>=0;
+      const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':`#${i+1}`;
+      return `
+      <div class="holder-line">
+        <span style="width:26px;text-align:center;font-weight:700;">${medal}</span>
+        <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
+        <span>@${esc(r.username)}</span>
+        <span class="mono" style="margin-left:auto;">${fmtUsd(r.current)}</span>
+        <span class="coin-chg ${up?'up':'down'}" style="padding:2px 7px;">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.change))}</span>
+      </div>`;
+    }).join('');
+  }catch(err){
+    list.innerHTML = `<div class="empty">Couldn't load the leaderboard: ${esc(err.message)}</div>`;
+  }
 }
 
 /* ===================== PROFILE ===================== */
