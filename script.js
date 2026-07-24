@@ -357,8 +357,8 @@ function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
   const botCount = 10 + Math.floor(Math.random()*41); // 10-50
-  const durationMs = 120000;
-  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 2 minutes`, 'ok');
+  const durationMs = 10000;
+  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 10 seconds`, 'ok');
   for(let i=0;i<botCount;i++){
     const delay = Math.random()*durationMs;
     setTimeout(()=>{
@@ -1024,10 +1024,17 @@ function drawNetWorthChart(canvasId, history){
 }
 
 /* ===================== TRADE EXECUTION ===================== */
+// While a real trade is in flight on a coin, bot ticks skip that exact coin (see botTick and
+// botCoinTick below) — bots racing to update the SAME document a real user's transaction is
+// touching is what caused buys/sells to sometimes take ages or look stuck. Bots still trade
+// everything else normally; this only pauses the one coin actively mid-transaction.
+const coinsWithPendingUserTrade = new Set();
+
 async function doBuy(coinId, usdAmount){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
   if(btn){ btn.disabled=true; btn.textContent='Buying…'; }
+  coinsWithPendingUserTrade.add(coinId);
   try{
     const result = await runTransaction(db, async (tx)=>{
       const userRef = doc(db,'users',state.uid);
@@ -1080,11 +1087,12 @@ async function doBuy(coinId, usdAmount){
       });
       return { tokensOut, wasCapped, finalUsd };
     });
-    if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at 80% ownership, rest refunded.`, 'ok');
+    if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at ${Math.round(MAX_OWNERSHIP_PCT*100)}% ownership, rest refunded.`, 'ok');
     else toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
     state.tradeAmount = 0;
     refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
+  coinsWithPendingUserTrade.delete(coinId);
   if(btn){ btn.disabled=false; }
 }
 
@@ -1092,6 +1100,7 @@ async function doSell(coinId, tokenAmount){
   if(!tokenAmount || tokenAmount<=0){ toast('Enter an amount to sell.', 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
   if(btn){ btn.disabled=true; btn.textContent='Selling…'; }
+  coinsWithPendingUserTrade.add(coinId);
   try{
     const result = await runTransaction(db, async (tx)=>{
       const userRef = doc(db,'users',state.uid);
@@ -1145,6 +1154,7 @@ async function doSell(coinId, tokenAmount){
     state.tradeAmount = 0;
     refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
+  coinsWithPendingUserTrade.delete(coinId);
   if(btn){ btn.disabled=false; }
 }
 
@@ -1456,6 +1466,7 @@ async function botCoinTick(){
     const q = query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT));
     const snap = await getDocs(q);
     snap.docs.forEach(d=>{
+      if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.ruggedAt){
         if(Date.now()-toMillisLoose(coin.ruggedAt) > BOT_COIN_RUG_CLEANUP_MS) cleanupRuggedCoin(d.id, coin);
@@ -1468,8 +1479,15 @@ async function botCoinTick(){
       const buyChance = Math.min(0.95, Math.max(0.05, 0.5+bias*0.5));
       const usd = botCoinTradeSize();
       const big = usd>800;
-      if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-      else botSellOnCoin(d.id, usd, big);
+      // Stagger across most of the tick window instead of firing every qualifying coin's
+      // transaction in the same synchronous instant — this loop can touch up to 30 coins per
+      // tick, so without spreading them out that's up to ~20+ concurrent Firestore transactions
+      // landing at once, which is what made real buys/sells occasionally take ages.
+      setTimeout(()=>{
+        if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
+        if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
+        else botSellOnCoin(d.id, usd, big);
+      }, Math.random()*9000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
@@ -1519,19 +1537,25 @@ async function botTick(){
       // doc at nearly the same instant, which is exactly what produces Firestore transaction
       // contention ("stored version doesn't match") on commit. One owner per coin, no race.
       if(coin.isBotCoin) return;
+      if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const mc = marketCapOf({...coin});
       if(mc >= GRAD_MARKET_CAP) return; // graduated coins are left alone
       // Single roll split into ranges so buy/sell/explode/dump stay mutually exclusive per tick.
       const r = Math.random();
       let acc = 0;
+      // Stagger the actual write across a few seconds instead of firing every qualifying coin's
+      // transaction in the same instant — spreading out when each transaction actually lands cuts
+      // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
+      // take ages or look stuck when a lot of bot activity landed on the same coin at once.
+      const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*9000);
       if(r < (acc += BOT_EXPLODE_CHANCE)){
-        botBuyOnCoin(d.id, 200+Math.random()*500, true);
+        fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
-        botSellOnCoin(d.id, 200+Math.random()*500, true);
+        fire(()=> botSellOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_BUY_CHANCE)){
-        botBuyOnCoin(d.id, 4+Math.random()*36, false);
+        fire(()=> botBuyOnCoin(d.id, 4+Math.random()*36, false));
       } else if(r < (acc += BOT_SELL_CHANCE)){
-        botSellOnCoin(d.id, 4+Math.random()*36, false);
+        fire(()=> botSellOnCoin(d.id, 4+Math.random()*36, false));
       }
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
