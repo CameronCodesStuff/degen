@@ -33,6 +33,13 @@ service cloud.firestore {
         allow read: if isSignedIn();
         allow write: if isOwner(uid);
       }
+
+      match /closedPositions/{recordId} {
+        // One record per sell (not per coin) — readable by anyone signed in so it shows up on
+        // public profiles, writable only by the account it belongs to.
+        allow read: if isSignedIn();
+        allow write: if isOwner(uid);
+      }
     }
 
     match /usernames/{name} {

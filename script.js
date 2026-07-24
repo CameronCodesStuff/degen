@@ -594,7 +594,7 @@ function recentTradesHtml(trades){
   return trades.slice(0,14).map(t=>`
     <div class="holder-line">
       <div class="user-link" data-uid="${t.isBot?'':(t.uid||'')}" style="display:flex;align-items:center;gap:8px;${t.isBot?'':'cursor:pointer;'}">
-        <img class="avatar-sm" src="${avatarFor(t.username)}" style="border-radius:50%;">
+        <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
         <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
       </div>
       <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
@@ -872,7 +872,7 @@ async function doBuy(coinId, usdAmount){
 
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
@@ -918,7 +918,7 @@ async function doSell(coinId, tokenAmount){
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*INITIAL_TOKEN_RESERVE, priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1 });
       tx.update(userRef, { balance: user.balance + usdOut });
       // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
@@ -941,6 +941,15 @@ async function doSell(coinId, tokenAmount){
         type:'sell', usdAmount: usdOut, tokenAmount,
         coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
         createdAt: serverTimestamp()
+      });
+      // Every sell is its own closed position (not just a full exit) — a discrete record of that
+      // specific sale's cost basis, proceeds, and realized P&L, so a partial sell shows up in
+      // "Closed Positions" immediately rather than waiting until the whole bag is gone.
+      const closedRef = doc(collection(db,'users',state.uid,'closedPositions'));
+      tx.set(closedRef, {
+        coinId: coin.id||coinId, ticker: coin.ticker, name: coin.name, imageURL: coin.imageURL||'',
+        tokensSold: tokenAmount, costBasis: costRemoved, proceeds: usdOut, pnl: usdOut-costRemoved,
+        closedAt: Date.now()
       });
       return usdOut;
     });
@@ -1051,26 +1060,27 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
 // practice reading — no waiting around for real people to launch and trade something.
 const BOT_COIN_POOL_CAP = 18;         // don't let the pool of bot coins grow unbounded
 const BOT_COIN_SPAWN_CHANCE = 0.05;   // rolled roughly once a minute (see spawnCheckCounter below)
-const BOT_COIN_TRADE_CHANCE = 0.5;    // per bot coin, per 14s tick — much livelier than young-coin noise
+const BOT_COIN_TRADE_CHANCE = 0.65;   // per bot coin, per 14s tick — much livelier than young-coin noise
 const BOT_COIN_QUERY_LIMIT = 30;
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
 
 function hashStr(s){ let h=0; for(let i=0;i<s.length;i++){ h=(h*31+s.charCodeAt(i))|0; } return h; }
-// Deterministic pseudo-random "mood" for a given coin over a several-minute window, so price
-// action has believable multi-minute runs (trending up, then down) instead of pure tick-to-tick
-// noise — same idea real charts show, without needing any server-side state to track it.
+// Deterministic pseudo-random "mood" for a given coin over a short window, so price action has
+// believable runs (trending up, then down) instead of pure tick-to-tick noise — same idea real
+// charts show, without needing any server-side state to track it. Shorter bucket than before
+// (2.5 min) so the mood flips more often, giving snappier up/down swings rather than long flats.
 function botCoinTrendBias(coinId){
-  const bucket = Math.floor(Date.now()/(4*60*1000));
+  const bucket = Math.floor(Date.now()/(2.5*60*1000));
   const x = Math.abs(Math.sin(hashStr(coinId+':'+bucket)))*10000;
   return (x-Math.floor(x))*2-1; // -1..1
 }
 function botCoinTradeSize(){
   const r = Math.random();
-  if(r<0.05) return 500+Math.random()*2500;  // rare whale-sized swing — real volatility spikes
-  if(r<0.30) return 60+Math.random()*300;    // medium
-  return 6+Math.random()*60;                  // typical small/medium
+  if(r<0.10) return 800+Math.random()*4200;  // whale-sized swing — real volatility spikes
+  if(r<0.40) return 100+Math.random()*450;   // medium
+  return 8+Math.random()*90;                  // typical small/medium
 }
 
 // Fabricates a plausible "this coin has been live for hours" backstory at spawn time: a wobbly
@@ -1122,9 +1132,19 @@ async function spawnBotCoin(){
     if(!picked) return;
     const { name, ticker } = picked;
     const { priceHistory, currentPrice, tradeCountSeed, recentTrades } = simulateBotCoinLaunch();
-    const circulatingFrac = 0.05+Math.random()*0.4;
-    const tokenReserve = INITIAL_TOKEN_RESERVE*(1-circulatingFrac);
-    const solReserve = currentPrice*tokenReserve;
+    // Liquidity depth is chosen directly in dollar terms (same order of magnitude as a real
+    // community coin's $8,000 depth) rather than derived from the fabricated price walk. Deriving
+    // it from price meant a coin whose random walk happened to land low ended up with almost no
+    // liquidity (e.g. a coin sitting at a fraction of a cent could have only ~$900 in reserve),
+    // so a completely ordinary $95 buy could scoop up tens of millions of tokens. Picking depth
+    // independently, then solving tokenReserve = solReserve / price, keeps token payout per
+    // dollar sane regardless of where the price walk ended up.
+    let solReserve = 4000+Math.random()*12000;
+    let tokenReserve = solReserve/currentPrice;
+    const MIN_TOK = INITIAL_TOKEN_RESERVE*0.05, MAX_TOK = INITIAL_TOKEN_RESERVE*0.95;
+    if(tokenReserve < MIN_TOK) tokenReserve = MIN_TOK;
+    if(tokenReserve > MAX_TOK) tokenReserve = MAX_TOK;
+    solReserve = currentPrice*tokenReserve; // keep price = solReserve/tokenReserve consistent after clamping
     const coinRef = doc(collection(db,'coins'));
     await setDoc(coinRef, {
       name, ticker, description:'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
@@ -1166,9 +1186,9 @@ async function botCoinTick(){
     snap.docs.forEach(d=>{
       if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
       const bias = botCoinTrendBias(d.id);
-      const buyChance = Math.min(0.85, Math.max(0.15, 0.5+bias*0.3));
+      const buyChance = Math.min(0.9, Math.max(0.1, 0.5+bias*0.4));
       const usd = botCoinTradeSize();
-      const big = usd>400;
+      const big = usd>600;
       if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
       else botSellOnCoin(d.id, usd, big);
     });
@@ -1461,22 +1481,19 @@ async function loadLeaderboard(){
 // SETUP.md) so a public profile can show someone else's positions, not just your own.
 async function loadPositions(uid){
   const holdSnap = await getDocs(collection(db,'users',uid,'holdings'));
-  const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()}));
-  const open = [], closed = [];
+  const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+  const open = [];
   for(const h of holdings){
-    const everTraded = (h.totalBoughtUsd||0) > 0;
-    if(!(h.tokens>0.0001) && !everTraded) continue;
     let coin = state.coinsCache.get(h.id);
     if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()){ coin = {id:cs.id, ...cs.data()}; state.coinsCache.set(h.id, coin); } }
-    if(h.tokens>0.0001){
-      const val = coin? sellValue(coin, h.tokens) : 0;
-      open.push({ h, coin, val, pnl: val-(h.costBasis||0) });
-    } else if(everTraded){
-      closed.push({ h, coin });
-    }
+    const val = coin? sellValue(coin, h.tokens) : 0;
+    open.push({ h, coin, val, pnl: val-(h.costBasis||0) });
   }
   open.sort((a,b)=> b.val-a.val);
-  closed.sort((a,b)=> (b.h.updatedAt||0)-(a.h.updatedAt||0));
+  // Every sell writes its own record here, so this is a running list of individual sales —
+  // not just coins you've fully exited — sorted most recent first.
+  const closedSnap = await getDocs(query(collection(db,'users',uid,'closedPositions'), orderBy('closedAt','desc'), limit(50)));
+  const closed = closedSnap.docs.map(d=>({id:d.id,...d.data()}));
   return { open, closed };
 }
 function openPositionsHtml(open){
@@ -1499,17 +1516,16 @@ function openPositionsHtml(open){
   }).join('');
 }
 function closedPositionsHtml(closed){
-  if(!closed.length) return '<div class="empty" style="padding:16px;">No closed positions yet.</div>';
+  if(!closed.length) return '<div class="empty" style="padding:16px;">No closed positions yet — sell something to see it here.</div>';
   return closed.map(r=>{
-    const pnl = r.h.realizedPnl||0;
+    const pnl = r.pnl||0;
     const up = pnl>=0;
-    const ticker = r.coin?.ticker || r.h.ticker;
     return `
-    <div class="hold-row" data-coin="${r.h.id}" style="cursor:pointer;">
-      <img class="coin-logo" src="${coinLogoFor(ticker, r.coin?.imageURL||r.h.imageURL)}">
+    <div class="hold-row" data-coin="${r.coinId}" style="cursor:pointer;">
+      <img class="coin-logo" src="${coinLogoFor(r.ticker, r.imageURL)}">
       <div class="hold-info">
-        <div class="coin-ticker">$${esc(ticker)}</div>
-        <div class="coin-name">Bought ${fmtUsd(r.h.totalBoughtUsd||0)} · Sold ${fmtUsd(r.h.totalSoldUsd||0)}</div>
+        <div class="coin-ticker">$${esc(r.ticker)}</div>
+        <div class="coin-name">Sold ${fmtTok(r.tokensSold)} for ${fmtUsd(r.proceeds)} · ${timeAgo(r.closedAt)}</div>
       </div>
       <div class="hold-right">
         <div class="mono" style="font-weight:600;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(pnl))}</div>
@@ -1541,7 +1557,8 @@ async function renderUserProfile(uid){
       </div>
     </div>
     <div class="panel">
-      <div class="settings-row" style="border:none;"><span>Cash balance</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
+      <div class="settings-row" style="border:none;"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
     </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
@@ -1579,7 +1596,8 @@ function renderProfile(){
     <div class="panel">
       <div class="settings-row"><span>Avatar image URL</span><button class="btn btn-ghost" id="changeAvatarBtn">Edit</button></div>
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
-      <div class="settings-row" style="border:none;"><span>Cash balance</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
+      <div class="settings-row" style="border:none;"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
     </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
