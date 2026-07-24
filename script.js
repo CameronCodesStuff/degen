@@ -329,7 +329,7 @@ document.addEventListener('click', (e)=>{
 function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
-  const botCount = 10 + Math.floor(Math.random()*410); // 10-50
+  const botCount = 10 + Math.floor(Math.random()*41); // 10-50
   const durationMs = 120000;
   toast(`🚀 Pump activated — ${botCount} bots aping in over the next 2 minutes`, 'ok');
   for(let i=0;i<botCount;i++){
