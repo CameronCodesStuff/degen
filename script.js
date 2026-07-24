@@ -6,7 +6,8 @@ import {
 import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   doc, getDoc, setDoc, updateDoc, onSnapshot, collection,
-  query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp
+  query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp,
+  getCountFromServer
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyCMDe_UPrNTjKnEoO2ngTe7wE6P7_G06ms",
@@ -369,11 +370,16 @@ function triggerPump(coinId){
 }
 
 
-let homeUnsub = null, homeSort='new';
+let homeUnsub = null, homeSort='new', homeCategory='user';
 function renderHome(){
   const view = document.getElementById('view');
   view.innerHTML = `
     <div class="section-title">Explore Coins</div>
+    <div class="chip-row" id="categoryChips">
+      <div class="chip" data-cat="user">🧑‍🤝‍🧑 Community Coins</div>
+      <div class="chip" data-cat="bot">🤖 Bot Market</div>
+    </div>
+    <div class="cat-blurb" id="categoryBlurb"></div>
     <div class="searchbar">🔍 <input id="homeSearch" placeholder="Search by name or ticker..."></div>
     <div class="chip-row" id="sortChips">
       <div class="chip" data-sort="new">🆕 New</div>
@@ -383,6 +389,17 @@ function renderHome(){
     </div>
     <div id="coinGrid" class="coin-grid"><div class="spinner" style="margin-top:40px;"></div></div>
   `;
+  const blurb = document.getElementById('categoryBlurb');
+  function updateBlurb(){
+    blurb.textContent = homeCategory==='bot'
+      ? "Fully simulated coins — nobody launched these, prices move automatically 24/7. Real market, real trades, but the counterparty pressure is bots, not people. Good for practicing reads on volatility."
+      : "Coins launched by real people. Price only moves when someone actually buys or sells.";
+  }
+  updateBlurb();
+  document.querySelectorAll('#categoryChips .chip').forEach(c=>{
+    c.classList.toggle('active', c.dataset.cat===homeCategory);
+    c.addEventListener('click', ()=>{ homeCategory=c.dataset.cat; document.querySelectorAll('#categoryChips .chip').forEach(x=>x.classList.remove('active')); c.classList.add('active'); updateBlurb(); loadHomeCoins(); });
+  });
   document.querySelectorAll('#sortChips .chip').forEach(c=>{
     c.classList.toggle('active', c.dataset.sort===homeSort);
     c.addEventListener('click', ()=>{ homeSort=c.dataset.sort; document.querySelectorAll('#sortChips .chip').forEach(x=>x.classList.remove('active')); c.classList.add('active'); loadHomeCoins(); });
@@ -394,15 +411,24 @@ function renderHome(){
 function loadHomeCoins(){
   if(homeUnsub) homeUnsub();
   const sortField = homeSort==='cap'?'marketCap':'createdAt';
-  const q = query(collection(db,'coins'), orderBy(sortField,'desc'), limit(60));
+  // Bot Market is a server-side filter (needs a composite index — see SETUP.md); Community stays
+  // an unfiltered query + client-side exclusion so older coins launched before this feature
+  // (which have no isBotCoin field at all) still show up correctly.
+  const q = homeCategory==='bot'
+    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,'desc'), limit(60))
+    : query(collection(db,'coins'), orderBy(sortField,'desc'), limit(60));
   homeUnsub = onSnapshot(q, snap=>{
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
+    if(homeCategory==='user') coins = coins.filter(c=> !c.isBotCoin);
     const term = (document.getElementById('homeSearch')?.value||'').toLowerCase();
     if(term) coins = coins.filter(c=> c.ticker.toLowerCase().includes(term) || c.name.toLowerCase().includes(term));
     if(homeSort==='gainers') coins = coins.slice().sort((a,b)=> pctChange(b.priceHistory)-pctChange(a.priceHistory));
     if(homeSort==='losers') coins = coins.slice().sort((a,b)=> pctChange(a.priceHistory)-pctChange(b.priceHistory));
     renderCoinGrid(coins);
+  }, ()=>{
+    const grid = document.getElementById('coinGrid');
+    if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load coins — if this is the Bot Market tab, it may need a Firestore index (see SETUP.md).</div>`;
   });
   state.unsubs.push(homeUnsub);
 }
@@ -422,7 +448,12 @@ function sparklineSvg(history, up){
 function renderCoinGrid(coins){
   const grid = document.getElementById('coinGrid');
   if(!grid) return;
-  if(coins.length===0){ grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">👻</div>No coins found. Be the first to launch one!</div>`; return; }
+  if(coins.length===0){
+    grid.innerHTML = homeCategory==='bot'
+      ? `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">🤖</div>No bot coins yet — new ones spawn automatically every few minutes while the app's open. Check back shortly!</div>`
+      : `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">👻</div>No coins found. Be the first to launch one!</div>`;
+    return;
+  }
   grid.innerHTML = coins.map(c=>{
     const price = priceOf(c);
     const chg = pctChange(c.priceHistory||[]);
@@ -437,14 +468,14 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''}
+        ${c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
         <div class="coin-price mono">${fmtPrice(price)}</div>
         <div class="coin-chg ${up?'up':'down'}">${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%</div>
       </div>
-      <div class="coin-card-foot"><span>MCAP ${fmtUsd(mc)}</span><span>by @${esc(c.creatorUsername)}</span></div>
+      <div class="coin-card-foot"><span>MCAP ${fmtUsd(mc)}</span><span>${c.isBotCoin?`${(c.tradeCount||0).toLocaleString()} trades`:'by @'+esc(c.creatorUsername)}</span></div>
       <div class="progress-track"><div class="progress-fill" style="width:${gradPct}%"></div></div>
     </div>`;
   }).join('');
@@ -491,8 +522,8 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}</div>
-            <div class="detail-name">${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')}</div>
+            <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
         <div class="price-row">
@@ -523,7 +554,7 @@ function buildCoinDetailShell(coin){
           <div class="desc-text">${esc(coin.description)||'No description provided.'}</div>
           <div class="meta-row">
             <span class="meta-tag">🎟️ ${esc(coin.ticker)}</span>
-            <span class="meta-tag user-link" data-uid="${coin.creatorUid||''}" style="cursor:pointer;">👤 @${esc(coin.creatorUsername)}</span>
+            <span class="meta-tag ${coin.isBotCoin?'':'user-link'}" data-uid="${coin.creatorUid||''}" style="${coin.isBotCoin?'':'cursor:pointer;'}">👤 @${esc(coin.creatorUsername)}</span>
             <span class="meta-tag" id="liveLiquidity">💧 Virtual liquidity ${fmtUsd(coin.solReserve)}</span>
           </div>
         </div>
@@ -596,7 +627,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -967,6 +998,7 @@ const BOT_DUMP_CHANCE    = 0.03;     // per young coin, per tick — a dramatic 
 const BOT_BUY_CHANCE     = 0.2;      // per young coin, per tick — small buy pressure
 const BOT_SELL_CHANCE    = 0.2;      // per young coin, per tick — small profit-taking, keeps the line from only ever going up
 let botInterval = null;
+let botCoinInterval = null;
 
 function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
@@ -1013,6 +1045,128 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
+/* ===================== BOT MARKET COINS ===================== */
+// A second flavor of coin, fully separate from user launches: nobody creates these, they spawn
+// themselves periodically and trade forever (not just for their first 8 minutes like the young-
+// coin noise above), so Explore → Bot Market always has a handful of live, chaotic charts to
+// practice reading — no waiting around for real people to launch and trade something.
+const BOT_COIN_POOL_CAP = 18;         // don't let the pool of bot coins grow unbounded
+const BOT_COIN_SPAWN_CHANCE = 0.05;   // rolled roughly once a minute (see spawnCheckCounter below)
+const BOT_COIN_TRADE_CHANCE = 0.5;    // per bot coin, per 14s tick — much livelier than young-coin noise
+const BOT_COIN_QUERY_LIMIT = 30;
+
+const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
+const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
+
+function hashStr(s){ let h=0; for(let i=0;i<s.length;i++){ h=(h*31+s.charCodeAt(i))|0; } return h; }
+// Deterministic pseudo-random "mood" for a given coin over a several-minute window, so price
+// action has believable multi-minute runs (trending up, then down) instead of pure tick-to-tick
+// noise — same idea real charts show, without needing any server-side state to track it.
+function botCoinTrendBias(coinId){
+  const bucket = Math.floor(Date.now()/(4*60*1000));
+  const x = Math.abs(Math.sin(hashStr(coinId+':'+bucket)))*10000;
+  return (x-Math.floor(x))*2-1; // -1..1
+}
+function botCoinTradeSize(){
+  const r = Math.random();
+  if(r<0.05) return 500+Math.random()*2500;  // rare whale-sized swing — real volatility spikes
+  if(r<0.30) return 60+Math.random()*300;    // medium
+  return 6+Math.random()*60;                  // typical small/medium
+}
+
+// Fabricates a plausible "this coin has been live for hours" backstory at spawn time: a wobbly
+// random-walk price history, a trade count already in the thousands, and a handful of recent
+// trades — so a freshly-spawned bot coin immediately looks like an established, volatile market
+// instead of starting flat at zero like a brand new launch.
+function simulateBotCoinLaunch(){
+  const initPrice = INITIAL_SOL_RESERVE/INITIAL_TOKEN_RESERVE;
+  const steps = 90;
+  const stepGapMs = Math.floor((3+Math.random()*6)*3600000/steps); // spread over a fake 3-9hr past
+  let p = initPrice;
+  const priceHistory = [];
+  const now = Date.now();
+  for(let i=0;i<steps;i++){
+    let mult;
+    if(Math.random()<0.08) mult = 1 + (Math.random()<0.5?-1:1)*(0.25+Math.random()*0.35); // occasional big jump
+    else mult = 1 + (Math.random()-0.5)*0.12; // normal wobble
+    p = Math.max(initPrice*0.05, p*mult);
+    priceHistory.push({ p, t: now-(steps-i)*stepGapMs });
+  }
+  const recentTrades = [];
+  for(let i=0;i<14;i++){
+    const isBuy = Math.random()<0.5;
+    recentTrades.push({
+      uid:'bot', username: randBotName(), type: isBuy?'buy':'sell',
+      usdAmount: 8+Math.random()*300, tokenAmount: 1000+Math.random()*500000,
+      t: now-(14-i)*(stepGapMs/3), isBot:true
+    });
+  }
+  return { priceHistory, currentPrice: p, tradeCountSeed: 900+Math.floor(Math.random()*5200), recentTrades };
+}
+
+async function makeUniqueBotTicker(){
+  for(let attempt=0; attempt<6; attempt++){
+    const adj = BOT_COIN_ADJ[Math.floor(Math.random()*BOT_COIN_ADJ.length)];
+    const noun = BOT_COIN_NOUN[Math.floor(Math.random()*BOT_COIN_NOUN.length)];
+    const name = `${adj} ${noun}`;
+    let ticker = (adj.slice(0,2)+noun.slice(0,2)).toUpperCase();
+    if(attempt>0) ticker += Math.floor(Math.random()*10);
+    const tSnap = await getDoc(doc(db,'tickers',ticker));
+    if(!tSnap.exists()) return { name, ticker };
+  }
+  return null; // give up quietly this round — next spawn check will try again
+}
+
+async function spawnBotCoin(){
+  try{
+    const picked = await makeUniqueBotTicker();
+    if(!picked) return;
+    const { name, ticker } = picked;
+    const { priceHistory, currentPrice, tradeCountSeed, recentTrades } = simulateBotCoinLaunch();
+    const circulatingFrac = 0.05+Math.random()*0.4;
+    const tokenReserve = INITIAL_TOKEN_RESERVE*(1-circulatingFrac);
+    const solReserve = currentPrice*tokenReserve;
+    const coinRef = doc(collection(db,'coins'));
+    await setDoc(coinRef, {
+      name, ticker, description:'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
+      imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true,
+      solReserve, tokenReserve,
+      price: currentPrice, marketCap: currentPrice*INITIAL_TOKEN_RESERVE,
+      priceHistory, recentTrades, tradeCount: tradeCountSeed,
+      createdAt: serverTimestamp()
+    });
+    await setDoc(doc(db,'tickers',ticker), { coinId: coinRef.id });
+  }catch(err){ /* silent — e.g. a rare ticker race; next spawn check will just try again */ }
+}
+
+let botCoinSpawnCheckCounter = 0;
+async function maybeSpawnBotCoin(){
+  botCoinSpawnCheckCounter++;
+  if(botCoinSpawnCheckCounter % 4 !== 0) return; // only actually check roughly once a minute
+  try{
+    const countSnap = await getCountFromServer(query(collection(db,'coins'), where('isBotCoin','==',true)));
+    if(countSnap.data().count >= BOT_COIN_POOL_CAP) return;
+    if(Math.random() < BOT_COIN_SPAWN_CHANCE) spawnBotCoin();
+  }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+}
+
+async function botCoinTick(){
+  try{
+    const q = query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT));
+    const snap = await getDocs(q);
+    snap.docs.forEach(d=>{
+      if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
+      const bias = botCoinTrendBias(d.id);
+      const buyChance = Math.min(0.85, Math.max(0.15, 0.5+bias*0.3));
+      const usd = botCoinTradeSize();
+      const big = usd>400;
+      if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
+      else botSellOnCoin(d.id, usd, big);
+    });
+  }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+  maybeSpawnBotCoin();
+}
+
 async function botTick(){
   try{
     const cutoff = Timestamp.fromDate(new Date(Date.now()-BOT_YOUNG_MS));
@@ -1041,9 +1195,14 @@ async function botTick(){
 function startBots(){
   if(botInterval) return;
   botInterval = setInterval(botTick, BOT_TICK_MS);
+  botCoinInterval = setInterval(botCoinTick, BOT_TICK_MS);
   setTimeout(botTick, 3000); // one early tick shortly after load
+  setTimeout(botCoinTick, 4500);
 }
-function stopBots(){ if(botInterval){ clearInterval(botInterval); botInterval=null; } }
+function stopBots(){
+  if(botInterval){ clearInterval(botInterval); botInterval=null; }
+  if(botCoinInterval){ clearInterval(botCoinInterval); botCoinInterval=null; }
+}
 
 /* ===================== CREATE COIN ===================== */
 function renderCreate(){
@@ -1089,7 +1248,7 @@ async function submitCreateCoin(){
     const initPrice = INITIAL_SOL_RESERVE/INITIAL_TOKEN_RESERVE;
     await setDoc(coinRef, {
       name, ticker, description:desc, imageURL,
-      creatorUid: state.uid, creatorUsername: state.userDoc.username,
+      creatorUid: state.uid, creatorUsername: state.userDoc.username, isBotCoin:false,
       solReserve: INITIAL_SOL_RESERVE, tokenReserve: INITIAL_TOKEN_RESERVE,
       price: initPrice, marketCap: initPrice*INITIAL_TOKEN_RESERVE,
       priceHistory: [{p:initPrice, t:Date.now()}], recentTrades: [], tradeCount:0,

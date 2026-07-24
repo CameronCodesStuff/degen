@@ -51,7 +51,13 @@ service cloud.firestore {
 
     match /coins/{coinId} {
       allow read: if isSignedIn();
-      allow create: if isSignedIn() && request.resource.data.creatorUid == request.auth.uid;
+      // Real launches must be tagged with the actual signed-in user. Bot Market coins are
+      // self-spawned by whichever browser tab is running the bot loop — they're always tagged
+      // creatorUid:'bot' + isBotCoin:true, never tied to a real uid, so they get their own clause.
+      allow create: if isSignedIn() && (
+        request.resource.data.creatorUid == request.auth.uid ||
+        (request.resource.data.creatorUid == 'bot' && request.resource.data.isBotCoin == true)
+      );
       allow update: if isSignedIn(); // trades update reserves; validated by AMM math client-side + transactions
       allow delete: if false;
     }
@@ -107,6 +113,15 @@ Explore → Leaderboard shows Daily / Weekly / All-Time top traders, ranked by c
 - Your own ranking updates live on every trade, and also refreshes each time you open the leaderboard. Other players' rankings only refresh when *they* trade — so someone who's holding a coin that's mooning right now but hasn't personally bought/sold anything today will look "frozen" until their next trade. A fully live version of this would need a backend job continuously repricing every portfolio, which is out of scope for a no-backend static site.
 - The leaderboard reads every user's top-level document (capped at 200 users) to build the rankings — fine for a friends-group app, but something to be aware of if this ever grows to a large public userbase.
 - Clicking anyone's name on the leaderboard opens their public profile.
+
+### Bot Market
+Explore now has two tabs: **Community Coins** (real launches, unchanged) and **🤖 Bot Market** — coins nobody created, that trade themselves 24/7:
+- A pool of up to 18 bot coins exists at any time. Roughly once a minute, whichever browser tab has the app open rolls a 5% chance to spawn a new one (procedurally named, e.g. "Turbo Frog" / $TUFR) if the pool isn't full — so new ones appear "randomly," a handful of minutes apart, exactly like the ask.
+- A brand-new bot coin is backfilled with a fabricated launch history at spawn time: a wobbly random-walk price chart spanning a fake 3–9 hours, a trade count already in the thousands, and some recent trades — so it never looks freshly-launched-and-empty, it looks like an established, volatile market from the moment it appears.
+- Every 14s tick, each bot coin has a 50% chance to trade, with sizes ranging from small ($6–$60) to medium ($60–$360) to rare whale-sized swings ($500–$3,000) that spike the chart. Buy vs. sell isn't pure coin-flip noise — each coin has a slow-shifting "mood" (a deterministic pseudo-random bias recalculated every ~4 minutes) that leans it bullish or bearish for a stretch before flipping, so the chart shows believable multi-minute trends instead of static jitter, while staying net-neutral over the long run for the same reason the young-coin bots were rebalanced (see Bots, above) — no free liquidity drifting in over time.
+- Bot Market coins never stop trading and never "graduate" out of bot activity, unlike young user coins which age out after 8 minutes — they're meant to always be live.
+- They're clearly labeled everywhere (🤖 BOT badge on the coin card and detail page) so it's never ambiguous that you're trading against automated counterparties, not real people. Real trades against them are still 100% real — your buys/sells hit the same AMM math and update your real balance and holdings, same as any user coin.
+- **Extra Firestore index needed**: the Bot Market tab queries `coins` filtered by `isBotCoin == true` and sorted by `marketCap` or `createdAt`, which needs a composite index (Firestore will show a one-click "create index" link in the browser console the first time it runs — or pre-create `isBotCoin` Ascending + `marketCap` Descending, and `isBotCoin` Ascending + `createdAt` Descending, under Firestore → Indexes).
 
 ### Recent Activity feed
 A new "Activity" tab shows a live, global feed of real buys and sells across every coin (bot trades are excluded — this is about real people). Each real trade is written to a new top-level `activity` Firestore collection inside the same transaction as the trade itself. Clicking a username in the feed opens that person's profile, and clicking a ticker jumps to that coin.
