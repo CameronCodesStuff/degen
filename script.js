@@ -830,7 +830,7 @@ async function refreshHolderCount(coinId){
 function startHolderCount(coinId){
   stopHolderCount();
   refreshHolderCount(coinId);
-  holderCountInterval = setInterval(()=> refreshHolderCount(coinId), 20000);
+  holderCountInterval = setInterval(()=> refreshHolderCount(coinId), 60000);
 }
 function stopHolderCount(){ if(holderCountInterval){ clearInterval(holderCountInterval); holderCountInterval=null; } }
 
@@ -1480,7 +1480,7 @@ async function checkRankOvertake(){
 // never a real user's balance or holdings — and only target coins launched in the last
 // few minutes, so a coin gets some early liquidity/action before it goes quiet.
 const BOT_YOUNG_MS = 8*60*1000;      // bots only touch coins younger than this
-const BOT_TICK_MS = 14000;           // how often this tab rolls the dice
+const BOT_TICK_MS = 22000;           // how often this tab rolls the dice
 // Buy/sell and explode/dump use matching chance + size ranges on purpose. Bots don't have real
 // balances — a bot "buy" just pushes solReserve up as if real money arrived, and a real user who
 // sells after can walk away with that virtual liquidity as actual spendable balance. If bot buying
@@ -1568,8 +1568,8 @@ async function writeWhaleActivity(coinId, info){
 // practice reading — no waiting around for real people to launch and trade something.
 const BOT_COIN_POOL_CAP = 18;         // don't let the pool of bot coins grow unbounded
 const BOT_COIN_SPAWN_CHANCE = 0.05;   // rolled roughly once a minute (see spawnCheckCounter below)
-const BOT_COIN_TRADE_CHANCE = 0.75;   // per bot coin, per 14s tick — much livelier than young-coin noise
-const BOT_COIN_QUERY_LIMIT = 30;
+const BOT_COIN_TRADE_CHANCE = 0.35;   // per bot coin, per tick — was 0.75, cut hard to stay within Firestore rate limits
+const BOT_COIN_QUERY_LIMIT = 15;      // was 30 — fewer coins touched per tick
 // Rare, dramatic crash-and-delist event — mirrors how real memecoins actually behave, and gives
 // holding a bot coin genuine stakes instead of it just being a risk-free chart to watch. ~0.15%
 // chance per coin per tick means most coins live a good while, but over a long enough run it's
@@ -1707,14 +1707,19 @@ async function maybeSpawnBotCoin(){
   const isFirstCheck = botCoinSpawnCheckCounter === 1;
   if(!isFirstCheck && botCoinSpawnCheckCounter % 4 !== 0) return; // otherwise only check roughly once a minute
   try{
-    // Rugged coins stick around forever now (no more auto-delisting), so counting ALL bot coins
-    // against the cap would mean a long-running session slowly fills up with graveyard coins and
-    // active spawns eventually stop happening. Counting only non-rugged ones keeps ~18 *active*
-    // coins in the pool regardless of how many rugged ones have piled up alongside them. This
-    // needs the actual docs (not just a count aggregation) since "ruggedAt doesn't exist" isn't
-    // a query Firestore can do directly — the pool is small enough that this stays cheap.
-    const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true)));
-    const count = snap.docs.filter(d=>!d.data().ruggedAt).length;
+    // Cheap first pass: a plain aggregation count of ALL bot coins (rugged or not). Since active
+    // count can never exceed total count, if total is already comfortably under the cap we know
+    // active is too, without needing to read any actual documents. Only fall back to fetching
+    // full docs (to filter out rugged ones) once the total is close enough to the cap that it
+    // actually matters — keeps the common case a single cheap aggregation query instead of a
+    // full collection read every single check.
+    const totalSnap = await getCountFromServer(query(collection(db,'coins'), where('isBotCoin','==',true)));
+    const total = totalSnap.data().count;
+    let count = total;
+    if(total >= BOT_COIN_POOL_CAP){
+      const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true)));
+      count = snap.docs.filter(d=>!d.data().ruggedAt).length;
+    }
     if(count >= BOT_COIN_POOL_CAP) return;
     // Bootstrap: if the pool is completely empty (e.g. first time this feature has ever run),
     // spawn a handful right away instead of waiting on the ~5%-per-minute probabilistic trickle —
@@ -1811,7 +1816,7 @@ async function botCoinTick(){
           if(coinsWithPendingUserTrade.has(d.id)) return;
           if(Math.random() < RUGGED_RECOVERY_CHANCE) botBuyOnCoin(d.id, usd, big);
           else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
-        }, Math.random()*12000);
+        }, Math.random()*18000);
         return;
       }
       const ageMs = Date.now()-toMillisLoose(coin.createdAt);
@@ -1829,7 +1834,7 @@ async function botCoinTick(){
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
         else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
-      }, Math.random()*12000);
+      }, Math.random()*18000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
@@ -1891,7 +1896,7 @@ async function botTick(){
       // transaction in the same instant — spreading out when each transaction actually lands cuts
       // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
       // take ages or look stuck when a lot of bot activity landed on the same coin at once.
-      const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*12000);
+      const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*18000);
       if(r < (acc += BOT_EXPLODE_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
