@@ -1043,7 +1043,13 @@ async function doBuy(coinId, usdAmount){
       const [userSnap, coinSnap, holdSnap] = await Promise.all([tx.get(userRef), tx.get(coinRef), tx.get(holdRef)]);
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
-      if(user.balance < usdAmount) throw new Error("You don't have enough balance.");
+      // Same idea as the sell-side fix below: the MAX button rounds to 2 decimals, which can
+      // occasionally round UP a fraction of a cent past the real balance. Clamp instead of
+      // rejecting a legitimate "spend everything" buy.
+      if(usdAmount > user.balance){
+        if(usdAmount - user.balance <= 0.01) usdAmount = user.balance;
+        else throw new Error("You don't have enough balance.");
+      }
       const prevTokens = holdSnap.exists()? holdSnap.data().tokens:0;
       const maxOwnershipTokens = totalSupplyOf(coin)*MAX_OWNERSHIP_PCT;
       if(prevTokens >= maxOwnershipTokens) throw new Error(`You already hold the max allowed ${Math.round(MAX_OWNERSHIP_PCT*100)}% of this coin's supply.`);
@@ -1064,8 +1070,8 @@ async function doBuy(coinId, usdAmount){
       }
 
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-20);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
@@ -1110,11 +1116,19 @@ async function doSell(coinId, tokenAmount){
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
       const owned = holdSnap.exists()? holdSnap.data().tokens:0;
-      if(tokenAmount > owned+0.0000001) throw new Error("You don't own that many tokens.");
+      // The MAX/25%/50%/75% quick buttons round the displayed amount to 4 decimal places, which
+      // can occasionally round UP a hair past what's actually owned (e.g. selling "MAX" on a
+      // holding with more precision than 4 decimals). Treat anything within a tiny tolerance as
+      // "sell everything" instead of rejecting a perfectly reasonable MAX sell outright.
+      if(tokenAmount > owned){
+        const tolerance = Math.max(owned*0.0005, 0.0001);
+        if(tokenAmount - owned <= tolerance) tokenAmount = owned;
+        else throw new Error("You don't own that many tokens.");
+      }
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-20);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       tx.update(userRef, { balance: user.balance + usdOut });
       // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
@@ -1217,8 +1231,8 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coin = coinSnap.data();
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
       if(!(tokensOut>0)) return;
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-20);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
     });
     if(isExplosion) toast(`💥 A whale just aped into a new coin!`, 'ok');
@@ -1243,8 +1257,8 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
       if(tokenAmount > maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) return;
-      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-20);
+      const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
     });
     if(isDump) toast(`📉 Paper hands are dumping a coin!`, 'err');
@@ -1444,7 +1458,7 @@ async function catchUpBotCoin(coinId, coin){
       }
     }
   }
-  hist = hist.slice(-160); trades = trades.slice(-20);
+  hist = hist.slice(-110); trades = trades.slice(-14);
   const newPrice = solReserve/tokenReserve;
   try{
     await updateDoc(doc(db,'coins',coinId), {
@@ -1487,7 +1501,7 @@ async function botCoinTick(){
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
         else botSellOnCoin(d.id, usd, big);
-      }, Math.random()*9000);
+      }, Math.random()*12000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
@@ -1506,8 +1520,8 @@ async function ruggedCoinEvent(coinId){
       const crashFactor = 0.02+Math.random()*0.08; // keep 2-10% of liquidity → 90-98% price crash
       const newSol = c.solReserve*crashFactor;
       const newPrice = newSol/c.tokenReserve;
-      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-160);
-      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-20);
+      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-14);
       tx.update(coinRef, {
         solReserve:newSol, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
         priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1,
@@ -1547,7 +1561,7 @@ async function botTick(){
       // transaction in the same instant — spreading out when each transaction actually lands cuts
       // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
       // take ages or look stuck when a lot of bot activity landed on the same coin at once.
-      const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*9000);
+      const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*12000);
       if(r < (acc += BOT_EXPLODE_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
