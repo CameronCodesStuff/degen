@@ -129,6 +129,19 @@ function timeAgo(ts){
   if(s<86400) return Math.floor(s/3600)+'h ago';
   return Math.floor(s/86400)+'d ago';
 }
+// Like timeAgo but without the "ago" suffix and with week/month granularity for long-lived bot
+// coins — timeAgo caps out at "Nd ago" which gets unwieldy once a coin's been around for weeks.
+function ageText(ts){
+  if(!ts) return '';
+  const d = ts.toDate ? ts.toDate() : new Date(ts);
+  const s = Math.floor((Date.now()-d.getTime())/1000);
+  if(s<60) return s+'s';
+  if(s<3600) return Math.floor(s/60)+'m';
+  if(s<86400) return Math.floor(s/3600)+'h';
+  if(s<604800) return Math.floor(s/86400)+'d';
+  if(s<2592000) return Math.floor(s/604800)+'w';
+  return Math.floor(s/2592000)+'mo';
+}
 function avatarFor(username, url){
   if(url) return url;
   const seed = encodeURIComponent(username||'anon');
@@ -359,7 +372,7 @@ function listenTickerTape(){
 /* ===================== ROUTER ===================== */
 function navigate(name, param=null){
   state.route = {name, param};
-  if(name!=='coin') stopViewerCount();
+  if(name!=='coin'){ stopViewerCount(); stopHolderCount(); }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
   });
@@ -545,6 +558,7 @@ function renderHome(){
     <div class="searchbar">🔍 <input id="homeSearch" placeholder="Search by name or ticker..."></div>
     <div class="chip-row" id="sortChips">
       <div class="chip" data-sort="new">🆕 New</div>
+      <div class="chip" data-sort="oldest">🕰️ Oldest</div>
       <div class="chip" data-sort="cap">💰 Market Cap</div>
       <div class="chip" data-sort="gainers">🔥 Gainers</div>
       <div class="chip" data-sort="losers">📉 Losers</div>
@@ -573,12 +587,13 @@ function renderHome(){
 function loadHomeCoins(){
   if(homeUnsub) homeUnsub();
   const sortField = homeSort==='cap'?'marketCap':'createdAt';
+  const sortDir = homeSort==='oldest'?'asc':'desc';
   // Bot Market is a server-side filter (needs a composite index — see SETUP.md); Community stays
   // an unfiltered query + client-side exclusion so older coins launched before this feature
   // (which have no isBotCoin field at all) still show up correctly.
   const q = homeCategory==='bot'
-    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,'desc'), limit(60))
-    : query(collection(db,'coins'), orderBy(sortField,'desc'), limit(60));
+    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,sortDir), limit(60))
+    : query(collection(db,'coins'), orderBy(sortField,sortDir), limit(60));
   homeUnsub = onSnapshot(q, snap=>{
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
@@ -647,11 +662,11 @@ function renderCoinGrid(coins){
 }
 
 /* ===================== COIN DETAIL ===================== */
-let coinUnsub = null, chartRange='1h', shellCoinId=null, currentRecalc=null;
+let coinUnsub = null, chartRange='1h', shellCoinId=null, currentRecalc=null, currentDetailCoin=null;
 function renderCoinDetail(coinId){
   if(coinUnsub) coinUnsub();
   if(state.chart){ state.chart.destroy(); state.chart=null; }
-  state.tradeMode='buy'; state.tradeAmount=0; shellCoinId=null; currentRecalc=null;
+  state.tradeMode='buy'; state.tradeAmount=0; shellCoinId=null; currentRecalc=null; currentDetailCoin=null;
   const view = document.getElementById('view');
   view.innerHTML = `<div class="spinner" style="margin-top:60px;"></div>`;
   coinUnsub = onSnapshot(doc(db,'coins',coinId), snap=>{
@@ -669,6 +684,7 @@ function renderCoinDetail(coinId){
 }
 
 function buildCoinDetailShell(coin){
+  currentDetailCoin = coin;
   const view = document.getElementById('view');
   const price = priceOf(coin);
   const chg = pctChange(coin.priceHistory||[]);
@@ -684,8 +700,8 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED — delisting soon</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}</div>
-            <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}</div>
+            <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
         <div class="price-row">
@@ -723,7 +739,7 @@ function buildCoinDetailShell(coin){
         </div>
 
         <div class="panel" style="margin-top:16px;">
-          <div style="font-weight:700;margin-bottom:10px;">Top Holders</div>
+          <div style="font-weight:700;margin-bottom:10px;display:flex;align-items:center;gap:8px;">Top Holders <span class="meta-tag" id="holderCount" style="font-weight:600;">— holders</span></div>
           <div id="topHoldersList"><div class="spinner" style="margin:10px 0;"></div></div>
         </div>
 
@@ -749,12 +765,13 @@ function buildCoinDetailShell(coin){
   wireUserLinks(view);
   loadTopHolders(coin.id);
   startViewerCount(coin);
+  startHolderCount(coin.id);
   drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
-    b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(coin, true); });
+    b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(currentDetailCoin||coin, true); });
   });
   document.querySelectorAll('.trade-tab').forEach(t=>{
-    t.addEventListener('click', ()=>{ state.tradeMode=t.dataset.mode; state.tradeAmount=0; rebuildTradePanel(coin); });
+    t.addEventListener('click', ()=>{ state.tradeMode=t.dataset.mode; state.tradeAmount=0; rebuildTradePanel(currentDetailCoin||coin); });
   });
   wireTradePanel(coin);
 }
@@ -796,6 +813,26 @@ function startViewerCount(coin){
   viewerCountInterval = setInterval(update, 8000);
 }
 function stopViewerCount(){ if(viewerCountInterval){ clearInterval(viewerCountInterval); viewerCountInterval=null; } }
+
+/* ===================== LIVE HOLDER COUNT ===================== */
+// A genuinely live count (not fake, unlike the viewer counter above) of distinct accounts
+// currently holding this coin — uses the same collection-group index the Top Holders list needs.
+let holderCountInterval = null;
+async function refreshHolderCount(coinId){
+  const el = document.getElementById('holderCount');
+  if(!el) { stopHolderCount(); return; }
+  try{
+    const snap = await getCountFromServer(query(collectionGroup(db,'holdings'), where('coinId','==',coinId), where('tokens','>',0.0001)));
+    const el2 = document.getElementById('holderCount'); // re-check — the await may have outlived the page
+    if(el2) el2.textContent = `👥 ${snap.data().count.toLocaleString()} holder${snap.data().count===1?'':'s'}`;
+  }catch(err){ if(el) el.textContent = '👥 —'; }
+}
+function startHolderCount(coinId){
+  stopHolderCount();
+  refreshHolderCount(coinId);
+  holderCountInterval = setInterval(()=> refreshHolderCount(coinId), 20000);
+}
+function stopHolderCount(){ if(holderCountInterval){ clearInterval(holderCountInterval); holderCountInterval=null; } }
 
 function wireUserLinks(container){
   container.querySelectorAll('.user-link[data-uid]').forEach(el=>{
@@ -840,6 +877,7 @@ async function loadTopHolders(coinId){
 // Cheap refresh used on every live snapshot after the shell already exists.
 // Never touches the trade amount input, so typing isn't interrupted by other users' trades.
 function updateCoinDetailLive(coin){
+  currentDetailCoin = coin;
   const price = priceOf(coin);
   const chg = pctChange(coin.priceHistory||[]);
   const up = chg>=0;
@@ -856,7 +894,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED — delisting soon</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -873,10 +911,8 @@ function rebuildTradePanel(coin){
 
 function buyPanelHtml(coin){
   const bal = state.userDoc?.balance||0;
-  if(coin.ruggedAt){
-    return `<div class="empty" style="padding:24px 12px;">💀 This coin got rugged and is being delisted. You can still sell to exit, but buying is disabled.</div>`;
-  }
   return `
+    ${coin.ruggedAt?'<div class="empty" style="padding:10px 4px 16px;color:var(--down);font-size:12.5px;">💀 This coin got rugged. Still fully tradeable, but the odds of a real comeback are deliberately very low — buy in knowing it\'s mostly a long shot.</div>':''}
     <div class="amt-display"><input id="tradeAmt" inputmode="decimal" placeholder="$0" value="${state.tradeAmount||''}"></div>
     <div class="amt-sub">Balance: ${fmtUsd(bal)}</div>
     <div class="quick-row">
@@ -999,7 +1035,15 @@ function buildTradeMarkers(coin, windowed, windowMs){
       const diff = Math.abs(toMillis(p.t)-tMs);
       if(diff<bestDiff){ bestDiff=diff; bestIdx=i; }
     });
-    markers.push({ index:bestIdx, trade:t, img:getAvatarImg(t.avatarURL) });
+    // Most real users never bother setting a custom avatarURL, which left it as an empty string
+    // on their trade records — getAvatarImg('') always returned null, so a plain "no custom
+    // avatar" real trade silently never got a marker at all (bought or sold, not sell-specific,
+    // but sells are just as likely to hit this). Falling back to the same generated default
+    // avatar used everywhere else in the app fixes that. Bots (uid 'bot' or missing) stay
+    // excluded on purpose — this is specifically about real people.
+    const isBotTrade = !t.uid || t.uid==='bot';
+    const img = isBotTrade ? null : getAvatarImg(avatarFor(t.username, t.avatarURL));
+    markers.push({ index:bestIdx, trade:t, img });
   });
   return markers;
 }
@@ -1531,7 +1575,7 @@ const BOT_COIN_QUERY_LIMIT = 30;
 // is actually visible/tradeable) before being delisted to make room for a fresh spawn.
 const BOT_COIN_RUG_CHANCE = 0.0015;
 const BOT_COIN_RUG_MIN_AGE_MS = 15*60*1000; // too unfair to rug something seconds after it's born
-const BOT_COIN_RUG_CLEANUP_MS = 45*1000;    // how long a rugged coin lingers, crashed, before delisting
+const RUGGED_RECOVERY_CHANCE = 0.06; // fixed low buy-chance for a rugged coin, replacing the normal trend-bias split
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -1568,11 +1612,25 @@ function simulateBotCoinLaunch(){
   const totalSupply = BOT_COIN_SUPPLY_CHOICES[Math.floor(Math.random()*BOT_COIN_SUPPLY_CHOICES.length)];
   const startMcap = 2000+Math.random()*78000; // wide spread — some tiny, some near graduation-scale
   const initPrice = startMcap/totalSupply;
+  const now = Date.now();
+
+  // ~30% of spawns are genuinely brand new — zero trades, flat single-point history, nothing
+  // fabricated — instead of every single coin arriving with a fake multi-hour backstory. Gives
+  // Explore a real mix: some coins you're seeing at literally trade #0, others already established.
+  if(Math.random() < 0.3){
+    return {
+      priceHistory: [{p:initPrice, t:now}],
+      currentPrice: initPrice,
+      tradeCountSeed: 0,
+      recentTrades: [],
+      totalSupply
+    };
+  }
+
   const steps = 90;
   const stepGapMs = Math.floor((3+Math.random()*6)*3600000/steps); // spread over a fake 3-9hr past
   let p = initPrice;
   const priceHistory = [];
-  const now = Date.now();
   for(let i=0;i<steps;i++){
     let mult;
     // Bigger and more frequent moves than a community coin's organic trading — this is what's
@@ -1647,8 +1705,14 @@ async function maybeSpawnBotCoin(){
   const isFirstCheck = botCoinSpawnCheckCounter === 1;
   if(!isFirstCheck && botCoinSpawnCheckCounter % 4 !== 0) return; // otherwise only check roughly once a minute
   try{
-    const countSnap = await getCountFromServer(query(collection(db,'coins'), where('isBotCoin','==',true)));
-    const count = countSnap.data().count;
+    // Rugged coins stick around forever now (no more auto-delisting), so counting ALL bot coins
+    // against the cap would mean a long-running session slowly fills up with graveyard coins and
+    // active spawns eventually stop happening. Counting only non-rugged ones keeps ~18 *active*
+    // coins in the pool regardless of how many rugged ones have piled up alongside them. This
+    // needs the actual docs (not just a count aggregation) since "ruggedAt doesn't exist" isn't
+    // a query Firestore can do directly — the pool is small enough that this stays cheap.
+    const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true)));
+    const count = snap.docs.filter(d=>!d.data().ruggedAt).length;
     if(count >= BOT_COIN_POOL_CAP) return;
     // Bootstrap: if the pool is completely empty (e.g. first time this feature has ever run),
     // spawn a handful right away instead of waiting on the ~5%-per-minute probabilistic trickle —
@@ -1733,7 +1797,19 @@ async function botCoinTick(){
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.ruggedAt){
-        if(Date.now()-toMillisLoose(coin.ruggedAt) > BOT_COIN_RUG_CLEANUP_MS) cleanupRuggedCoin(d.id, coin);
+        // Rugged coins stay in the pool forever now — no deletion, still fully tradeable — but
+        // recovery is deliberately rare: buy chance is fixed low instead of using the normal
+        // trend-bias split, so it mostly keeps drifting down or sideways with only an occasional
+        // small bounce. Betting on a rugged coin's comeback is meant to be a real long-shot, not
+        // a guaranteed loss or a normal coin in disguise.
+        if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
+        const usd = botCoinTradeSize();
+        const big = usd>800;
+        setTimeout(()=>{
+          if(coinsWithPendingUserTrade.has(d.id)) return;
+          if(Math.random() < RUGGED_RECOVERY_CHANCE) botBuyOnCoin(d.id, usd, big);
+          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
+        }, Math.random()*12000);
         return;
       }
       const ageMs = Date.now()-toMillisLoose(coin.createdAt);
@@ -1750,7 +1826,7 @@ async function botCoinTick(){
       setTimeout(()=>{
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-        else if((coin.pumpSellSuppressUntil||0) <= Date.now()) botSellOnCoin(d.id, usd, big);
+        else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
       }, Math.random()*12000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
@@ -1778,15 +1854,17 @@ async function ruggedCoinEvent(coinId){
         ruggedAt: Date.now(), lastTickAt: Date.now()
       });
     });
-    if(ticker) toast(`💀 $${ticker} just got rugged — crashed ~90%+ in seconds.`, 'err');
+    if(ticker) toast(`💀 $${ticker} just got rugged — crashed ~90%+ in seconds. Still tradeable, but don't expect a comeback.`, 'err');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
-async function cleanupRuggedCoin(coinId, coin){
-  try{
-    await deleteDoc(doc(db,'coins',coinId));
-    if(coin.ticker) await deleteDoc(doc(db,'tickers',coin.ticker)).catch(()=>{});
-  }catch(err){ /* another tab may already be cleaning this one up — fine either way */ }
+// While pumpSellSuppressUntil is in the future for a coin, bot sells are heavily dampened rather
+// than completely blocked — a pump should still read as strongly one-sided, but a total sell
+// blackout felt too artificial/one-directional. ~15% of sell rolls still go through.
+function pumpAllowsSell(coin){
+  const until = coin.pumpSellSuppressUntil||0;
+  if(until <= Date.now()) return true;
+  return Math.random() < 0.15;
 }
 
 async function botTick(){
@@ -1812,15 +1890,14 @@ async function botTick(){
       // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
       // take ages or look stuck when a lot of bot activity landed on the same coin at once.
       const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*12000);
-      const sellsSuppressed = (coin.pumpSellSuppressUntil||0) > Date.now();
       if(r < (acc += BOT_EXPLODE_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
-        if(!sellsSuppressed) fire(()=> botSellOnCoin(d.id, 200+Math.random()*500, true));
+        if(pumpAllowsSell(coin)) fire(()=> botSellOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_BUY_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 4+Math.random()*36, false));
       } else if(r < (acc += BOT_SELL_CHANCE)){
-        if(!sellsSuppressed) fire(()=> botSellOnCoin(d.id, 4+Math.random()*36, false));
+        if(pumpAllowsSell(coin)) fire(()=> botSellOnCoin(d.id, 4+Math.random()*36, false));
       }
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
