@@ -122,7 +122,7 @@ Drop all files (`index.html`, `style.css`, `script.js`, `sw.js`, `manifest.json`
 - Coins "graduate" 🎓 cosmetically once market cap crosses $69,000 (a nod to pump.fun's real graduation threshold — just a badge here, no extra mechanics).
 - Launching a coin costs a $5 fee (from the $100 starting balance) to discourage spam.
 - Avatars and coin logos are plain image URLs — paste a link to any hosted image (e.g. Imgur), or leave it blank for an auto-generated default.
-- The chart has **1m / 1h / 1d / all** ranges and updates live in place (no page flicker, no losing whatever you were typing in the buy/sell box) whenever anyone trades.
+- The chart has **1m / 5m / 1h / 1d / all** ranges and updates live in place (no page flicker, no losing whatever you were typing in the buy/sell box) whenever anyone trades.
 
 ### Portfolio value now reflects real slippage
 Previously, your portfolio and net worth (and therefore the leaderboard) valued every holding as `tokens × current spot price`. That overstated what you could actually walk away with, because spot price is only the price of the *next* token — selling a large stack pushes the price down as you sell, same as any bonding curve/AMM. Portfolio value, the leaderboard, and each holding's shown value now run the actual sell math (`ammSell`) to show what you'd realistically get if you sold right now, which is what fixes the "it said I'd get $1,000 but I only got $100" issue.
@@ -181,8 +181,8 @@ Selling any amount of a coin — not just fully exiting it — writes its own re
 ### Profile: overall balance, today's change, and win rate
 Profiles (yours and anyone else's) now show "Overall account balance" (cash + realizable value of everything held) separately from cash, a green/red line under the username showing today's % and $ change in net worth (reusing the leaderboard's daily-baseline logic), and a win rate stat (% of closed positions that were profitable), computed straight from the closed-positions data described above.
 
-### Portfolio history chart
-The Portfolio page now includes a line chart of your net worth over time, plotted from `netWorthHistory` — data that was already being recorded on every trade but never visualized before.
+### Net worth history chart
+The same "Net Worth Over Time" line chart appears in three places now: the Portfolio page, your own profile, and everyone's public profile — all plotted from the `netWorthHistory` field on that user's doc, which is public data already (any signed-in user can read `users/{uid}`). Since it's just visualizing an existing field, an admin economy reset (which resets `netWorthHistory` back to a single starting point for every account) automatically wipes these charts too — nothing extra needed there.
 
 ### Recent Activity feed
 A new "Activity" tab shows a live, global feed of real buys and sells across every coin (bot trades are excluded — this is about real people). Each real trade is written to a new top-level `activity` Firestore collection inside the same transaction as the trade itself. Clicking a username in the feed opens that person's profile, and clicking a ticker jumps to that coin.

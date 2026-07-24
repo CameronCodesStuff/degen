@@ -642,7 +642,7 @@ function buildCoinDetailShell(coin){
           </div>
           <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
           <div class="range-row" id="rangeRow">
-            ${['1M','1H','1D','ALL'].map(r=>`<div class="range-btn ${r.toLowerCase()===chartRange?'active':''}" data-range="${r.toLowerCase()}">${r}</div>`).join('')}
+            ${['1M','5M','1H','1D','ALL'].map(r=>`<div class="range-btn ${r.toLowerCase()===chartRange?'active':''}" data-range="${r.toLowerCase()}">${r}</div>`).join('')}
           </div>
           <div style="margin-top:14px;" id="gradWrap">
             <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--txt-dim);margin-bottom:4px;">
@@ -745,7 +745,8 @@ async function loadTopHolders(coinId){
     }).join('');
     wireUserLinks(list);
   }catch(err){
-    list.innerHTML = `<div class="empty">Couldn't load holders${err.code==='failed-precondition'?' — needs a Firestore index (see SETUP.md)':''}.</div>`;
+    console.error('loadTopHolders failed:', err);
+    list.innerHTML = `<div class="empty">Couldn't load holders: ${esc(err.message||err.code||'unknown error')}</div>`;
   }
 }
 
@@ -874,6 +875,7 @@ async function wireTradePanel(coin){
 
 function rangeMs(){
   if(chartRange==='1m') return 60000;
+  if(chartRange==='5m') return 300000;
   if(chartRange==='1h') return 3600000;
   if(chartRange==='1d') return 86400000;
   return Infinity;
@@ -893,7 +895,7 @@ function drawChart(coin, forceRebuild){
   let windowed = window_===Infinity ? hist : hist.filter(p=> p.t && (Date.now()-toMillis(p.t)) <= window_);
   if(windowed.length===0) windowed = hist.length? [hist[hist.length-1]] : [{p:priceOf(coin),t:Date.now()}];
   if(windowed.length===1) windowed = [{p:windowed[0].p, t:toMillis(windowed[0].t)-1000}, windowed[0]];
-  const labels = windowed.map(p=> new Date(toMillis(p.t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second: chartRange==='1m'?'2-digit':undefined}));
+  const labels = windowed.map(p=> new Date(toMillis(p.t)).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second: (chartRange==='1m'||chartRange==='5m')?'2-digit':undefined}));
   const prices = windowed.map(p=>p.p);
   const up = prices[prices.length-1] >= prices[0];
   const color = up? '#C6FF3D' : '#FF4D6D';
@@ -983,15 +985,15 @@ function drawChart(coin, forceRebuild){
 function toMillis(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
 
 let pfChartInstance = null;
-function drawPortfolioChart(){
-  const ctx = document.getElementById('pfChart');
+function drawNetWorthChart(canvasId, history){
+  const ctx = document.getElementById(canvasId);
   if(!ctx) return;
   if(typeof Chart === 'undefined'){
     ctx.parentElement.insertAdjacentHTML('beforeend','<div style="text-align:center;color:var(--txt-faint);font-size:12px;padding-top:10px;">Chart library failed to load.</div>');
     return;
   }
   if(pfChartInstance){ pfChartInstance.destroy(); pfChartInstance = null; }
-  let hist = (state.userDoc?.netWorthHistory||[]).slice().sort((a,b)=>a.t-b.t);
+  let hist = (history||[]).slice().sort((a,b)=>a.t-b.t);
   if(!hist.length) hist = [{t:Date.now(), nw:STARTING_BALANCE}];
   if(hist.length===1) hist = [{t:hist[0].t-1000, nw:hist[0].nw}, hist[0]];
   const labels = hist.map(h=> new Date(h.t).toLocaleDateString([], {month:'short', day:'numeric'}));
@@ -1632,7 +1634,7 @@ async function renderPortfolio(){
     <div class="section-title" style="font-size:16px;">Your Holdings</div>
     <div id="holdingsList"><div class="spinner"></div></div>
   `;
-  drawPortfolioChart();
+  drawNetWorthChart('pfChart', state.userDoc?.netWorthHistory);
   const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
   let holdingsVal = 0;
@@ -1949,12 +1951,17 @@ async function renderUserProfile(uid){
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
       <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
     </div>
+    <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
+      <div class="chart-wrap" style="height:180px;"><canvas id="userProfChart"></canvas></div>
+    </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Closed Positions</div>
     <div id="closedPosList"><div class="spinner"></div></div>
   `;
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('leaderboard'));
+  drawNetWorthChart('userProfChart', u.netWorthHistory);
   try{
     const { open, closed } = await loadPositions(uid);
     const openEl = document.getElementById('openPosList');
@@ -1998,6 +2005,10 @@ function renderProfile(){
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
       <div class="settings-row" style="border:none;"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
     </div>
+    <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
+      <div class="chart-wrap" style="height:180px;"><canvas id="profChart"></canvas></div>
+    </div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Open Positions</div>
     <div id="openPosList"><div class="spinner"></div></div>
     <div class="section-title" style="font-size:16px;margin-top:20px;">Closed Positions</div>
@@ -2007,6 +2018,7 @@ function renderProfile(){
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
+  drawNetWorthChart('profChart', u.netWorthHistory);
   loadPositions(state.uid).then(({open, closed})=>{
     const openEl = document.getElementById('openPosList');
     const closedEl = document.getElementById('closedPosList');
