@@ -409,17 +409,24 @@ document.addEventListener('click', (e)=>{
   triggerPump(el.dataset.coin);
 }, true);
 
+// While a coin is in this map with a future timestamp, bot ticks (both the young-coin loop and
+// the Bot Market loop) skip any sell/dump roll on it entirely — real user sells are untouched,
+// this only mutes bot-generated sell pressure so a pump doesn't get immediately undone by the
+// same bots that would otherwise dump it right back down.
+const pumpSellSuppressUntil = new Map();
+
 function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
   const botCount = 10 + Math.floor(Math.random()*41); // 10-50
   const durationMs = 10000;
-  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 10 seconds`, 'ok');
+  pumpSellSuppressUntil.set(coinId, Date.now()+5*60*1000); // 5 minutes of no bot sells on this coin
+  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 10 seconds (no bot sells on this coin for 5 min)`, 'ok');
   for(let i=0;i<botCount;i++){
     const delay = Math.random()*durationMs;
     setTimeout(()=>{
-      const usd = 8 + Math.random()*220;
-      botBuyOnCoin(coinId, usd, usd>150);
+      const usd = 150 + Math.random()*2500; // bigger purchases than the old $8-228 range
+      botBuyOnCoin(coinId, usd, usd>800);
     }, delay);
   }
   setTimeout(()=> activePumps.delete(coinId), durationMs+3000);
@@ -1748,7 +1755,7 @@ async function botCoinTick(){
       setTimeout(()=>{
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-        else botSellOnCoin(d.id, usd, big);
+        else if((pumpSellSuppressUntil.get(d.id)||0) <= Date.now()) botSellOnCoin(d.id, usd, big);
       }, Math.random()*12000);
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
@@ -1810,14 +1817,15 @@ async function botTick(){
       // down peak concurrent load on Firestore, which is what made real buys/sells occasionally
       // take ages or look stuck when a lot of bot activity landed on the same coin at once.
       const fire = (fn)=> setTimeout(()=>{ if(!coinsWithPendingUserTrade.has(d.id)) fn(); }, Math.random()*12000);
+      const sellsSuppressed = (pumpSellSuppressUntil.get(d.id)||0) > Date.now();
       if(r < (acc += BOT_EXPLODE_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_DUMP_CHANCE)){
-        fire(()=> botSellOnCoin(d.id, 200+Math.random()*500, true));
+        if(!sellsSuppressed) fire(()=> botSellOnCoin(d.id, 200+Math.random()*500, true));
       } else if(r < (acc += BOT_BUY_CHANCE)){
         fire(()=> botBuyOnCoin(d.id, 4+Math.random()*36, false));
       } else if(r < (acc += BOT_SELL_CHANCE)){
-        fire(()=> botSellOnCoin(d.id, 4+Math.random()*36, false));
+        if(!sellsSuppressed) fire(()=> botSellOnCoin(d.id, 4+Math.random()*36, false));
       }
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
