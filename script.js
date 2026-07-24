@@ -997,8 +997,7 @@ const BOT_EXPLODE_CHANCE = 0.03;     // per young coin, per tick — a dramatic 
 const BOT_DUMP_CHANCE    = 0.03;     // per young coin, per tick — a dramatic sell-off (the "drop" half of a spike)
 const BOT_BUY_CHANCE     = 0.2;      // per young coin, per tick — small buy pressure
 const BOT_SELL_CHANCE    = 0.2;      // per young coin, per tick — small profit-taking, keeps the line from only ever going up
-let botInterval = null;
-let botCoinInterval = null;
+let botRunning = false;
 
 function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
@@ -1184,6 +1183,11 @@ async function botTick(){
     const snap = await getDocs(q);
     snap.docs.forEach(d=>{
       const coin = d.data();
+      // Bot Market coins are exclusively handled by botCoinTick — if this loop touched them too,
+      // both loops fire on the same 14s cadence and can race to update the same freshly-spawned
+      // doc at nearly the same instant, which is exactly what produces Firestore transaction
+      // contention ("stored version doesn't match") on commit. One owner per coin, no race.
+      if(coin.isBotCoin) return;
       const mc = marketCapOf({...coin});
       if(mc >= GRAD_MARKET_CAP) return; // graduated coins are left alone
       // Single roll split into ranges so buy/sell/explode/dump stay mutually exclusive per tick.
@@ -1203,16 +1207,22 @@ async function botTick(){
 }
 
 function startBots(){
-  if(botInterval) return;
-  botInterval = setInterval(botTick, BOT_TICK_MS);
-  botCoinInterval = setInterval(botCoinTick, BOT_TICK_MS);
-  setTimeout(botTick, 3000); // one early tick shortly after load
+  if(botRunning) return;
+  botRunning = true;
+  // Self-scheduling with jitter (±3s) rather than a fixed setInterval — if two tabs (or, before
+  // the fix above, two loops in the same tab) both tick on a perfectly synced clock, they're far
+  // more likely to race to update the same document at the same instant. Randomized spacing
+  // spreads that out and cuts down on transaction contention.
+  function scheduleNext(fn, base){
+    if(!botRunning) return;
+    setTimeout(()=>{ if(!botRunning) return; fn(); scheduleNext(fn, base); }, base + (Math.random()*6000-3000));
+  }
+  setTimeout(botTick, 3000);       // one early tick shortly after load
   setTimeout(botCoinTick, 4500);
+  scheduleNext(botTick, BOT_TICK_MS);
+  scheduleNext(botCoinTick, BOT_TICK_MS);
 }
-function stopBots(){
-  if(botInterval){ clearInterval(botInterval); botInterval=null; }
-  if(botCoinInterval){ clearInterval(botCoinInterval); botCoinInterval=null; }
-}
+function stopBots(){ botRunning = false; }
 
 /* ===================== CREATE COIN ===================== */
 function renderCreate(){
