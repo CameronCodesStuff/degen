@@ -1042,6 +1042,7 @@ const coinsWithPendingUserTrade = new Set();
 async function doBuy(coinId, usdAmount){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
+  const originalBtnText = btn?.textContent;
   if(btn){ btn.disabled=true; btn.textContent='Buying…'; }
   coinsWithPendingUserTrade.add(coinId);
   try{
@@ -1108,12 +1109,13 @@ async function doBuy(coinId, usdAmount){
     refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
   coinsWithPendingUserTrade.delete(coinId);
-  if(btn){ btn.disabled=false; }
+  if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
 }
 
 async function doSell(coinId, tokenAmount){
   if(!tokenAmount || tokenAmount<=0){ toast('Enter an amount to sell.', 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
+  const originalBtnText = btn?.textContent;
   if(btn){ btn.disabled=true; btn.textContent='Selling…'; }
   coinsWithPendingUserTrade.add(coinId);
   try{
@@ -1178,7 +1180,7 @@ async function doSell(coinId, tokenAmount){
     refreshNetWorthSnapshot();
   }catch(err){ toast(err.message, 'err'); }
   coinsWithPendingUserTrade.delete(coinId);
-  if(btn){ btn.disabled=false; }
+  if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
 }
 
 // Best-effort snapshot of the current user's total net worth (cash + all holdings at current
