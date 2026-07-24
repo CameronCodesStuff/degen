@@ -1249,6 +1249,7 @@ const coinsWithPendingUserTrade = new Set();
 
 async function doBuy(coinId, usdAmount){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
+  if(!state.userDoc){ toast("Still loading your account — try again in a second.", 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
   const originalBtnText = btn?.textContent;
   if(btn){ btn.disabled=true; btn.textContent='Buying…'; }
@@ -1325,6 +1326,7 @@ async function doBuy(coinId, usdAmount){
 
 async function doSell(coinId, tokenAmount){
   if(!tokenAmount || tokenAmount<=0){ toast('Enter an amount to sell.', 'err'); return; }
+  if(!state.userDoc){ toast("Still loading your account — try again in a second.", 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
   const originalBtnText = btn?.textContent;
   if(btn){ btn.disabled=true; btn.textContent='Selling…'; }
@@ -1963,6 +1965,7 @@ async function submitCreateCoin(){
   const desc = document.getElementById('cDesc').value.trim();
   if(name.length<2){ toast('Enter a coin name.', 'err'); return; }
   if(!/^[A-Z0-9]{2,8}$/.test(ticker)){ toast('Ticker must be 2-8 letters/numbers.', 'err'); return; }
+  if(!state.userDoc){ toast("Still loading your account — try again in a second.", 'err'); return; }
   if((state.userDoc?.balance||0) < CREATE_FEE){ toast('Not enough balance to cover the launch fee.', 'err'); return; }
   const btn = document.getElementById('createSubmit');
   btn.disabled = true; btn.textContent = 'Launching…';
@@ -2413,7 +2416,26 @@ function handsBadgeText(closed){
 }
 /* ===================== PROFILE ===================== */
 function renderProfile(){
-  const u = state.userDoc; if(!u) return;
+  const u = state.userDoc;
+  if(!u){
+    const view = document.getElementById('view');
+    if(view) view.innerHTML = `<div class="spinner" style="margin-top:60px;"></div>`;
+    // listenUserDoc's onSnapshot re-calls renderProfile() the moment the account loads — but if
+    // that never happens (a genuinely broken/missing account doc, not just a brief load race),
+    // don't leave the person staring at a spinner forever with no explanation.
+    setTimeout(()=>{
+      if(state.userDoc || state.route.name!=='profile') return;
+      const v = document.getElementById('view');
+      if(v) v.innerHTML = `
+        <div class="empty">
+          <div class="em-ic">⚠️</div>
+          Couldn't load your account. This usually clears up by logging out and back in.
+          <button class="btn btn-ghost" style="margin-top:14px;" id="profileReloadBtn">Log Out</button>
+        </div>`;
+      document.getElementById('profileReloadBtn')?.addEventListener('click', ()=> signOut(auth));
+    }, 6000);
+    return;
+  }
   const view = document.getElementById('view');
   const today = todaysChange(u);
   const todayUp = today.change>=0;
