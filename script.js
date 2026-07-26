@@ -2374,14 +2374,17 @@ function trySnipeBuy(coinId, c){
 
 function listenAutoSnipe(){
   snipeCursorMs = Date.now(); // only react to coins created after this instant
-  // limit(50) is just a safety cap on the query itself, not the "how many can I catch" window —
+  catchUpSnipeMisses(); // separately sweep anything created while you were fully offline
+  // limit(150) is just a safety cap on the query itself, not the "how many can I catch" window —
   // the actual new-vs-already-existed decision is the createdAt-vs-cursor check below, which
   // works correctly no matter how many coins arrive in one snapshot batch or how Firestore
   // chunks delivery. The old approach (a tiny limit(5) + treat every 'added' as new) missed
   // coins whenever more than a handful were created close together — e.g. the 5-coin bootstrap
   // spawn, or a few Right Ctrl presses in a row — since Firestore doesn't guarantee one event
-  // per document in that scenario.
-  const q = query(collection(db,'coins'), orderBy('createdAt','desc'), limit(50));
+  // per document in that scenario. 150 leaves a very large margin against ever overflowing given
+  // how bounded bot-coin spawn rates are now (5-60 min ambient, up to 3/day insider, plus manual
+  // admin triggers) alongside real community launches.
+  const q = query(collection(db,'coins'), orderBy('createdAt','desc'), limit(150));
   const un = onSnapshot(q, snap=>{
     snap.docChanges().forEach(change=>{
       if(change.type!=='added') return;
@@ -2392,6 +2395,36 @@ function listenAutoSnipe(){
     });
   }, ()=>{ /* silent — non-critical */ });
   state.unsubs.push(un);
+}
+
+// One-time sweep run at the start of each session: catches any coin created between your last
+// session and this one — i.e. while you were fully signed out everywhere, not just a brief
+// disconnect (the live listener above already handles reconnects fine on its own). Without this,
+// "snipe every new coin, no matter what" wasn't really true — anything launched while you had
+// zero tabs open anywhere would've been missed forever, since nothing was watching.
+async function catchUpSnipeMisses(){
+  try{
+    await waitForUserDoc(); // listenAutoSnipe fires right after listenUserDoc, with no guarantee
+                            // the first snapshot has landed yet — trySnipeBuy relies on
+                            // state.userDoc being real, so this has to actually wait for it.
+    const snipe = state.userDoc?.snipeBot;
+    if(!snipe?.owned) return; // never bought the feature — nothing to track or sweep
+    if(snipe.active && snipe.lastCheckedAt){
+      const cutoff = Timestamp.fromMillis(toMillisLoose(snipe.lastCheckedAt));
+      const snap = await getDocs(query(collection(db,'coins'), where('createdAt','>',cutoff), orderBy('createdAt','asc'), limit(200)));
+      snap.docs.forEach(d=> trySnipeBuy(d.id, d.data()));
+    }
+    await updateDoc(doc(db,'users',state.uid), { 'snipeBot.lastCheckedAt': Date.now() });
+  }catch(err){ /* non-critical — e.g. missing index while Firestore builds one */ }
+}
+function waitForUserDoc(timeoutMs=5000){
+  return new Promise(resolve=>{
+    if(state.userDoc) return resolve();
+    const start = Date.now();
+    const iv = setInterval(()=>{
+      if(state.userDoc || Date.now()-start>timeoutMs){ clearInterval(iv); resolve(); }
+    }, 100);
+  });
 }
 
 // Keeps a lightweight record of snipe activity (total spent + last 30 coins sniped into) on the
