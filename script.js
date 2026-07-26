@@ -1445,9 +1445,12 @@ async function doSell(coinId, tokenAmount){
     const nw = await refreshNetWorthSnapshot();
     checkMilestones(result.pnl, nw);
     checkRankOvertake();
-  }catch(err){ toast(err.message, 'err'); }
-  coinsWithPendingUserTrade.delete(coinId);
-  if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
+    return result;
+  }catch(err){ toast(err.message, 'err'); return null; }
+  finally{
+    coinsWithPendingUserTrade.delete(coinId);
+    if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
+  }
 }
 
 // Best-effort snapshot of the current user's total net worth (cash + all holdings at current
@@ -2274,6 +2277,42 @@ async function logSnipeLedger(coinId, ticker, name, imageURL, amount){
 // decomposed ledger: current realizable value of whatever you still hold in every coin you've
 // ever sniped into, versus total spent via snipe. If you've also traded those same coins by
 // hand, this blends both; it's described that way in the modal rather than pretending otherwise.
+// Renders the "Currently Holding" list inside the snipe stats modal, each row with a quick-sell
+// button that sells the entire position right from the modal — no need to navigate to the
+// coin's own page first just to dump a bag you sniped into.
+function renderSnipeHeldList(held, overlay){
+  const listEl = overlay.querySelector('#snipeHeldList');
+  if(!listEl) return;
+  if(!held.length){ listEl.innerHTML = '<div class="empty" style="padding:16px;">Not currently holding any sniped coins.</div>'; return; }
+  listEl.innerHTML = held.map(h=>{
+    const up = h.pnl>=0;
+    return `
+    <div class="holder-line" data-row-coin="${h.coinId}">
+      <img class="coin-logo" src="${coinLogoFor(h.ticker, h.imageURL)}">
+      <div class="hold-info">
+        <div class="coin-ticker">$${esc(h.ticker)}</div>
+        <div class="coin-name">${fmtTok(h.tokens)} · ${fmtUsd(h.val)} <span style="color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(h.pnl))}</span></div>
+      </div>
+      <button class="btn btn-ghost" style="padding:6px 12px;font-size:12px;" data-sell-coin="${h.coinId}" data-sell-tokens="${h.tokens}">Sell</button>
+    </div>`;
+  }).join('');
+  listEl.querySelectorAll('[data-sell-coin]').forEach(btn=>{
+    btn.addEventListener('click', async ()=>{
+      const coinId = btn.dataset.sellCoin;
+      const tokens = parseFloat(btn.dataset.sellTokens);
+      btn.disabled = true; btn.textContent = 'Selling…';
+      const result = await doSell(coinId, tokens);
+      if(result){
+        const row = listEl.querySelector(`[data-row-coin="${coinId}"]`);
+        row?.remove();
+        if(!listEl.querySelector('[data-row-coin]')) listEl.innerHTML = '<div class="empty" style="padding:16px;">Not currently holding any sniped coins.</div>';
+      } else {
+        btn.disabled = false; btn.textContent = 'Sell';
+      }
+    });
+  });
+}
+
 async function openSnipeStatsModal(){
   const snipe = state.userDoc?.snipeBot || {};
   const list = (snipe.snipedCoins||[]).slice().reverse(); // newest first
@@ -2289,7 +2328,10 @@ async function openSnipeStatsModal(){
         <div><div style="font-size:11px;color:var(--txt-faint);">REALIZED P&L (SOLD)</div><div class="mono" style="font-size:18px;font-weight:700;" id="snipeRealizedPnl">—</div></div>
       </div>
       <div style="font-size:11px;color:var(--txt-faint);line-height:1.4;margin-bottom:10px;">Current value only counts coins you still hold from the list below. Realized P&L sums every past sell tagged as coming from a sniped position. Since a sniped coin's position can also get topped up or sold by hand, both numbers blend snipe and manual activity on the same coin rather than isolating just the snipe portion.</div>
-      <div id="snipeCoinList" style="max-height:280px;overflow-y:auto;">${list.length? list.map(s=>`
+      <div style="font-weight:700;font-size:13px;margin:14px 0 8px;">Currently Holding</div>
+      <div id="snipeHeldList" style="max-height:220px;overflow-y:auto;margin-bottom:14px;"><div class="spinner" style="margin:10px 0;"></div></div>
+      <div style="font-weight:700;font-size:13px;margin:14px 0 8px;">Recently Sniped</div>
+      <div id="snipeCoinList" style="max-height:220px;overflow-y:auto;">${list.length? list.map(s=>`
         <div class="holder-line" data-coin="${s.coinId}" style="cursor:pointer;">
           <img class="coin-logo" src="${coinLogoFor(s.ticker, s.imageURL)}">
           <div class="hold-info">
@@ -2306,10 +2348,13 @@ async function openSnipeStatsModal(){
 
   // Live current-value tally, computed after the modal is already showing (avoids blocking the
   // open on a batch of reads) — sums realizable value across every distinct coin ever sniped,
-  // for whatever amount of it you currently still hold.
+  // for whatever amount of it you currently still hold. Also builds the Currently Holding list
+  // with a quick-sell button per coin, so a sniped bag can be dumped right from this modal
+  // without navigating to the coin's own page first.
   try{
     const uniqueCoinIds = [...new Set(list.map(s=>s.coinId))];
     let total = 0;
+    const held = [];
     for(const coinId of uniqueCoinIds){
       const holdSnap = await getDoc(doc(db,'users',state.uid,'holdings',coinId));
       if(!holdSnap.exists()) continue;
@@ -2317,11 +2362,18 @@ async function openSnipeStatsModal(){
       if(!(h.tokens>0.0001)) continue;
       let coin = state.coinsCache.get(coinId);
       if(!coin){ const cs = await getDoc(doc(db,'coins',coinId)); if(cs.exists()){ coin = {id:cs.id,...cs.data()}; state.coinsCache.set(coinId, coin); } }
-      if(coin) total += sellValue(coin, h.tokens);
+      if(!coin) continue;
+      const val = sellValue(coin, h.tokens);
+      total += val;
+      held.push({ coinId, ticker: h.ticker, imageURL: h.imageURL, tokens: h.tokens, val, pnl: val-(h.costBasis||0) });
     }
     const el = document.getElementById('snipeCurValue');
     if(el) el.textContent = fmtUsd(total);
-  }catch(err){ const el = document.getElementById('snipeCurValue'); if(el) el.textContent = '—'; }
+    renderSnipeHeldList(held, overlay);
+  }catch(err){
+    const el = document.getElementById('snipeCurValue'); if(el) el.textContent = '—';
+    const heldEl = document.getElementById('snipeHeldList'); if(heldEl) heldEl.innerHTML = `<div class="empty" style="padding:16px;">Couldn't load holdings.</div>`;
+  }
 
   try{
     const closedSnap = await getDocs(collection(db,'users',state.uid,'closedPositions'));
