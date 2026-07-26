@@ -779,6 +779,9 @@ function renderCoinDetail(coinId){
     if(shellCoinId !== coin.id){
       shellCoinId = coin.id;
       buildCoinDetailShell(coin); // full DOM build — only happens once per coin visit
+      // Fire-and-forget, once per visit (not on every live re-render) — feeds the "coins people
+      // are actually looking at trade faster" behavior in the bot tick loops.
+      updateDoc(doc(db,'coins',coinId), { lastViewedAt: Date.now() }).catch(()=>{});
     } else {
       updateCoinDetailLive(coin); // cheap in-place refresh — keeps inputs/focus intact
     }
@@ -1033,7 +1036,10 @@ function rebuildTradePanel(coin){
 function buyPanelHtml(coin){
   const bal = state.userDoc?.balance||0;
   return `
-    ${coin.ruggedAt?'<div class="empty" style="padding:10px 4px 16px;color:var(--down);font-size:12.5px;">💀 This coin got rugged. Still fully tradeable, but the odds of a real comeback are deliberately very low — buy in knowing it\'s mostly a long shot.</div>':''}
+    ${coin.ruggedAt?(coin.isRisky
+      ? '<div class="empty" style="padding:10px 4px 16px;color:var(--down);font-size:12.5px;">💀 Today\'s risky pick got rugged. Buying and selling stay completely open — rugging never blocks trading, here or anywhere else — but recovery odds on this specific coin are essentially nil until it\'s replaced tomorrow.</div>'
+      : '<div class="empty" style="padding:10px 4px 16px;color:var(--down);font-size:12.5px;">💀 This coin got rugged. Still fully tradeable, but the odds of a real comeback are deliberately very low — buy in knowing it\'s mostly a long shot.</div>'
+    ):''}
     <div class="amt-display"><input id="tradeAmt" inputmode="decimal" placeholder="$0" value="${state.tradeAmount||''}"></div>
     <div class="amt-sub">Balance: ${fmtUsd(bal)}</div>
     <div class="quick-row">
@@ -1449,7 +1455,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-14);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
       const prevHold = holdSnap.exists()? holdSnap.data() : {};
@@ -1516,7 +1522,7 @@ async function doSell(coinId, tokenAmount){
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-14);
-      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
       tx.update(userRef, { balance: user.balance + usdOut });
       // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
       // so open positions (unrealized) and closed positions (realized) can both be shown accurately.
@@ -1752,9 +1758,9 @@ const RISKY_TICK_MS = 9000;          // ticks much faster than the main bot loop
 const RISKY_TRADE_CHANCE = 0.9;
 const RISKY_MIN_SWING = 800;
 const RISKY_MAX_SWING = 15000;       // bigger than even Bot Market's normal whale range
-const RISKY_RUG_CHANCE = 0.012;      // ~8x the normal bot-coin rug chance
+const RISKY_RUG_CHANCE = 0.035;      // ~23x the normal bot-coin rug chance — was 0.012
 const RISKY_RUG_MIN_AGE_MS = 5*60*1000; // short grace period so it can't rug the instant it's picked
-const RISKY_MEGA_CHANCE = 0.4; // 40% of trades are genuinely violent, sized off the coin's own reserve
+const RISKY_MEGA_CHANCE = 0.55; // 55% of trades are genuinely violent, sized off the coin's own reserve — was 0.4
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -2037,7 +2043,8 @@ async function riskyCoinTick(){
     if(coin.ruggedAt) return; // already rugged today — just sits until tomorrow's replacement
     const ageMs = Date.now()-toMillisLoose(coin.createdAt);
     if(ageMs>RISKY_RUG_MIN_AGE_MS && Math.random()<RISKY_RUG_CHANCE){ ruggedCoinEvent(coinId); return; }
-    if(Math.random() >= RISKY_TRADE_CHANCE) return;
+    const hot = isCoinHot(coin);
+    if(Math.random() >= (hot?0.98:RISKY_TRADE_CHANCE)) return;
     // A flat dollar range can sometimes land as a fairly mild move depending on how deep this
     // particular coin's liquidity happens to be. "Unhinged" means guaranteeing real violence a
     // good chunk of the time — mega mode sizes the trade as a large fraction of the coin's OWN
@@ -2055,7 +2062,7 @@ async function riskyCoinTick(){
       if(coinsWithPendingUserTrade.has(coinId)) return;
       if(Math.random()<0.5) botBuyOnCoin(coinId, usd, true);
       else if(pumpAllowsSell(coin)) botSellOnCoin(coinId, usd, true, isMega?0.35:0.05);
-    }, Math.random()*7000);
+    }, hot ? Math.random()*2000 : Math.random()*7000);
   }catch(err){ /* non-critical */ }
 }
 
@@ -2122,6 +2129,18 @@ async function catchUpAllBotCoins(){
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
 }
 
+// "Hot" coins — someone real looked at this coin's page recently, or actually traded it
+// recently — get noticeably more frequent and faster bot activity. Applies to any bot-driven
+// coin (normal, rugged, guaranteed-growth, risky): boosts the effective trade-chance roll and
+// shrinks the stagger delay, so a coin someone's actually paying attention to feels alive
+// instead of moving at the same pace as one nobody's looked at in hours.
+const HOT_COIN_WINDOW_MS = 5*60*1000;
+function isCoinHot(coin){
+  const now = Date.now();
+  return (now-toMillisLoose(coin.lastRealActivityAt||0) < HOT_COIN_WINDOW_MS)
+      || (now-toMillisLoose(coin.lastViewedAt||0) < HOT_COIN_WINDOW_MS);
+}
+
 async function botCoinTick(){
   try{
     const q = query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT));
@@ -2130,6 +2149,8 @@ async function botCoinTick(){
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.isRisky) return; // handled entirely by its own dedicated riskyCoinTick loop instead
+      const hot = isCoinHot(coin);
+      const hotStagger = (ms)=> hot ? ms*0.35 : ms; // hot coins fire sooner, not just more often
       if(coin.guaranteedGrowth){
         // Right-Ctrl force-spawned coins: never eligible for a rug-pull (checked before this
         // branch is even reached, see below). Two phases, timed off guaranteedHolderRampStart
@@ -2141,16 +2162,16 @@ async function botCoinTick(){
         const elapsed = Date.now()-spawnedAt;
         const inQuietPhase = elapsed < GUARANTEED_GROWTH_QUIET_MS;
         if(inQuietPhase){
-          if(Math.random() >= 0.12) return; // mostly nothing happens yet
+          if(Math.random() >= (hot?0.35:0.12)) return; // mostly nothing happens yet, unless someone's watching
           const usd = 5+Math.random()*30; // small, unremarkable
           setTimeout(()=>{
             if(coinsWithPendingUserTrade.has(d.id)) return;
             if(Math.random()<0.85) botBuyOnCoin(d.id, usd, false);
             else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd*0.5, false);
-          }, Math.random()*18000);
+          }, hotStagger(Math.random()*18000));
           return;
         }
-        if(Math.random() >= 0.9) return; // rapid-growth phase: very high trade chance
+        if(Math.random() >= (hot?0.97:0.9)) return; // rapid-growth phase: very high trade chance
         const usd = botCoinTradeSize()*2.2; // bigger than normal for a dramatic climb
         const big = true;
         const smallDip = Math.random() < 0.1; // occasional small drop, never a real reversal
@@ -2159,7 +2180,7 @@ async function botCoinTick(){
           if(coinsWithPendingUserTrade.has(d.id)) return;
           if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
           else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, Math.min(usd, usd*0.3), false); // dips are shallow, not crashes
-        }, Math.random()*18000);
+        }, hotStagger(Math.random()*18000));
         return;
       }
       if(coin.ruggedAt){
@@ -2168,19 +2189,19 @@ async function botCoinTick(){
         // trend-bias split, so it mostly keeps drifting down or sideways with only an occasional
         // small bounce. Betting on a rugged coin's comeback is meant to be a real long-shot, not
         // a guaranteed loss or a normal coin in disguise.
-        if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
+        if(Math.random() >= (hot?Math.min(0.95,BOT_COIN_TRADE_CHANCE*2):BOT_COIN_TRADE_CHANCE)) return;
         const usd = botCoinTradeSize();
         const big = usd>800;
         setTimeout(()=>{
           if(coinsWithPendingUserTrade.has(d.id)) return;
           if(Math.random() < RUGGED_RECOVERY_CHANCE) botBuyOnCoin(d.id, usd, big);
           else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
-        }, Math.random()*18000);
+        }, hotStagger(Math.random()*18000));
         return;
       }
       const ageMs = Date.now()-toMillisLoose(coin.createdAt);
       if(ageMs > BOT_COIN_RUG_MIN_AGE_MS && Math.random() < BOT_COIN_RUG_CHANCE){ ruggedCoinEvent(d.id); return; }
-      if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
+      if(Math.random() >= (hot?Math.min(0.95,BOT_COIN_TRADE_CHANCE*2):BOT_COIN_TRADE_CHANCE)) return;
       const bias = botCoinTrendBias(d.id);
       const buyChance = Math.min(0.95, Math.max(0.05, 0.5+bias*0.5));
       const usd = botCoinTradeSize();
@@ -2188,12 +2209,13 @@ async function botCoinTick(){
       // Stagger across most of the tick window instead of firing every qualifying coin's
       // transaction in the same synchronous instant — this loop can touch up to 30 coins per
       // tick, so without spreading them out that's up to ~20+ concurrent Firestore transactions
-      // landing at once, which is what made real buys/sells occasionally take ages.
+      // landing at once, which is what made real buys/sells occasionally take ages. Hot coins
+      // still get a shrunk delay on top — someone's actually watching, so it should feel snappy.
       setTimeout(()=>{
         if(coinsWithPendingUserTrade.has(d.id)) return; // re-check — a trade may have started since
         if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
         else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd, big);
-      }, Math.random()*18000);
+      }, hotStagger(Math.random()*18000));
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
@@ -2203,6 +2225,7 @@ async function botCoinTick(){
 
 async function ruggedCoinEvent(coinId){
   let ticker = '';
+  let wasRisky = false;
   try{
     await runTransaction(db, async (tx)=>{
       const coinRef = doc(db,'coins',coinId);
@@ -2211,7 +2234,10 @@ async function ruggedCoinEvent(coinId){
       const c = snap.data();
       if(c.ruggedAt) return; // already rugged by another tab racing this same tick
       ticker = c.ticker;
-      const crashFactor = 0.02+Math.random()*0.08; // keep 2-10% of liquidity → 90-98% price crash
+      wasRisky = !!c.isRisky;
+      // Risky coins crash much harder than a normal rug — the whole point is a real chance of
+      // losing essentially everything, not just a bad-but-survivable 90-98% hit.
+      const crashFactor = c.isRisky ? (0.002+Math.random()*0.018) : (0.02+Math.random()*0.08); // risky: keep 0.2-2% (98-99.8% crash) vs normal 2-10% (90-98% crash)
       const newSol = c.solReserve*crashFactor;
       const newPrice = newSol/c.tokenReserve;
       const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
@@ -2222,7 +2248,9 @@ async function ruggedCoinEvent(coinId){
         ruggedAt: Date.now(), lastTickAt: Date.now()
       });
     });
-    if(ticker) toast(`💀 $${ticker} just got rugged — crashed ~90%+ in seconds. Still tradeable, but don't expect a comeback.`, 'err');
+    if(ticker) toast(wasRisky
+      ? `💀 Today's risky pick ($${ticker}) just got rugged — wiped out almost entirely in seconds. That's the risk.`
+      : `💀 $${ticker} just got rugged — crashed ~90%+ in seconds. Still tradeable, but don't expect a comeback.`, 'err');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
@@ -2536,21 +2564,28 @@ async function renderPortfolio(){
 
   const list = document.getElementById('holdingsList');
   if(rows.length===0){ list.innerHTML = `<div class="empty"><div class="em-ic">📭</div>No holdings yet. Head to Explore and buy your first coin!</div>`; return; }
+  const pinnedIds = state.userDoc?.pinnedCoins||[];
+  rows.sort((a,b)=> (pinnedIds.includes(b.coin.id)?1:0)-(pinnedIds.includes(a.coin.id)?1:0));
   list.innerHTML = rows.map(r=>{
     const up = r.pnl>=0;
+    const isPinned = pinnedIds.includes(r.coin.id);
     return `
     <div class="hold-row" data-coin="${r.coin.id}">
       <img class="coin-logo" src="${coinLogoFor(r.coin.ticker,r.coin.imageURL)}">
       <div class="hold-info">
-        <div class="coin-ticker">$${esc(r.coin.ticker)}</div>
+        <div class="coin-ticker">${isPinned?'📌 ':''}$${esc(r.coin.ticker)}</div>
         <div class="coin-name">${fmtTok(r.h.tokens)} tokens</div>
       </div>
       <div class="hold-right">
         <div class="hold-val mono">${fmtUsd(r.val)}</div>
         <div class="mono" style="font-size:11.5px;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.pnl))}</div>
       </div>
+      <button class="btn btn-ghost" data-pin-coin="${r.coin.id}" style="padding:6px 10px;font-size:11px;margin-left:8px;flex-shrink:0;">${isPinned?'Unpin':'📌 Pin'}</button>
     </div>`;}).join('');
   list.querySelectorAll('.hold-row').forEach(el=> el.addEventListener('click', ()=> navigate('coin', el.dataset.coin)));
+  list.querySelectorAll('[data-pin-coin]').forEach(el=>{
+    el.addEventListener('click', (e)=>{ e.stopPropagation(); togglePinCoin(el.dataset.pinCoin).then(()=> renderPortfolio()); });
+  });
 }
 
 /* ===================== ACTIVITY FEED ===================== */
@@ -2780,7 +2815,10 @@ async function sendCoinToUser(rawUsername, coinId, tokens){
       const hSnap = await tx.get(holdRef);
       if(!hSnap.exists()) throw new Error("You don't hold any of this coin.");
       const h = hSnap.data();
-      if(tokens > h.tokens) throw new Error("You don't have that many tokens.");
+      if(tokens > h.tokens){
+        if(tokens - h.tokens <= h.tokens*0.0001 + 0.0001) tokens = h.tokens; // tiny float rounding from the MAX button — clamp instead of reject
+        else throw new Error("You don't have that many tokens.");
+      }
       const coinSnap = await tx.get(doc(db,'coins',coinId));
       const coin = coinSnap.exists() ? coinSnap.data() : null;
       const valueAtSend = coin ? sellValue(coin, tokens) : 0;
@@ -3231,11 +3269,18 @@ function renderLeaderboard(){
 function attachUserAutocomplete(inputEl){
   if(!inputEl || inputEl.dataset.autocompleteAttached) return;
   inputEl.dataset.autocompleteAttached = '1';
-  const parent = inputEl.parentElement;
-  parent.style.position = 'relative';
+  // Wrap the input in its own small positioned container so the dropdown always sits directly
+  // under THIS input specifically — relying on inputEl.parentElement was fragile, since in some
+  // call sites (like the Send Coin modal) the parent is a large shared container (the whole
+  // modal-box), which meant the dropdown was positioned relative to the ENTIRE modal instead of
+  // just the input, and could end up visually overlapping the Send/Cancel buttons below it.
+  const wrapper = document.createElement('div');
+  wrapper.style.position = 'relative';
+  inputEl.parentElement.insertBefore(wrapper, inputEl);
+  wrapper.appendChild(inputEl);
   const dropdown = document.createElement('div');
   dropdown.className = 'user-autocomplete-dropdown';
-  parent.appendChild(dropdown);
+  wrapper.appendChild(dropdown);
   let debounceTimer = null;
   function hide(){ dropdown.style.display='none'; dropdown.innerHTML=''; }
   inputEl.addEventListener('input', ()=>{
@@ -3389,24 +3434,22 @@ async function loadPositions(uid){
   const closed = closedSnap.docs.map(d=>({id:d.id,...d.data()}));
   return { open, closed };
 }
-function openPositionsHtml(open, pinnedIds=[], canPin=false){
+function openPositionsHtml(open){
   if(!open.length) return '<div class="empty" style="padding:16px;">No open positions.</div>';
   return open.map(r=>{
     const up = r.pnl>=0;
     const ticker = r.coin?.ticker || r.h.ticker;
-    const isPinned = pinnedIds.includes(r.h.id);
     return `
     <div class="hold-row" data-coin="${r.h.id}">
       <img class="coin-logo" src="${coinLogoFor(ticker, r.coin?.imageURL||r.h.imageURL)}">
       <div class="hold-info">
-        <div class="coin-ticker">${isPinned?'📌 ':''}$${esc(ticker)}</div>
+        <div class="coin-ticker">$${esc(ticker)}</div>
         <div class="coin-name">${fmtTok(r.h.tokens)} tokens</div>
       </div>
       <div class="hold-right">
         <div class="hold-val mono">${fmtUsd(r.val)}</div>
         <div class="mono" style="font-size:11.5px;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.pnl))}</div>
       </div>
-      ${canPin?`<button class="btn btn-ghost" data-pin-coin="${r.h.id}" style="padding:6px 10px;font-size:11px;margin-left:8px;flex-shrink:0;">${isPinned?'Unpin':'📌 Pin'}</button>`:''}
     </div>`;
   }).join('');
 }
@@ -3493,11 +3536,9 @@ async function renderUserProfile(uid){
   drawNetWorthChart('userProfChart', u.netWorthHistory);
   try{
     const { open, closed } = await loadPositions(uid);
-    const pinnedIds = u.pinnedCoins||[];
-    open.sort((a,b)=> (pinnedIds.includes(b.h.id)?1:0)-(pinnedIds.includes(a.h.id)?1:0));
     const openEl = document.getElementById('openPosList');
     const closedEl = document.getElementById('closedPosList');
-    if(openEl){ openEl.innerHTML = openPositionsHtml(open, pinnedIds, false); wirePositionRows(openEl); }
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
     const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
@@ -3676,11 +3717,9 @@ function renderProfile(){
   });
   drawNetWorthChart('profChart', u.netWorthHistory);
   loadPositions(state.uid).then(({open, closed})=>{
-    const pinnedIds = u.pinnedCoins||[];
-    open.sort((a,b)=> (pinnedIds.includes(b.h.id)?1:0)-(pinnedIds.includes(a.h.id)?1:0));
     const openEl = document.getElementById('openPosList');
     const closedEl = document.getElementById('closedPosList');
-    if(openEl){ openEl.innerHTML = openPositionsHtml(open, pinnedIds, true); wirePositionRows(openEl); }
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
     const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
