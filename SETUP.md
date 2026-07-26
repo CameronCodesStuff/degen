@@ -117,6 +117,21 @@ service cloud.firestore {
       allow read: if isSignedIn();
       allow write: if isSignedIn();
     }
+
+    match /transfers/{transferId} {
+      // The security design behind peer-to-peer sends (bank money + coins): nobody ever writes
+      // directly to someone else's balance/holdings. The SENDER debits their own account and
+      // creates this doc addressed to the recipient (create requires fromUid to be the real
+      // signed-in user). The RECIPIENT is the only one allowed to update it, and only to flip
+      // status from 'pending' to 'completed' — nothing else, so they can't tamper with the
+      // amount/coinId on their way to crediting themselves in their own transaction.
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.fromUid == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.toUid == request.auth.uid
+        && resource.data.status == 'pending' && request.resource.data.status == 'completed'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+      allow delete: if false;
+    }
   }
 }
 ```
@@ -134,6 +149,12 @@ The app queries coins ordered by `marketCap` and `createdAt`, and the Activity f
 - **Query scope: Collection group** (not "Collection" — this one's easy to miss, it's a dropdown/toggle right next to the Collection ID field)
 - Fields: `coinId` Ascending, `tokens` Descending
 - As always, the browser console will also print a direct "create index" link the first time the query runs if you'd rather use that.
+
+**One more composite index is required** for receiving peer-to-peer transfers (bank sends + coin sends):
+- Collection ID: `transfers`
+- Query scope: Collection
+- Fields: `toUid` Ascending, `status` Ascending
+- This powers `listenIncomingTransfers()`, which filters by both fields at once (two equality filters on different fields always need a composite index, unlike a single range filter + matching orderBy). Until this index exists, incoming transfers simply won't be noticed — the listener's error is caught silently, so it fails quiet rather than loud; check the browser console for the create-index link if sends don't seem to be arriving.
 
 
 ## 5. Deploy
@@ -169,6 +190,28 @@ No single account can hold more than 35% of a coin's 1B supply (down from the or
 
 ### Admin "pump" easter egg
 If you're signed in as the account with username `cameron` and email `detlaffcameron@gmail.com`, holding **Right Alt** and clicking any coin card/row sends 10–50 bots to buy into that coin in random amounts ($150–$2,650 each, up from the original $8–$228) over the next 10 seconds (coin cards get a dashed lime outline while Right Alt is held, so you can see it's armed). It also mutes bot-generated *sell* pressure on that specific coin for the next 5 minutes — real user sells are completely unaffected, this only stops the same bot loops from immediately dumping the pump back down. That 5-minute window is written to the coin's own Firestore doc (`pumpSellSuppressUntil`) rather than kept as local browser state, so it survives a hard refresh and is honored by every client, not just the tab that triggered it — only the in-flight staggered buy timers themselves are lost on a refresh, since those are genuinely ephemeral client-side timers with no backend to persist them. Like the rest of the bot system, this is 100% client-side — it's a fun toggle for one account, not a real access-control feature, and a determined user could bypass the check via devtools.
+
+### Pinned coins
+Any held coin can be pinned from your Open Positions list — up to 3 at a time — via a Pin/Unpin button next to each row. Pinned coins sort to the top (marked with 📌) on both your own profile and your public profile, so visitors see your picks first rather than whatever order value happened to sort them in. Stored as a plain `pinnedCoins` array on your user doc.
+
+### Bank
+A new section on the Portfolio page, separate from your regular cash balance:
+- **Deposit** moves cash into the bank; **Withdraw** moves it back — both simple single-user transactions, nothing cross-account involved.
+- **Daily growth**: 2%/day, compounding. There's no server to run this continuously, so it's computed the same "catch-up" way as the bot-coin offline mechanic elsewhere in this app — whole days elapsed since `bank.lastGrowthAt` are compounded in one shot whenever you next sign in. Miss five days, get five days' growth applied at once, not more, not less.
+- **Send to another user** — see Peer-to-peer transfers below for how this actually works under the hood.
+
+### Peer-to-peer transfers (bank sends + coin sends)
+Firestore rules only ever let you write your OWN balance and holdings (see `isOwner()` throughout) — a naive "send money to someone" feature would need to relax that to "any signed-in user can write any other user's balance," which is a real, serious hole, unlike the narrow single-account admin relaxations elsewhere in this app. Instead: **sending debits your own account and creates a `transfers` doc addressed to the recipient; the recipient's own client is the only thing that ever credits their account**, the moment it notices a pending transfer meant for them (`listenIncomingTransfers()`, started at sign-in). Every write is still always to your own document — the `transfers` collection is purely the coordination point, enforced by the rules above (create locked to the sender being who they claim; update locked to the addressed recipient, and only for the pending→completed flip, nothing else).
+
+Both bank-to-bank cash sends and coin gifts use this same system (`type:'cash'` or `type:'coin'` on the transfer doc). A gifted coin is valued at its market price at send-time for cost-basis purposes on the recipient's side — not free, not zero — so a gift can't manufacture profit or loss out of nothing for either party. Sending a coin is available from the Sell panel on that coin's own page ("🎁 Send to a user").
+
+**Same honest caveat as the rest of the bot system**: this can only actually land once the recipient's own account is signed in on some tab of theirs. The very first snapshot the recipient's listener receives naturally includes anything that arrived while they were fully away (Firestore delivers existing matching docs as 'added' on initial sync), so it self-catches-up with no extra cursor logic needed — but if they're never signed in again, it just waits indefinitely as a pending transfer.
+
+### Snipe bot upgrade: category amounts ($1,000)
+Replaces the single flat "amount per coin" with three separate amounts — community coins, Bot Market coins, and guaranteed-growth coins (Right Ctrl/Insider Insights) each get their own dollar figure, editable independently. Guaranteed-growth coins are deliberately their own category here, distinct from ordinary bot coins, since they're a very different risk profile (permanently rug-proof, heavily bullish-biased) and someone might reasonably want to snipe those harder than an ordinary coin. Requires owning the base auto-snipe bot first.
+
+### Snipe bot upgrade: Copy Trade ($2,500)
+Pick up to 5 real traders (by username) to automatically mirror. Watches the global `activity` feed (already used for the Recent Activity tab and whale alerts) for trades made by any of your chosen targets and replicates the action: a copied **buy** uses your own chosen dollar amount for that target, not theirs; a copied **sell** dumps your entire position in that coin, since there's no clean way to mirror "they sold 40%" using a fixed dollar figure. Bot trades are naturally never copied — they're tagged `uid:'bot'`, which will never match a real target's uid. Same offline-catch-up-sweep pattern as auto-snipe (`catchUpCopyTrades()`, using a `lastCheckedAt` timestamp), and the same "must be signed in somewhere" limitation — "even while offline" isn't literally achievable here either, for the same reason it isn't for the base snipe bot.
 
 ### Auto-Snipe Bot
 A purchasable feature in Profile settings: pay a one-time $500 to unlock, then optionally pause/resume it anytime after for free. While active, it auto-buys a dollar amount you choose (editable anytime) into **every new coin** the moment it's created — community launches and Bot Market spawns alike. It only reacts to coins created *after* you turn it on; nothing retroactive. It also never snipes your own community launches. Since Bot Market spawns happen more often than real launches, expect noticeably more frequent snipe buys than a community-only version would give.

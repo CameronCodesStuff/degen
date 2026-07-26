@@ -336,6 +336,9 @@ onAuthStateChanged(auth, async (user)=>{
     listenTickerTape();
     listenWhaleAlerts();
     listenAutoSnipe();
+    listenIncomingTransfers();
+    applyBankGrowth();
+    listenCopyTrades();
     navigate('home');
     startBots();
     startConsoleAutoClear();
@@ -1012,6 +1015,7 @@ function sellPanelHtml(coin){
     <button class="btn btn-magenta btn-block" id="tradeSubmit">Sell $${esc(coin.ticker)}</button>
     <div class="trade-stat-row"><span>You'll receive</span><span class="mono" id="estOut">$0.00</span></div>
     <div class="trade-stat-row"><span>Price impact</span><span class="mono" id="estImpact">0.00%</span></div>
+    <button class="btn btn-ghost btn-block" style="margin-top:10px;" id="sendCoinBtn">🎁 Send to a user</button>
   `;
 }
 
@@ -1065,6 +1069,41 @@ async function wireTradePanel(coin){
   submitBtn.addEventListener('click', ()=>{
     if(state.tradeMode==='buy') doBuy(coin.id, parseFloat(input.value)||0);
     else doSell(coin.id, parseFloat(input.value)||0);
+  });
+  document.getElementById('sendCoinBtn')?.addEventListener('click', ()=> openSendCoinModal(coin));
+}
+
+function openSendCoinModal(coin){
+  const holding = state.myHolding||0;
+  if(!(holding>0)){ toast("You don't hold any of this coin to send.", 'err'); return; }
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box">
+      <h3>🎁 Send $${esc(coin.ticker)}</h3>
+      <div style="font-size:12.5px;color:var(--txt-dim);margin:10px 0;">You own ${fmtTok(holding)} tokens. This is a gift, not a sale — no coins are created or destroyed, they just move from your holdings to theirs.</div>
+      <label class="flabel">Recipient username</label>
+      <input class="field" id="sendCoinUser" placeholder="username">
+      <label class="flabel" style="margin-top:10px;">Amount of tokens</label>
+      <div style="display:flex;gap:8px;">
+        <input class="field" id="sendCoinAmount" style="flex:1;" inputmode="decimal" placeholder="0">
+        <button class="btn btn-ghost" id="sendCoinMaxBtn">MAX</button>
+      </div>
+      <div style="display:flex;gap:10px;margin-top:16px;">
+        <button class="btn btn-ghost btn-block" id="sendCoinCancelBtn">Cancel</button>
+        <button class="btn btn-lime btn-block" id="sendCoinConfirmBtn">Send</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  document.getElementById('sendCoinCancelBtn').addEventListener('click', ()=> overlay.remove());
+  document.getElementById('sendCoinMaxBtn').addEventListener('click', ()=>{ document.getElementById('sendCoinAmount').value = holding; });
+  document.getElementById('sendCoinConfirmBtn').addEventListener('click', async ()=>{
+    const uname = document.getElementById('sendCoinUser').value;
+    const amount = parseFloat(document.getElementById('sendCoinAmount').value);
+    if(!uname.trim()){ toast('Enter a username.', 'err'); return; }
+    overlay.remove();
+    await sendCoinToUser(uname, coin.id, amount);
   });
 }
 
@@ -2270,9 +2309,34 @@ async function renderPortfolio(){
       <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
       <div class="chart-wrap" style="height:180px;"><canvas id="pfChart"></canvas></div>
     </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <div style="font-weight:700;margin-bottom:10px;">🏦 Bank</div>
+      <div class="settings-row" style="border:none;"><span>Balance (grows ${(BANK_DAILY_GROWTH_RATE*100).toFixed(0)}%/day)</span><b class="mono" id="bankBalanceDisplay">${fmtUsd(state.userDoc?.bank?.balance||0)}</b></div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        <input class="field" id="bankDepositInput" style="flex:1;min-width:90px;" inputmode="decimal" placeholder="Amount">
+        <button class="btn btn-lime" id="bankDepositBtn">Deposit</button>
+        <button class="btn btn-ghost" id="bankWithdrawBtn">Withdraw</button>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);margin:10px 0 4px;">Send bank money to another user</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input class="field" id="bankSendUser" style="flex:1;min-width:90px;" placeholder="username">
+        <input class="field" id="bankSendAmount" style="width:90px;" inputmode="decimal" placeholder="$">
+        <button class="btn btn-ghost" id="bankSendBtn">Send</button>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Growth is applied in one lump sum whenever you sign back in (whole days elapsed since last time), not continuously — there's no server here to run it in the background. Sends only actually arrive once the recipient's own account is signed in somewhere; nothing sensitive is exposed in the meantime, it just waits.</div>
+    </div>
     <div class="section-title" style="font-size:16px;">Your Holdings</div>
     <div id="holdingsList"><div class="spinner"></div></div>
   `;
+  document.getElementById('bankDepositBtn').addEventListener('click', ()=>{
+    bankDeposit(parseFloat(document.getElementById('bankDepositInput').value));
+  });
+  document.getElementById('bankWithdrawBtn').addEventListener('click', ()=>{
+    bankWithdraw(parseFloat(document.getElementById('bankDepositInput').value));
+  });
+  document.getElementById('bankSendBtn').addEventListener('click', ()=>{
+    sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
+  });
   drawNetWorthChart('pfChart', state.userDoc?.netWorthHistory);
   const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
@@ -2344,6 +2408,8 @@ function listenWhaleAlerts(){
 
 /* ===================== AUTO-SNIPE BOT ===================== */
 const SNIPE_BOT_PRICE = 500; // one-time cost to unlock; pausing/resuming afterward is free
+const SNIPE_CATEGORY_UPGRADE_PRICE = 1000;
+const SNIPE_COPYTRADE_UPGRADE_PRICE = 2500;
 // Watches for every newly-created coin — community launches AND Bot Market spawns alike — and
 // auto-buys a fixed dollar amount into each one, for as long as the feature is toggled on. Real,
 // structural limitation worth being upfront about: since there's no backend, this can only fire
@@ -2361,7 +2427,10 @@ function trySnipeBuy(coinId, c){
   if(!snipe?.active) return;
   // Now includes Bot Market spawns too, not just community launches.
   if(c.creatorUid===state.uid && !c.isBotCoin) return; // don't snipe your own community launch
-  const amount = snipe.amountPerCoin||0;
+  // Category amounts upgrade ($1k): guaranteed-growth coins (Right Ctrl/Insider) count as their
+  // own category, distinct from ordinary bot coins, since they're a very different risk profile.
+  const category = !c.isBotCoin ? 'community' : (c.guaranteedGrowth ? 'guaranteed' : 'bot');
+  const amount = snipe.categoryUpgrade ? (snipe.amounts?.[category]||0) : (snipe.amountPerCoin||0);
   if(!(amount>0)) return;
   if((state.userDoc?.balance||0) < amount) return; // can't afford it right now — skip quietly
   snipeAttempted.add(coinId);
@@ -2370,6 +2439,179 @@ function trySnipeBuy(coinId, c){
     toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', coinId));
     logSnipeLedger(coinId, c.ticker, c.name, c.imageURL||'', amount);
   });
+}
+
+/* ===================== BANK ===================== */
+const BANK_DAILY_GROWTH_RATE = 0.02; // 2%/day, compounding
+// Same "catch-up" idea used elsewhere in this app (bot coins, snipe sweeps): there's no server
+// to run a daily cron, so growth is computed as whole days elapsed since bank.lastGrowthAt,
+// compounded in one shot, whenever you next sign in. Miss five days, get five days' growth at
+// once — not more, not less, just applied late instead of continuously.
+async function applyBankGrowth(){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      if(!uSnap.exists()) return;
+      const bank = uSnap.data().bank;
+      const now = Date.now();
+      if(!bank){ tx.update(userRef, { bank: { balance:0, lastGrowthAt: now } }); return; }
+      const bal = bank.balance||0;
+      const lastAt = toMillisLoose(bank.lastGrowthAt||now);
+      const days = Math.floor((now-lastAt)/86400000);
+      if(days<=0) return;
+      if(bal<=0){ tx.update(userRef, { 'bank.lastGrowthAt': lastAt+days*86400000 }); return; }
+      const grown = bal*Math.pow(1+BANK_DAILY_GROWTH_RATE, days);
+      tx.update(userRef, { 'bank.balance': grown, 'bank.lastGrowthAt': lastAt+days*86400000 });
+    });
+  }catch(err){ /* non-critical */ }
+}
+async function bankDeposit(amount){
+  if(!(amount>0)){ toast('Enter an amount to deposit.', 'err'); return; }
+  try{
+    await runTransaction(db, async (tx)=>{
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      const u = uSnap.data();
+      if((u.balance||0) < amount) throw new Error("You don't have enough cash.");
+      tx.update(userRef, { balance: u.balance-amount, 'bank.balance': (u.bank?.balance||0)+amount, 'bank.lastGrowthAt': u.bank?.lastGrowthAt||Date.now() });
+    });
+    toast(`🏦 Deposited ${fmtUsd(amount)}.`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
+}
+async function bankWithdraw(amount){
+  if(!(amount>0)){ toast('Enter an amount to withdraw.', 'err'); return; }
+  try{
+    await runTransaction(db, async (tx)=>{
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      const u = uSnap.data();
+      const bankBal = u.bank?.balance||0;
+      if(bankBal < amount) throw new Error("Not enough in your bank balance.");
+      tx.update(userRef, { balance: (u.balance||0)+amount, 'bank.balance': bankBal-amount });
+    });
+    toast(`🏦 Withdrew ${fmtUsd(amount)} back to cash.`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
+}
+
+/* ===================== PEER-TO-PEER TRANSFERS (bank sends + coin sends) ===================== */
+// Security design worth being explicit about: Firestore rules only let you write your OWN
+// balance/holdings (see isOwner() throughout). A naive "send money" feature would need to credit
+// SOMEONE ELSE's balance directly, which would require relaxing that to "any signed-in user can
+// write any other user's balance" — a real, serious hole (unlike the narrow, single-account
+// admin relaxations elsewhere in this app). Instead: sending debits your OWN account and creates
+// a `transfers` doc addressed to the recipient; the RECIPIENT's own client is the only thing that
+// ever credits their account, when it notices a pending transfer meant for them. Every write is
+// still always to your own doc — the transfers collection is just the coordination point.
+// Consequence worth knowing: like the auto-snipe bot, this only actually lands once the
+// recipient's own account is signed in on some tab of theirs — "even while they're offline"
+// isn't literally achievable without a real backend. The very first snapshot this listener gets
+// naturally includes anything that arrived while they were away (Firestore delivers existing
+// matching docs as 'added' on initial sync), so it self-catches-up with no extra cursor logic.
+function listenIncomingTransfers(){
+  const q = query(collection(db,'transfers'), where('toUid','==',state.uid), where('status','==','pending'));
+  const un = onSnapshot(q, snap=>{
+    snap.docChanges().forEach(change=>{
+      if(change.type!=='added') return;
+      processIncomingTransfer(change.doc.id, change.doc.data());
+    });
+  }, ()=>{ /* silent — non-critical, e.g. missing index while Firestore builds one */ });
+  state.unsubs.push(un);
+}
+async function processIncomingTransfer(transferId, t){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const transferRef = doc(db,'transfers',transferId);
+      const tSnap = await tx.get(transferRef);
+      if(!tSnap.exists() || tSnap.data().status!=='pending') return; // already claimed by another tab
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      if(!uSnap.exists()) return;
+      const u = uSnap.data();
+      if(t.type==='cash'){
+        tx.update(userRef, { 'bank.balance': (u.bank?.balance||0) + t.amount });
+      } else if(t.type==='coin'){
+        const holdRef = doc(db,'users',state.uid,'holdings',t.coinId);
+        const hSnap = await tx.get(holdRef);
+        const prevHold = hSnap.exists() ? hSnap.data() : {};
+        // Gifted tokens are valued at their market price at send-time for cost-basis purposes —
+        // not free, not zero — so receiving a gift can't manufacture profit or loss out of
+        // nothing; your P&L on it starts fresh from whatever it was actually worth at that moment.
+        tx.set(holdRef, {
+          tokens: (prevHold.tokens||0) + t.tokens,
+          ticker: t.ticker, name: t.name||t.ticker, imageURL: t.imageURL||'',
+          coinId: t.coinId, username: state.userDoc?.username||'', avatarURL: state.userDoc?.avatarURL||'',
+          costBasis: (prevHold.costBasis||0) + (t.valueAtSend||0),
+          totalBoughtUsd: prevHold.totalBoughtUsd||0, totalSoldUsd: prevHold.totalSoldUsd||0, realizedPnl: prevHold.realizedPnl||0,
+          firstBuyAt: (prevHold.tokens>0.0001) ? (prevHold.firstBuyAt||Date.now()) : Date.now(),
+          updatedAt: Date.now()
+        }, {merge:true});
+      }
+      tx.update(transferRef, { status:'completed' });
+    });
+    if(t.type==='cash') toast(`💸 @${t.fromUsername} sent you ${fmtUsd(t.amount)}!`, 'ok', ()=> navigate('portfolio'));
+    else toast(`🎁 @${t.fromUsername} sent you ${fmtTok(t.tokens)} $${t.ticker}!`, 'ok', ()=> navigate('coin', t.coinId));
+  }catch(err){ /* silent — will just get picked up again next time this listener re-evaluates */ }
+}
+
+async function sendCashToUser(rawUsername, amount){
+  if(!(amount>0)){ toast('Enter an amount to send.', 'err'); return; }
+  const toUsername = rawUsername.trim().replace(/^@/,'');
+  const toLower = toUsername.toLowerCase();
+  if(toLower === (state.userDoc?.username||'').toLowerCase()){ toast("You can't send money to yourself.", 'err'); return; }
+  try{
+    const unameSnap = await getDoc(doc(db,'usernames',toLower));
+    if(!unameSnap.exists()){ toast('No user found with that username.', 'err'); return; }
+    const toUid = unameSnap.data().uid;
+    await runTransaction(db, async (tx)=>{
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      if(!uSnap.exists()) throw new Error('Account not found.');
+      const bankBal = uSnap.data().bank?.balance||0;
+      if(bankBal < amount) throw new Error("Not enough in your bank balance.");
+      tx.update(userRef, { 'bank.balance': bankBal-amount });
+      const transferRef = doc(collection(db,'transfers'));
+      tx.set(transferRef, {
+        fromUid: state.uid, fromUsername: state.userDoc.username,
+        toUid, toUsername,
+        type:'cash', amount, status:'pending', createdAt: serverTimestamp()
+      });
+    });
+    toast(`💸 Sent ${fmtUsd(amount)} to @${toUsername}!`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
+}
+
+async function sendCoinToUser(rawUsername, coinId, tokens){
+  if(!(tokens>0)){ toast('Enter an amount to send.', 'err'); return; }
+  const toUsername = rawUsername.trim().replace(/^@/,'');
+  const toLower = toUsername.toLowerCase();
+  if(toLower === (state.userDoc?.username||'').toLowerCase()){ toast("You can't send a coin to yourself.", 'err'); return; }
+  try{
+    const unameSnap = await getDoc(doc(db,'usernames',toLower));
+    if(!unameSnap.exists()){ toast('No user found with that username.', 'err'); return; }
+    const toUid = unameSnap.data().uid;
+    await runTransaction(db, async (tx)=>{
+      const holdRef = doc(db,'users',state.uid,'holdings',coinId);
+      const hSnap = await tx.get(holdRef);
+      if(!hSnap.exists()) throw new Error("You don't hold any of this coin.");
+      const h = hSnap.data();
+      if(tokens > h.tokens) throw new Error("You don't have that many tokens.");
+      const coinSnap = await tx.get(doc(db,'coins',coinId));
+      const coin = coinSnap.exists() ? coinSnap.data() : null;
+      const valueAtSend = coin ? sellValue(coin, tokens) : 0;
+      const avgCost = h.tokens>0 ? (h.costBasis||0)/h.tokens : 0;
+      const costRemoved = Math.min(h.costBasis||0, avgCost*tokens);
+      tx.set(holdRef, { tokens: h.tokens-tokens, costBasis: Math.max(0,(h.costBasis||0)-costRemoved) }, {merge:true});
+      const transferRef = doc(collection(db,'transfers'));
+      tx.set(transferRef, {
+        fromUid: state.uid, fromUsername: state.userDoc.username,
+        toUid, toUsername,
+        type:'coin', coinId, ticker: h.ticker, name: h.name, imageURL: h.imageURL||'',
+        tokens, valueAtSend, status:'pending', createdAt: serverTimestamp()
+      });
+    });
+    toast(`🎁 Sent ${fmtTok(tokens)} tokens to @${toUsername}!`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
 }
 
 function listenAutoSnipe(){
@@ -2559,6 +2801,125 @@ async function openSnipeStatsModal(){
       el.textContent = `${up?'▲':'▼'} ${fmtUsd(Math.abs(realizedPnl))}`;
     }
   }catch(err){ const el = document.getElementById('snipeRealizedPnl'); if(el) el.textContent = '—'; }
+}
+
+/* ===================== SNIPE BOT UPGRADES ===================== */
+async function purchaseSnipeCategoryUpgrade(){
+  if(!state.userDoc?.snipeBot?.owned){ toast('Unlock the base auto-snipe bot first.', 'err'); return; }
+  const bal = state.userDoc?.balance||0;
+  if(bal < SNIPE_CATEGORY_UPGRADE_PRICE){ toast(`Need ${fmtUsd(SNIPE_CATEGORY_UPGRADE_PRICE)} to unlock this upgrade.`, 'err'); return; }
+  try{
+    const amt = state.userDoc.snipeBot.amountPerCoin||10;
+    await updateDoc(doc(db,'users',state.uid), {
+      balance: bal-SNIPE_CATEGORY_UPGRADE_PRICE,
+      'snipeBot.categoryUpgrade': true,
+      'snipeBot.amounts': { community:amt, bot:amt, guaranteed:amt }
+    });
+    toast('🎯 Category amounts unlocked!', 'ok');
+  }catch(err){ toast('Purchase failed: '+err.message, 'err'); }
+}
+async function updateSnipeCategoryAmount(category, amount){
+  if(!(amount>0)){ toast('Enter an amount greater than $0.', 'err'); return; }
+  try{ await updateDoc(doc(db,'users',state.uid), { [`snipeBot.amounts.${category}`]: amount }); toast('Updated.', 'ok'); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+
+async function purchaseCopyTradeUpgrade(){
+  if(!state.userDoc?.snipeBot?.owned){ toast('Unlock the base auto-snipe bot first.', 'err'); return; }
+  const bal = state.userDoc?.balance||0;
+  if(bal < SNIPE_COPYTRADE_UPGRADE_PRICE){ toast(`Need ${fmtUsd(SNIPE_COPYTRADE_UPGRADE_PRICE)} to unlock this upgrade.`, 'err'); return; }
+  try{
+    await updateDoc(doc(db,'users',state.uid), {
+      balance: bal-SNIPE_COPYTRADE_UPGRADE_PRICE,
+      'snipeBot.copyTrade': { owned:true, active:true, targets:[] }
+    });
+    toast('🪞 Copy Trade unlocked!', 'ok');
+  }catch(err){ toast('Purchase failed: '+err.message, 'err'); }
+}
+async function toggleCopyTrade(){
+  const ct = state.userDoc?.snipeBot?.copyTrade;
+  if(!ct?.owned) return;
+  try{ await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.active': !ct.active }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+async function addCopyTarget(rawUsername, amount){
+  if(!(amount>0)){ toast('Enter an amount greater than $0.', 'err'); return; }
+  const uname = rawUsername.trim().replace(/^@/,'');
+  const lower = uname.toLowerCase();
+  if(lower === (state.userDoc?.username||'').toLowerCase()){ toast("You can't copy yourself.", 'err'); return; }
+  try{
+    const unameSnap = await getDoc(doc(db,'usernames',lower));
+    if(!unameSnap.exists()){ toast('No user found with that username.', 'err'); return; }
+    const targetUid = unameSnap.data().uid;
+    const ct = state.userDoc?.snipeBot?.copyTrade || {owned:true, active:true, targets:[]};
+    const targets = ct.targets||[];
+    if(targets.some(t=>t.uid===targetUid)){ toast('Already copying that user.', 'err'); return; }
+    if(targets.length>=5){ toast('You can copy up to 5 users.', 'err'); return; }
+    await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.targets': [...targets, {uid:targetUid, username:uname, amount}] });
+    toast(`Now copying @${uname}'s trades.`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
+}
+async function removeCopyTarget(targetUid){
+  const ct = state.userDoc?.snipeBot?.copyTrade;
+  if(!ct) return;
+  try{ await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.targets': (ct.targets||[]).filter(t=>t.uid!==targetUid) }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+
+// Copy Trade watches the global activity feed (real trades only — bot trades are tagged uid:'bot'
+// and will simply never match anyone's target uid) for trades made by whichever users you've
+// chosen to mirror, and replicates them at YOUR chosen dollar amount, not theirs. A copied sell
+// dumps your entire position in that coin (there's no clean way to mirror "sold 40%" using a
+// fixed dollar amount the way a buy can). Same offline-sweep + must-be-signed-in-somewhere
+// caveat as the rest of the bot system — "even while offline" isn't literally true here either.
+let copyTradeCursorMs = null;
+function listenCopyTrades(){
+  copyTradeCursorMs = Date.now();
+  catchUpCopyTrades();
+  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(150));
+  const un = onSnapshot(q, snap=>{
+    snap.docChanges().forEach(change=>{
+      if(change.type!=='added') return;
+      const t = change.doc.data();
+      if(toMillisLoose(t.createdAt) <= copyTradeCursorMs) return;
+      handlePotentialCopyTrade(t);
+    });
+  }, ()=>{ /* silent — non-critical */ });
+  state.unsubs.push(un);
+}
+function handlePotentialCopyTrade(t){
+  const ct = state.userDoc?.snipeBot?.copyTrade;
+  if(!ct?.active) return;
+  const target = (ct.targets||[]).find(x=>x.uid===t.uid);
+  if(!target) return;
+  if(t.type==='buy'){
+    if((state.userDoc?.balance||0) < target.amount) return; // can't afford it right now — skip quietly
+    doBuy(t.coinId, target.amount, true).then(result=>{
+      if(result) toast(`🪞 Copied @${target.username}'s buy — ${fmtUsd(target.amount)} into $${t.ticker}`, 'ok', ()=> navigate('coin', t.coinId));
+    });
+  } else if(t.type==='sell'){
+    getDoc(doc(db,'users',state.uid,'holdings',t.coinId)).then(hSnap=>{
+      if(!hSnap.exists()) return;
+      const tokens = hSnap.data().tokens;
+      if(!(tokens>0.0001)) return;
+      doSell(t.coinId, tokens).then(result=>{
+        if(result) toast(`🪞 Copied @${target.username}'s sell of $${t.ticker}`, 'ok');
+      });
+    });
+  }
+}
+async function catchUpCopyTrades(){
+  try{
+    await waitForUserDoc();
+    const ct = state.userDoc?.snipeBot?.copyTrade;
+    if(!ct?.owned) return;
+    if(ct.active && ct.lastCheckedAt){
+      const cutoff = Timestamp.fromMillis(toMillisLoose(ct.lastCheckedAt));
+      const snap = await getDocs(query(collection(db,'activity'), where('createdAt','>',cutoff), orderBy('createdAt','asc'), limit(200)));
+      snap.docs.forEach(d=> handlePotentialCopyTrade(d.data()));
+    }
+    await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.lastCheckedAt': Date.now() });
+  }catch(err){ /* non-critical */ }
 }
 
 async function purchaseSnipeBot(){
@@ -2791,24 +3152,41 @@ async function loadPositions(uid){
   const closed = closedSnap.docs.map(d=>({id:d.id,...d.data()}));
   return { open, closed };
 }
-function openPositionsHtml(open){
+function openPositionsHtml(open, pinnedIds=[], canPin=false){
   if(!open.length) return '<div class="empty" style="padding:16px;">No open positions.</div>';
   return open.map(r=>{
     const up = r.pnl>=0;
     const ticker = r.coin?.ticker || r.h.ticker;
+    const isPinned = pinnedIds.includes(r.h.id);
     return `
     <div class="hold-row" data-coin="${r.h.id}">
       <img class="coin-logo" src="${coinLogoFor(ticker, r.coin?.imageURL||r.h.imageURL)}">
       <div class="hold-info">
-        <div class="coin-ticker">$${esc(ticker)}</div>
+        <div class="coin-ticker">${isPinned?'📌 ':''}$${esc(ticker)}</div>
         <div class="coin-name">${fmtTok(r.h.tokens)} tokens</div>
       </div>
       <div class="hold-right">
         <div class="hold-val mono">${fmtUsd(r.val)}</div>
         <div class="mono" style="font-size:11.5px;color:${up?'var(--up)':'var(--down)'};">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.pnl))}</div>
       </div>
+      ${canPin?`<button class="btn btn-ghost" data-pin-coin="${r.h.id}" style="padding:6px 10px;font-size:11px;margin-left:8px;flex-shrink:0;">${isPinned?'Unpin':'📌 Pin'}</button>`:''}
     </div>`;
   }).join('');
+}
+// Pins are capped at 3 and stored directly on the user doc (public field, so pinned coins show
+// on both your own and public profile the same way). Sorting pinned-first happens at the call
+// site, not in here — this function just renders whatever order it's given.
+async function togglePinCoin(coinId){
+  const pinned = state.userDoc?.pinnedCoins||[];
+  const isPinned = pinned.includes(coinId);
+  let next;
+  if(isPinned) next = pinned.filter(id=>id!==coinId);
+  else{
+    if(pinned.length>=3){ toast('You can only pin up to 3 coins — unpin one first.', 'err'); return; }
+    next = [...pinned, coinId];
+  }
+  try{ await updateDoc(doc(db,'users',state.uid), { pinnedCoins: next }); }
+  catch(err){ toast("Couldn't update pins: "+err.message, 'err'); }
 }
 function closedPositionsHtml(closed){
   if(!closed.length) return '<div class="empty" style="padding:16px;">No closed positions yet — sell something to see it here.</div>';
@@ -2832,6 +3210,9 @@ function closedPositionsHtml(closed){
 function wirePositionRows(container){
   container.querySelectorAll('[data-coin]').forEach(el=>{
     if(el.dataset.coin) el.addEventListener('click', ()=> navigate('coin', el.dataset.coin));
+  });
+  container.querySelectorAll('[data-pin-coin]').forEach(el=>{
+    el.addEventListener('click', (e)=>{ e.stopPropagation(); togglePinCoin(el.dataset.pinCoin); });
   });
 }
 
@@ -2874,9 +3255,11 @@ async function renderUserProfile(uid){
   drawNetWorthChart('userProfChart', u.netWorthHistory);
   try{
     const { open, closed } = await loadPositions(uid);
+    const pinnedIds = u.pinnedCoins||[];
+    open.sort((a,b)=> (pinnedIds.includes(b.h.id)?1:0)-(pinnedIds.includes(a.h.id)?1:0));
     const openEl = document.getElementById('openPosList');
     const closedEl = document.getElementById('closedPosList');
-    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open, pinnedIds, false); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
     const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
@@ -2967,6 +3350,11 @@ function renderProfile(){
           <span>Status</span>
           <button class="btn ${u.snipeBot.active?'btn-lime':'btn-ghost'}" id="snipeToggleBtn">${u.snipeBot.active?'Active — tap to pause':'Paused — tap to resume'}</button>
         </div>
+        ${u.snipeBot.categoryUpgrade ? `
+        <div class="settings-row" style="flex-wrap:wrap;gap:8px;"><span>Community coins</span><div style="display:flex;gap:8px;"><input class="field" id="snipeAmtCommunity" style="width:80px;padding:8px 10px;" inputmode="decimal" value="${u.snipeBot.amounts?.community||10}"><button class="btn btn-ghost" data-cat="community" data-cat-save>Save</button></div></div>
+        <div class="settings-row" style="flex-wrap:wrap;gap:8px;"><span>Bot Market coins</span><div style="display:flex;gap:8px;"><input class="field" id="snipeAmtBot" style="width:80px;padding:8px 10px;" inputmode="decimal" value="${u.snipeBot.amounts?.bot||10}"><button class="btn btn-ghost" data-cat="bot" data-cat-save>Save</button></div></div>
+        <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;"><span>Guaranteed-growth coins</span><div style="display:flex;gap:8px;"><input class="field" id="snipeAmtGuaranteed" style="width:80px;padding:8px 10px;" inputmode="decimal" value="${u.snipeBot.amounts?.guaranteed||10}"><button class="btn btn-ghost" data-cat="guaranteed" data-cat-save>Save</button></div></div>
+        ` : `
         <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;">
           <span>Amount per coin</span>
           <div style="display:flex;gap:8px;align-items:center;">
@@ -2974,15 +3362,40 @@ function renderProfile(){
             <button class="btn btn-ghost" id="snipeAmountSaveBtn">Save</button>
           </div>
         </div>
+        <button class="btn btn-ghost btn-block" style="margin-top:6px;" id="snipeCategoryUpgradeBtn">Upgrade: set separate amounts per coin type — ${fmtUsd(SNIPE_CATEGORY_UPGRADE_PRICE)}</button>
+        `}
         <div style="display:flex;gap:16px;margin:12px 0 4px;font-size:12.5px;color:var(--txt-dim);">
           <span>Spent: <b class="mono" style="color:var(--txt);">${fmtUsd(u.snipeBot.totalSpent||0)}</b></span>
           <span>Coins sniped: <b class="mono" style="color:var(--txt);">${(u.snipeBot.snipedCoins||[]).length}</b></span>
         </div>
         <button class="btn btn-ghost btn-block" style="margin-top:8px;" id="snipeStatsBtn">📊 View Stats</button>
-        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys this amount into every new coin — community launches and Bot Market spawns alike — from now on, only while your account is signed in on some open tab of yours. Doesn't touch coins that already existed before you turned this on, and never snipes your own launches.</div>
+        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys into every new coin — community launches and Bot Market spawns alike — from now on, only while your account is signed in on some open tab of yours. Doesn't touch coins that already existed before you turned this on, and never snipes your own launches.</div>
       ` : `
         <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Auto-buy a set dollar amount into every new coin the moment it launches — community coins and Bot Market spawns alike — for as long as it's toggled on. One-time unlock, pause/resume anytime after.</div>
         <button class="btn btn-lime btn-block" id="snipeBuyBtn">Unlock for ${fmtUsd(SNIPE_BOT_PRICE)}</button>
+      `}
+    </div>
+    <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">🪞 Copy Trade</div>
+      ${u.snipeBot?.copyTrade?.owned ? `
+        <div class="settings-row">
+          <span>Status</span>
+          <button class="btn ${u.snipeBot.copyTrade.active?'btn-lime':'btn-ghost'}" id="copyTradeToggleBtn">${u.snipeBot.copyTrade.active?'Active — tap to pause':'Paused — tap to resume'}</button>
+        </div>
+        <div id="copyTargetsList">${(u.snipeBot.copyTrade.targets||[]).length? u.snipeBot.copyTrade.targets.map(t=>`
+          <div class="settings-row">
+            <span>@${esc(t.username)} · ${fmtUsd(t.amount)}/trade</span>
+            <button class="btn btn-ghost" data-remove-target="${t.uid}" style="padding:6px 10px;font-size:11px;">Remove</button>
+          </div>`).join('') : '<div style="font-size:12px;color:var(--txt-faint);padding:6px 0;">Not copying anyone yet.</div>'}</div>
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+          <input class="field" id="copyTargetUser" style="flex:1;min-width:90px;" placeholder="username">
+          <input class="field" id="copyTargetAmount" style="width:80px;" inputmode="decimal" placeholder="$/trade">
+          <button class="btn btn-ghost" id="copyTargetAddBtn">Add</button>
+        </div>
+        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:10px;line-height:1.5;">Mirrors up to 5 users' real buys and sells — each buy uses your own chosen dollar amount, not theirs; a copied sell dumps your entire position in that coin. Same rule as everything else here: only fires while your account is signed in somewhere.</div>
+      ` : `
+        <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Pick up to 5 real traders and automatically mirror their buys and sells, at a dollar amount you choose per trade — not theirs.</div>
+        <button class="btn btn-lime btn-block" id="copyTradeBuyBtn">Unlock for ${fmtUsd(SNIPE_COPYTRADE_UPGRADE_PRICE)}</button>
       `}
     </div>
     <div class="panel" style="margin-top:16px;">
@@ -3005,11 +3418,29 @@ function renderProfile(){
     const v = parseFloat(document.getElementById('snipeAmountInput').value);
     updateSnipeAmount(v);
   });
+  document.getElementById('snipeCategoryUpgradeBtn')?.addEventListener('click', ()=> purchaseSnipeCategoryUpgrade());
+  document.querySelectorAll('[data-cat-save]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const cat = btn.dataset.cat;
+      const inputId = cat==='community'?'snipeAmtCommunity':cat==='bot'?'snipeAmtBot':'snipeAmtGuaranteed';
+      updateSnipeCategoryAmount(cat, parseFloat(document.getElementById(inputId).value));
+    });
+  });
+  document.getElementById('copyTradeBuyBtn')?.addEventListener('click', ()=> purchaseCopyTradeUpgrade());
+  document.getElementById('copyTradeToggleBtn')?.addEventListener('click', ()=> toggleCopyTrade());
+  document.getElementById('copyTargetAddBtn')?.addEventListener('click', ()=>{
+    addCopyTarget(document.getElementById('copyTargetUser').value, parseFloat(document.getElementById('copyTargetAmount').value));
+  });
+  document.querySelectorAll('[data-remove-target]').forEach(btn=>{
+    btn.addEventListener('click', ()=> removeCopyTarget(btn.dataset.removeTarget));
+  });
   drawNetWorthChart('profChart', u.netWorthHistory);
   loadPositions(state.uid).then(({open, closed})=>{
+    const pinnedIds = u.pinnedCoins||[];
+    open.sort((a,b)=> (pinnedIds.includes(b.h.id)?1:0)-(pinnedIds.includes(a.h.id)?1:0));
     const openEl = document.getElementById('openPosList');
     const closedEl = document.getElementById('closedPosList');
-    if(openEl){ openEl.innerHTML = openPositionsHtml(open); wirePositionRows(openEl); }
+    if(openEl){ openEl.innerHTML = openPositionsHtml(open, pinnedIds, true); wirePositionRows(openEl); }
     if(closedEl){ closedEl.innerHTML = closedPositionsHtml(closed); wirePositionRows(closedEl); }
     const wrEl = document.getElementById('winRateStat'); if(wrEl) wrEl.textContent = winRateText(closed);
     const wsEl = document.getElementById('winStreakStat'); if(wsEl) wsEl.textContent = winStreakText(closed);
