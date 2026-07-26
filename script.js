@@ -383,6 +383,7 @@ function listenTickerTape(){
 function navigate(name, param=null){
   state.route = {name, param};
   if(name!=='coin'){ stopViewerCount(); stopHolderCount(); }
+  if(name!=='home'){ if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub=null; } if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub=null; } }
   if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
@@ -607,15 +608,18 @@ function renderHome(){
     <div class="chip-row" id="categoryChips">
       <div class="chip" data-cat="user">🧑‍🤝‍🧑 Community Coins</div>
       <div class="chip" data-cat="bot">🤖 Bot Market</div>
+      <div class="chip" data-cat="risky" style="margin-left:auto;">⚠️ Risky</div>
     </div>
     <div class="cat-blurb" id="categoryBlurb"></div>
-    <div class="searchbar">🔍 <input id="homeSearch" placeholder="Search by name or ticker..."></div>
-    <div class="chip-row" id="sortChips">
-      <div class="chip" data-sort="new">🆕 New</div>
-      <div class="chip" data-sort="oldest">🕰️ Oldest</div>
-      <div class="chip" data-sort="cap">💰 Market Cap</div>
-      <div class="chip" data-sort="gainers">🔥 Gainers</div>
-      <div class="chip" data-sort="losers">📉 Losers</div>
+    <div id="sortSearchWrap">
+      <div class="searchbar">🔍 <input id="homeSearch" placeholder="Search by name or ticker..."></div>
+      <div class="chip-row" id="sortChips">
+        <div class="chip" data-sort="new">🆕 New</div>
+        <div class="chip" data-sort="oldest">🕰️ Oldest</div>
+        <div class="chip" data-sort="cap">💰 Market Cap</div>
+        <div class="chip" data-sort="gainers">🔥 Gainers</div>
+        <div class="chip" data-sort="losers">📉 Losers</div>
+      </div>
     </div>
     <div id="coinGrid" class="coin-grid"><div class="spinner" style="margin-top:40px;"></div></div>
   `;
@@ -623,19 +627,28 @@ function renderHome(){
   function updateBlurb(){
     blurb.textContent = homeCategory==='bot'
       ? "Fully simulated coins — nobody launched these, prices move automatically 24/7. Real market, real trades, but the counterparty pressure is bots, not people. Good for practicing reads on volatility."
+      : homeCategory==='risky'
+      ? "One coin, replaced every day. No bias, no guarantees — massive spikes, massive drops, and a real (boosted) chance it just gets rugged. Extremely unpredictable on purpose."
       : "Coins launched by real people. Price only moves when someone actually buys or sells.";
   }
   updateBlurb();
   document.querySelectorAll('#categoryChips .chip').forEach(c=>{
     c.classList.toggle('active', c.dataset.cat===homeCategory);
-    c.addEventListener('click', ()=>{ homeCategory=c.dataset.cat; document.querySelectorAll('#categoryChips .chip').forEach(x=>x.classList.remove('active')); c.classList.add('active'); updateBlurb(); loadHomeCoins(); });
+    c.addEventListener('click', ()=>{
+      homeCategory=c.dataset.cat;
+      document.querySelectorAll('#categoryChips .chip').forEach(x=>x.classList.remove('active'));
+      c.classList.add('active'); updateBlurb();
+      document.getElementById('sortSearchWrap').style.display = homeCategory==='risky' ? 'none' : '';
+      if(homeCategory==='risky') loadRiskyCoin(); else loadHomeCoins();
+    });
   });
+  document.getElementById('sortSearchWrap').style.display = homeCategory==='risky' ? 'none' : '';
   document.querySelectorAll('#sortChips .chip').forEach(c=>{
     c.classList.toggle('active', c.dataset.sort===homeSort);
     c.addEventListener('click', ()=>{ homeSort=c.dataset.sort; document.querySelectorAll('#sortChips .chip').forEach(x=>x.classList.remove('active')); c.classList.add('active'); loadHomeCoins(); });
   });
   document.getElementById('homeSearch').addEventListener('input', ()=> loadHomeCoins());
-  loadHomeCoins();
+  if(homeCategory==='risky') loadRiskyCoin(); else loadHomeCoins();
 }
 
 function loadHomeCoins(){
@@ -656,6 +669,7 @@ function loadHomeCoins(){
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
     if(homeCategory==='user') coins = coins.filter(c=> !c.isBotCoin);
+    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky); // Risky has its own dedicated tab
     const term = (document.getElementById('homeSearch')?.value||'').toLowerCase();
     if(term) coins = coins.filter(c=> c.ticker.toLowerCase().includes(term) || c.name.toLowerCase().includes(term));
     if(homeSort==='gainers') coins = coins.slice().sort((a,b)=> pctChange(b.priceHistory)-pctChange(a.priceHistory));
@@ -678,6 +692,34 @@ function sparklineSvg(history, up){
   const coords = vals.map((v,i)=> `${(i*step).toFixed(1)},${(h-((v-min)/range)*h*0.8-h*0.1).toFixed(1)}`).join(' ');
   const color = up? 'var(--up)':'var(--down)';
   return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none"><polyline points="${coords}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+}
+
+// The Risky tab shows exactly one coin, replaced daily — watches meta/riskySchedule for today's
+// pick (rather than a category query over the coins collection), then watches that single coin
+// doc directly. Reuses renderCoinGrid so the card looks and behaves identically to every other
+// coin card, just with a single-element array and its own badge (see the ⚠️ RISKY badge logic).
+let riskyScheduleUnsub = null, riskyCoinUnsub = null;
+function loadRiskyCoin(){
+  if(riskyScheduleUnsub) riskyScheduleUnsub();
+  if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub = null; }
+  const grid = document.getElementById('coinGrid');
+  if(grid) grid.innerHTML = '<div class="spinner" style="margin-top:40px;grid-column:1/-1;"></div>';
+  riskyScheduleUnsub = onSnapshot(doc(db,'meta','riskySchedule'), snap=>{
+    const coinId = snap.exists() ? snap.data().coinId : null;
+    if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub = null; }
+    if(!coinId){
+      if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">⚠️</div>Today's risky coin hasn't been picked yet — check back shortly.</div>`;
+      return;
+    }
+    riskyCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
+      const g = document.getElementById('coinGrid');
+      if(!g) return;
+      if(!cSnap.exists()){ g.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">⚠️</div>Today's risky coin is gone — check back tomorrow.</div>`; return; }
+      const coin = {id:cSnap.id, ...cSnap.data()};
+      state.coinsCache.set(coin.id, coin);
+      renderCoinGrid([coin]);
+    });
+  }, ()=>{ if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load today's risky coin.</div>`; });
 }
 
 function renderCoinGrid(coins){
@@ -703,7 +745,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')))}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -758,7 +800,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -970,7 +1012,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -1538,7 +1580,7 @@ async function refreshNetWorthSnapshot(){
     const uSnap = await getDoc(doc(db,'users',state.uid));
     if(!uSnap.exists()) return null;
     const u = uSnap.data();
-    const netWorth = (u.balance||0) + holdingsVal;
+    const netWorth = (u.balance||0) + (u.bank?.balance||0) + holdingsVal;
     const now = Date.now();
     const cutoffKeep = now - 35*86400000; // keep ~5 weeks of history, plenty for daily/weekly lookback
     let hist = (u.netWorthHistory||[]).filter(h=>h.t>=cutoffKeep);
@@ -1700,6 +1742,14 @@ const BOT_COIN_RUG_CHANCE = 0.0015;
 const BOT_COIN_RUG_MIN_AGE_MS = 15*60*1000; // too unfair to rug something seconds after it's born
 const RUGGED_RECOVERY_CHANCE = 0.06; // fixed low buy-chance for a rugged coin, replacing the normal trend-bias split
 const GUARANTEED_GROWTH_QUIET_MS = 2*60*1000; // Right-Ctrl coins sit ~flat for 2 min before the rapid-growth phase kicks in
+// Risky tab: exactly one coin, replaced daily, with extreme unbiased volatility and a much
+// higher chance of getting rugged outright — the opposite design goal of guaranteedGrowth coins.
+const RISKY_TICK_MS = 9000;          // ticks much faster than the main bot loop — just one doc, so cheap
+const RISKY_TRADE_CHANCE = 0.9;
+const RISKY_MIN_SWING = 800;
+const RISKY_MAX_SWING = 15000;       // bigger than even Bot Market's normal whale range
+const RISKY_RUG_CHANCE = 0.012;      // ~8x the normal bot-coin rug chance
+const RISKY_RUG_MIN_AGE_MS = 5*60*1000; // short grace period so it can't rug the instant it's picked
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -1809,7 +1859,7 @@ async function makeUniqueBotTicker(){
   return null; // give up quietly this round — next spawn check will try again
 }
 
-async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false){
+async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRisky=false){
   try{
     const picked = preset || await makeUniqueBotTicker();
     if(!picked) return;
@@ -1837,6 +1887,8 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false){
         ? "Fully automated market. Word is this one's going to blow up — guaranteed to hit 10,000 holders within the hour."
         : isInsider
         ? "Fully automated market. Quietly seeded ahead of time — no rug risk, built to hold up for the long haul."
+        : isRisky
+        ? "Today's risky pick. No bias, no guarantees — could double, could get rugged. Extremely unpredictable on purpose."
         : 'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
       imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
@@ -1849,6 +1901,7 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false){
       ...((forceSpawn||isInsider) ? { guaranteedGrowth: true } : {}),
       ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
       ...(isInsider ? { isInsider: true } : {}),
+      ...(isRisky ? { isRisky: true } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     };
     await setDoc(coinRef, coinData);
@@ -1945,6 +1998,53 @@ async function checkInsiderSchedule(){
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one, or a rare scheduling race */ }
 }
 
+// Risky tab: exactly one coin, replaced once per calendar day. Simpler than Insider Insights —
+// no advance leak/countdown, just "is there already a pick for today? if not, make one." Small
+// accepted race risk if two tabs both check right at day-rollover (same tradeoff already made
+// for Insider Insights): worst case, two risky coins get created and whichever write lands last
+// wins the schedule doc, leaving one orphaned (still exists, just never shown or referenced).
+let riskyCheckCounter = 0;
+async function checkRiskySchedule(){
+  riskyCheckCounter++;
+  if(riskyCheckCounter!==1 && riskyCheckCounter%4!==0) return; // otherwise only check roughly once a minute
+  try{
+    const ref = doc(db,'meta','riskySchedule');
+    const snap = await getDoc(ref);
+    const today = new Date().toISOString().slice(0,10);
+    const data = snap.exists() ? snap.data() : {};
+    if(data.dayKey===today && data.coinId) return; // today's pick already exists
+    const picked = await makeUniqueBotTicker();
+    if(!picked) return;
+    const newCoin = await spawnBotCoin(false, picked, false, true);
+    if(newCoin) await setDoc(ref, { dayKey: today, coinId: newCoin.id });
+  }catch(err){ /* ignore — e.g. a rare ticker/scheduling race, next check will just retry */ }
+}
+
+async function riskyCoinTick(){
+  try{
+    const snap = await getDoc(doc(db,'meta','riskySchedule'));
+    if(!snap.exists() || !snap.data().coinId) return;
+    const coinId = snap.data().coinId;
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const coinSnap = await getDoc(doc(db,'coins',coinId));
+    if(!coinSnap.exists()) return;
+    const coin = coinSnap.data();
+    if(coin.ruggedAt) return; // already rugged today — just sits until tomorrow's replacement
+    const ageMs = Date.now()-toMillisLoose(coin.createdAt);
+    if(ageMs>RISKY_RUG_MIN_AGE_MS && Math.random()<RISKY_RUG_CHANCE){ ruggedCoinEvent(coinId); return; }
+    if(Math.random() >= RISKY_TRADE_CHANCE) return;
+    const usd = RISKY_MIN_SWING + Math.random()*(RISKY_MAX_SWING-RISKY_MIN_SWING);
+    // Deliberately a flat 50/50 coin-flip, no trend bias at all — that's what makes it "extremely
+    // unpredictable" rather than just volatile-but-still-biased like guaranteedGrowth or the
+    // normal Bot Market trend logic.
+    setTimeout(()=>{
+      if(coinsWithPendingUserTrade.has(coinId)) return;
+      if(Math.random()<0.5) botBuyOnCoin(coinId, usd, true);
+      else if(pumpAllowsSell(coin)) botSellOnCoin(coinId, usd, true);
+    }, Math.random()*7000);
+  }catch(err){ /* non-critical */ }
+}
+
 // This is a static site with no server — literally nothing can move while zero browser tabs are
 // open anywhere. What we CAN do: the moment any tab reopens, check how long it's been since a
 // bot coin last ticked and replay that whole gap as a compressed batch of simulated ticks (same
@@ -2015,6 +2115,7 @@ async function botCoinTick(){
     snap.docs.forEach(d=>{
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
+      if(coin.isRisky) return; // handled entirely by its own dedicated riskyCoinTick loop instead
       if(coin.guaranteedGrowth){
         // Right-Ctrl force-spawned coins: never eligible for a rug-pull (checked before this
         // branch is even reached, see below). Two phases, timed off guaranteedHolderRampStart
@@ -2083,6 +2184,7 @@ async function botCoinTick(){
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
   checkInsiderSchedule();
+  checkRiskySchedule();
 }
 
 async function ruggedCoinEvent(coinId){
@@ -2178,8 +2280,10 @@ function startBots(){
   }
   setTimeout(botTick, 3000);       // one early tick shortly after load
   setTimeout(botCoinTick, 4500);
+  setTimeout(riskyCoinTick, 6000);
   scheduleNext(botTick, BOT_TICK_MS);
   scheduleNext(botCoinTick, BOT_TICK_MS);
+  scheduleNext(riskyCoinTick, RISKY_TICK_MS);
 }
 function stopBots(){ botRunning = false; }
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
@@ -3186,7 +3290,7 @@ async function loadLeaderboard(){
     // doing it for all 200.
     const candidates = users.slice().sort((a,b)=> (b.netWorth??b.balance??0)-(a.netWorth??a.balance??0)).slice(0,60);
     const rowsRaw = await Promise.all(candidates.map(async u=>{
-      const live = await liveNetWorthFor(u.uid, u.balance);
+      const live = await liveNetWorthFor(u.uid, (u.balance||0)+(u.bank?.balance||0));
       return { uid:u.uid, username:u.username, avatarURL:u.avatarURL, current: live, change: netWorthChange({...u, netWorth: live}, lbCategory) };
     }));
     const rows = rowsRaw.sort((a,b)=> b.change-a.change).slice(0,25);
@@ -3319,6 +3423,7 @@ async function renderUserProfile(uid){
     <div class="panel">
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Bank</span><b class="mono">${fmtUsd(u.bank?.balance||0)}</b></div>
       <div class="settings-row"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
       <div class="settings-row"><span>Streak</span><b class="mono" id="winStreakStat">—</b></div>
       <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
@@ -3420,6 +3525,7 @@ function renderProfile(){
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
+      <div class="settings-row"><span>Bank</span><b class="mono">${fmtUsd(u.bank?.balance||0)}</b></div>
       <div class="settings-row"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
       <div class="settings-row"><span>Streak</span><b class="mono" id="winStreakStat">—</b></div>
       <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
