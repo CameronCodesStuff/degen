@@ -783,7 +783,7 @@ function recentTradesHtml(trades){
     <div class="holder-line">
       <div class="user-link" data-uid="${t.isBot?'':(t.uid||'')}" style="display:flex;align-items:center;gap:8px;${t.isBot?'':'cursor:pointer;'}">
         <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
-        <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
+        <span>${t.isBot?'🤖 ':''}@${esc(t.username)}${t.viaSnipe?'\'s 🎯 snipe bot':''}${t.isExplosion?' 💥':''}${t.isDump?' 📉':''}</span>
       </div>
       <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
       <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
@@ -862,7 +862,7 @@ async function loadTopHolders(coinId){
       <div class="holder-line">
         <div class="user-link" data-uid="${h.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
           <img class="avatar-sm" src="${avatarFor(h.username, h.avatarURL)}" style="border-radius:50%;">
-          <span>@${esc(h.username||'anon')}</span>
+          <span>@${esc(h.username||'anon')}${h.viaSnipe?' 🎯':''}</span>
         </div>
         <span class="mono" style="margin-left:auto;">${fmtTok(h.tokens)}</span>
         <span style="font-size:11.5px;color:var(--txt-dim);min-width:44px;text-align:right;">${pct.toFixed(1)}%</span>
@@ -1248,7 +1248,7 @@ function drawNetWorthChart(canvasId, history){
 // everything else normally; this only pauses the one coin actively mid-transaction.
 const coinsWithPendingUserTrade = new Set();
 
-async function doBuy(coinId, usdAmount){
+async function doBuy(coinId, usdAmount, viaSnipe=false){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
   if(!state.userDoc){ toast("Still loading your account — try again in a second.", 'err'); return; }
   const btn = document.getElementById('tradeSubmit');
@@ -1291,7 +1291,7 @@ async function doBuy(coinId, usdAmount){
 
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now()}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-14);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
@@ -1303,26 +1303,30 @@ async function doBuy(coinId, usdAmount){
         totalBoughtUsd: (prevHold.totalBoughtUsd||0) + finalUsd,
         totalSoldUsd: prevHold.totalSoldUsd||0, realizedPnl: prevHold.realizedPnl||0,
         firstBuyAt: prevTokens>0.0001 ? (prevHold.firstBuyAt||Date.now()) : Date.now(),
+        viaSnipe: !!viaSnipe, // reflects whether the MOST RECENT trade touching this holding was a snipe buy
         updatedAt: Date.now()
       }, {merge:true});
       const activityRef = doc(collection(db,'activity'));
       tx.set(activityRef, {
         uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
-        type:'buy', usdAmount: finalUsd, tokenAmount: tokensOut,
+        type:'buy', usdAmount: finalUsd, tokenAmount: tokensOut, viaSnipe: !!viaSnipe,
         coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
         createdAt: serverTimestamp()
       });
       return { tokensOut, wasCapped, finalUsd };
     });
     if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at ${Math.round(MAX_OWNERSHIP_PCT*100)}% ownership, rest refunded.`, 'ok');
-    else toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
+    else if(!viaSnipe) toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
     state.tradeAmount = 0;
     const nw = await refreshNetWorthSnapshot();
     checkMilestones(null, nw);
     checkRankOvertake();
-  }catch(err){ toast(err.message, 'err'); }
-  coinsWithPendingUserTrade.delete(coinId);
-  if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
+    return result;
+  }catch(err){ toast(err.message, 'err'); return null; }
+  finally{
+    coinsWithPendingUserTrade.delete(coinId);
+    if(btn){ btn.disabled=false; if(originalBtnText!=null) btn.textContent=originalBtnText; }
+  }
 }
 
 async function doSell(coinId, tokenAmount){
@@ -2115,11 +2119,85 @@ function listenAutoSnipe(){
       const amount = snipe.amountPerCoin||0;
       if(!(amount>0)) return;
       if((state.userDoc?.balance||0) < amount) return; // can't afford it right now — skip quietly
-      doBuy(change.doc.id, amount);
-      toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', change.doc.id));
+      const coinId = change.doc.id;
+      doBuy(coinId, amount, true).then(result=>{
+        if(!result) return; // buy failed — don't log a snipe that didn't actually happen
+        toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', coinId));
+        logSnipeLedger(coinId, c.ticker, c.name, c.imageURL||'', amount);
+      });
     });
   }, ()=>{ /* silent — non-critical */ });
   state.unsubs.push(un);
+}
+
+// Keeps a lightweight record of snipe activity (total spent + last 30 coins sniped into) on the
+// user doc, purely for the stats menu on the profile page — not used for any trading logic.
+// Read-modify-write against state.userDoc rather than a transaction; a rare race between two
+// snipe buys landing in the same instant would at worst drop one ledger entry, not corrupt
+// anything real (balance/holdings are handled properly inside doBuy's own transaction).
+async function logSnipeLedger(coinId, ticker, name, imageURL, amount){
+  try{
+    const snipe = state.userDoc?.snipeBot || {};
+    const list = (snipe.snipedCoins||[]).concat([{ coinId, ticker, name, imageURL, amount, at:Date.now() }]).slice(-30);
+    await updateDoc(doc(db,'users',state.uid), {
+      'snipeBot.totalSpent': (snipe.totalSpent||0) + amount,
+      'snipeBot.snipedCoins': list
+    });
+  }catch(err){ /* non-critical */ }
+}
+
+// Shows total spent, count sniped, and — since a sniped coin's holding can also get topped up
+// or partly sold manually afterward — an approximate live picture rather than a perfectly
+// decomposed ledger: current realizable value of whatever you still hold in every coin you've
+// ever sniped into, versus total spent via snipe. If you've also traded those same coins by
+// hand, this blends both; it's described that way in the modal rather than pretending otherwise.
+async function openSnipeStatsModal(){
+  const snipe = state.userDoc?.snipeBot || {};
+  const list = (snipe.snipedCoins||[]).slice().reverse(); // newest first
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal-box">
+      <h3>🎯 Auto-Snipe Stats</h3>
+      <div style="display:flex;gap:20px;margin:14px 0;">
+        <div><div style="font-size:11px;color:var(--txt-faint);">TOTAL SPENT</div><div class="mono" style="font-size:18px;font-weight:700;">${fmtUsd(snipe.totalSpent||0)}</div></div>
+        <div><div style="font-size:11px;color:var(--txt-faint);">COINS SNIPED</div><div class="mono" style="font-size:18px;font-weight:700;">${list.length}</div></div>
+        <div><div style="font-size:11px;color:var(--txt-faint);">CURRENT VALUE</div><div class="mono" style="font-size:18px;font-weight:700;" id="snipeCurValue">—</div></div>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);line-height:1.4;margin-bottom:10px;">Current value only counts coins you still hold from the list below — if you've also bought/sold any of these by hand, this blends both rather than isolating just the snipe portion.</div>
+      <div id="snipeCoinList" style="max-height:280px;overflow-y:auto;">${list.length? list.map(s=>`
+        <div class="holder-line" data-coin="${s.coinId}" style="cursor:pointer;">
+          <img class="coin-logo" src="${coinLogoFor(s.ticker, s.imageURL)}">
+          <div class="hold-info">
+            <div class="coin-ticker">$${esc(s.ticker)}</div>
+            <div class="coin-name">Sniped ${fmtUsd(s.amount)} · ${timeAgo(s.at)}</div>
+          </div>
+        </div>`).join('') : '<div class="empty" style="padding:16px;">No snipes yet.</div>'}</div>
+      <button class="btn btn-ghost btn-block" style="margin-top:16px;" id="snipeStatsCloseBtn">Close</button>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  document.getElementById('snipeStatsCloseBtn').addEventListener('click', ()=> overlay.remove());
+  overlay.querySelectorAll('[data-coin]').forEach(el=> el.addEventListener('click', ()=>{ overlay.remove(); navigate('coin', el.dataset.coin); }));
+
+  // Live current-value tally, computed after the modal is already showing (avoids blocking the
+  // open on a batch of reads) — sums realizable value across every distinct coin ever sniped,
+  // for whatever amount of it you currently still hold.
+  try{
+    const uniqueCoinIds = [...new Set(list.map(s=>s.coinId))];
+    let total = 0;
+    for(const coinId of uniqueCoinIds){
+      const holdSnap = await getDoc(doc(db,'users',state.uid,'holdings',coinId));
+      if(!holdSnap.exists()) continue;
+      const h = holdSnap.data();
+      if(!(h.tokens>0.0001)) continue;
+      let coin = state.coinsCache.get(coinId);
+      if(!coin){ const cs = await getDoc(doc(db,'coins',coinId)); if(cs.exists()){ coin = {id:cs.id,...cs.data()}; state.coinsCache.set(coinId, coin); } }
+      if(coin) total += sellValue(coin, h.tokens);
+    }
+    const el = document.getElementById('snipeCurValue');
+    if(el) el.textContent = fmtUsd(total);
+  }catch(err){ const el = document.getElementById('snipeCurValue'); if(el) el.textContent = '—'; }
 }
 
 async function purchaseSnipeBot(){
@@ -2169,7 +2247,7 @@ function loadActivity(){
       <div class="holder-line">
         <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
           <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
-          <span>@${esc(t.username)}</span>
+          <span>@${esc(t.username)}${t.viaSnipe?'\'s 🎯 snipe bot':''}</span>
         </div>
         <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
         <span class="coin-tag" data-coin="${t.coinId||''}" style="cursor:pointer;font-weight:600;">$${esc(t.ticker)}</span>
@@ -2535,6 +2613,11 @@ function renderProfile(){
             <button class="btn btn-ghost" id="snipeAmountSaveBtn">Save</button>
           </div>
         </div>
+        <div style="display:flex;gap:16px;margin:12px 0 4px;font-size:12.5px;color:var(--txt-dim);">
+          <span>Spent: <b class="mono" style="color:var(--txt);">${fmtUsd(u.snipeBot.totalSpent||0)}</b></span>
+          <span>Coins sniped: <b class="mono" style="color:var(--txt);">${(u.snipeBot.snipedCoins||[]).length}</b></span>
+        </div>
+        <button class="btn btn-ghost btn-block" style="margin-top:8px;" id="snipeStatsBtn">📊 View Stats</button>
         <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys this amount into every new coin — community launches and Bot Market spawns alike — from now on, only while your account is signed in on some open tab of yours. Doesn't touch coins that already existed before you turned this on, and never snipes your own launches.</div>
       ` : `
         <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Auto-buy a set dollar amount into every new coin the moment it launches — community coins and Bot Market spawns alike — for as long as it's toggled on. One-time unlock, pause/resume anytime after.</div>
@@ -2556,6 +2639,7 @@ function renderProfile(){
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
   document.getElementById('snipeBuyBtn')?.addEventListener('click', ()=> purchaseSnipeBot());
   document.getElementById('snipeToggleBtn')?.addEventListener('click', ()=> toggleSnipeBot());
+  document.getElementById('snipeStatsBtn')?.addEventListener('click', ()=> openSnipeStatsModal());
   document.getElementById('snipeAmountSaveBtn')?.addEventListener('click', ()=>{
     const v = parseFloat(document.getElementById('snipeAmountInput').value);
     updateSnipeAmount(v);
