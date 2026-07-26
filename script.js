@@ -382,7 +382,7 @@ function listenTickerTape(){
 /* ===================== ROUTER ===================== */
 function navigate(name, param=null){
   state.route = {name, param};
-  if(name!=='coin'){ stopViewerCount(); stopHolderCount(); }
+  if(name!=='coin'){ stopViewerCount(); stopHolderCount(); stopViewingMicroTick(); }
   if(name!=='home'){ if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub=null; } if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub=null; } }
   if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
@@ -908,6 +908,7 @@ function buildCoinDetailShell(coin){
   loadTopHolders(coin.id);
   startViewerCount(coin);
   startHolderCount(coin.id);
+  startViewingMicroTick(coin.id, coin);
   drawChart(coin, true);
   document.querySelectorAll('#rangeRow .range-btn').forEach(b=>{
     b.addEventListener('click', ()=>{ chartRange=b.dataset.range; document.querySelectorAll('#rangeRow .range-btn').forEach(x=>x.classList.remove('active')); b.classList.add('active'); drawChart(currentDetailCoin||coin, true); });
@@ -2170,6 +2171,39 @@ async function catchUpAllBotCoins(){
 // coin (normal, rugged, guaranteed-growth, risky): boosts the effective trade-chance roll and
 // shrinks the stagger delay, so a coin someone's actually paying attention to feels alive
 // instead of moving at the same pace as one nobody's looked at in hours.
+// The shared bot tick loops (even "hot"-boosted) still only fire every several seconds at best —
+// nowhere near frequent enough to fill a 1m/5m chart window with real up-down wiggling instead
+// of a mostly-flat line with the occasional jump. This is a separate, much faster loop scoped to
+// whatever ONE bot-driven coin is currently open on THIS tab's detail page — never touches
+// community coins at all (price there only ever moves from a real trade, which is the honest,
+// correct behavior; faking movement on someone's real launch would undermine that entirely).
+const VIEWING_MICRO_TICK_MS_MIN = 1400, VIEWING_MICRO_TICK_MS_MAX = 2400;
+let viewingMicroTickTimer = null, viewingMicroTickCoinId = null;
+function startViewingMicroTick(coinId, coin){
+  stopViewingMicroTick();
+  if(!coin?.isBotCoin || coin.ruggedAt) return; // never fake movement on community coins or already-rugged ones
+  viewingMicroTickCoinId = coinId;
+  const run = ()=>{
+    viewingCoinMicroTick(viewingMicroTickCoinId);
+    viewingMicroTickTimer = setTimeout(run, VIEWING_MICRO_TICK_MS_MIN + Math.random()*(VIEWING_MICRO_TICK_MS_MAX-VIEWING_MICRO_TICK_MS_MIN));
+  };
+  viewingMicroTickTimer = setTimeout(run, 1000);
+}
+function stopViewingMicroTick(){ if(viewingMicroTickTimer){ clearTimeout(viewingMicroTickTimer); viewingMicroTickTimer=null; } viewingMicroTickCoinId=null; }
+async function viewingCoinMicroTick(coinId){
+  try{
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const coin = state.coinsCache.get(coinId);
+    if(!coin || !coin.isBotCoin || coin.ruggedAt) return; // re-check — state may have changed since this was scheduled
+    // Small, frequent wiggles layered on top of whatever directional bias the coin already has —
+    // not meant to move price much per tick, just often enough that short timeframes look alive.
+    const usd = 4 + Math.random()*40;
+    const buyChance = coin.isRisky ? 0.5 : coin.guaranteedGrowth ? 0.85 : Math.min(0.9, Math.max(0.1, 0.5+botCoinTrendBias(coinId)*0.5));
+    if(Math.random() < buyChance) botBuyOnCoin(coinId, usd, false);
+    else botSellOnCoin(coinId, usd, false);
+  }catch(err){ /* non-critical */ }
+}
+
 const HOT_COIN_WINDOW_MS = 5*60*1000;
 function isCoinHot(coin){
   const now = Date.now();
