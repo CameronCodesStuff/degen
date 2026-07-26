@@ -79,6 +79,12 @@ function isPumpAdmin(){
   const uname = (state.userDoc && state.userDoc.username || '').toLowerCase();
   return email===PUMP_ADMIN_EMAIL && uname===PUMP_ADMIN_USERNAME;
 }
+// Same client-side-only gating pattern as isPumpAdmin — decides whether to SHOW the Insights
+// option, not a real access-control boundary (like everything else admin-flavored in this app).
+function canSeeInsights(){
+  const uname = (state.userDoc && state.userDoc.username || '').toLowerCase();
+  return isPumpAdmin() || uname==='j_frosty';
+}
 
 /* ===================== STATE ===================== */
 const state = {
@@ -374,6 +380,7 @@ function listenTickerTape(){
 function navigate(name, param=null){
   state.route = {name, param};
   if(name!=='coin'){ stopViewerCount(); stopHolderCount(); }
+  if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
   });
@@ -385,6 +392,7 @@ function navigate(name, param=null){
   else if(name==='coin') renderCoinDetail(param);
   else if(name==='user') renderUserProfile(param);
   else if(name==='activity') renderActivity();
+  else if(name==='insights') renderInsights();
   window.scrollTo(0,0);
 }
 
@@ -1621,7 +1629,6 @@ async function writeWhaleActivity(coinId, info){
 // coin noise above), so Explore → Bot Market always has a handful of live, chaotic charts to
 // practice reading — no waiting around for real people to launch and trade something.
 const BOT_COIN_POOL_CAP = 18;         // don't let the pool of bot coins grow unbounded
-const BOT_COIN_SPAWN_CHANCE = 0.05;   // rolled roughly once a minute (see spawnCheckCounter below)
 const BOT_COIN_TRADE_CHANCE = 0.35;   // per bot coin, per tick — was 0.75, cut hard to stay within Firestore rate limits
 const BOT_COIN_QUERY_LIMIT = 15;      // was 30 — fewer coins touched per tick
 // Rare, dramatic crash-and-delist event — mirrors how real memecoins actually behave, and gives
@@ -1742,12 +1749,12 @@ async function makeUniqueBotTicker(){
   return null; // give up quietly this round — next spawn check will try again
 }
 
-async function spawnBotCoin(forceSpawn=false){
+async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false){
   try{
-    const picked = await makeUniqueBotTicker();
+    const picked = preset || await makeUniqueBotTicker();
     if(!picked) return;
     const { name, ticker } = picked;
-    const { priceHistory, currentPrice, tradeCountSeed, recentTrades, totalSupply } = simulateBotCoinLaunch(forceSpawn);
+    const { priceHistory, currentPrice, tradeCountSeed, recentTrades, totalSupply } = simulateBotCoinLaunch(forceSpawn||isInsider);
     // Liquidity depth is chosen directly in dollar terms (same order of magnitude as a real
     // community coin's $8,000 depth) rather than derived from the fabricated price walk. Deriving
     // it from price meant a coin whose random walk happened to land low ended up with almost no
@@ -1768,16 +1775,20 @@ async function spawnBotCoin(forceSpawn=false){
       name, ticker,
       description: forceSpawn
         ? "Fully automated market. Word is this one's going to blow up — guaranteed to hit 10,000 holders within the hour."
+        : isInsider
+        ? "Fully automated market. Quietly seeded ahead of time — no rug risk, built to hold up for the long haul."
         : 'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
       imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
       price: currentPrice, marketCap: currentPrice*totalSupply,
       priceHistory, recentTrades, tradeCount: tradeCountSeed,
       // guaranteedGrowth is the single flag botCoinTick checks to skip rug-eligibility and swap
-      // in the heavily-bullish trade bias below; guaranteedHolderRampStart independently drives
-      // the simulated holder-count ramp (see refreshHolderCount) and the quiet→rapid-growth
-      // phase timing in botCoinTick.
-      ...(forceSpawn ? { guaranteedGrowth: true, guaranteedHolderRampStart: Date.now() } : {}),
+      // in the heavily-bullish trade bias below — shared by both the Right-Ctrl force-spawn and
+      // Insider Insights coins. guaranteedHolderRampStart independently drives the simulated
+      // holder-count ramp (see refreshHolderCount) and is specific to the force-spawn easter egg.
+      ...((forceSpawn||isInsider) ? { guaranteedGrowth: true } : {}),
+      ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
+      ...(isInsider ? { isInsider: true } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     };
     await setDoc(coinRef, coinData);
@@ -1814,8 +1825,64 @@ async function maybeSpawnBotCoin(){
       for(let i=0;i<toSpawn;i++) spawnBotCoin();
       return;
     }
-    if(Math.random() < BOT_COIN_SPAWN_CHANCE) spawnBotCoin();
+    // Guaranteed bounded cadence (5–60 min) instead of a flat per-check probability, which had an
+    // unbounded tail — technically possible (if unlikely) to go a very long time with no new
+    // spawn at all. A persisted "next spawn at" timestamp guarantees a new coin lands somewhere
+    // in that window every time, while still feeling random since the exact minute within the
+    // window is picked fresh each time.
+    const scheduleRef = doc(db,'meta','botSpawnSchedule');
+    const scheduleSnap = await getDoc(scheduleRef);
+    const now = Date.now();
+    const nextAt = scheduleSnap.exists() ? toMillisLoose(scheduleSnap.data().nextSpawnAt) : 0;
+    if(now >= nextAt){
+      spawnBotCoin();
+      const delay = (5+Math.random()*55)*60000; // 5–60 minutes out
+      await setDoc(scheduleRef, { nextSpawnAt: now+delay });
+    }
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+}
+
+// Insider Insights: a small number of upcoming bot coins are decided in advance (name/ticker +
+// exact spawn time) and stashed in a shared doc, rather than being generated at spawn time like
+// every other bot coin — that's what makes it possible to "leak" one ahead of its public launch
+// to whoever can see the Insights page. Capped at INSIDER_DAILY_CAP per calendar day. Runs off
+// the same once-a-minute throttle as maybeSpawnBotCoin (both piggyback on botCoinTick).
+const INSIDER_DAILY_CAP = 3;
+let insiderCheckCounter = 0;
+async function checkInsiderSchedule(){
+  insiderCheckCounter++;
+  if(insiderCheckCounter!==1 && insiderCheckCounter%4!==0) return; // otherwise only check roughly once a minute
+  try{
+    const ref = doc(db,'meta','insiderSchedule');
+    const snap = await getDoc(ref);
+    const today = new Date().toISOString().slice(0,10);
+    let data = snap.exists() ? snap.data() : {};
+    if(data.dayKey !== today) data = { dayKey: today, spawnedToday: 0 };
+    const now = Date.now();
+
+    // Time to actually reveal-and-spawn the one that was scheduled?
+    if(data.nextCoinTicker && data.nextSpawnAt && now >= toMillisLoose(data.nextSpawnAt)){
+      const preset = { name: data.nextCoinName, ticker: data.nextCoinTicker };
+      // Clear the schedule FIRST (best-effort claim) so another tab checking at nearly the same
+      // instant won't also try to spawn the same preset coin.
+      await setDoc(ref, { dayKey: data.dayKey, spawnedToday: data.spawnedToday, nextSpawnAt: null, nextCoinName: null, nextCoinTicker: null });
+      await spawnBotCoin(false, preset, true);
+      data = { dayKey: data.dayKey, spawnedToday: (data.spawnedToday||0)+1 };
+      await setDoc(ref, data);
+    }
+
+    // Schedule the next one if there isn't one queued and we're still under the daily cap.
+    if(!data.nextCoinTicker && (data.spawnedToday||0) < INSIDER_DAILY_CAP){
+      const picked = await makeUniqueBotTicker();
+      if(picked){
+        const delay = (20+Math.random()*220)*60000; // 20 min – 4 hours out
+        await setDoc(ref, {
+          dayKey: data.dayKey, spawnedToday: data.spawnedToday||0,
+          nextCoinName: picked.name, nextCoinTicker: picked.ticker, nextSpawnAt: now+delay
+        });
+      }
+    }
+  }catch(err){ /* ignore — e.g. missing index while Firestore builds one, or a rare scheduling race */ }
 }
 
 // This is a static site with no server — literally nothing can move while zero browser tabs are
@@ -1955,6 +2022,7 @@ async function botCoinTick(){
     });
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
   maybeSpawnBotCoin();
+  checkInsiderSchedule();
 }
 
 async function ruggedCoinEvent(coinId){
@@ -2070,8 +2138,10 @@ function renderCreate(){
       <div class="fee-note"><span>Launch fee</span><b>${fmtUsd(CREATE_FEE)}</b></div>
       <button class="btn btn-primary btn-block" id="createSubmit">🚀 Launch Coin</button>
       <div style="text-align:center;color:var(--txt-faint);font-size:12px;margin-top:14px;">Starts at a $${INITIAL_SOL_RESERVE} market cap with a live bonding curve. No bots — price only moves when real users trade.</div>
+      ${canSeeInsights()? `<div id="insightsLink" style="text-align:center;margin-top:18px;"><a style="color:var(--violet);font-size:12.5px;cursor:pointer;text-decoration:underline;">🔮 Insider Insights</a></div>` : ''}
     </div>
   `;
+  document.getElementById('insightsLink')?.addEventListener('click', ()=> navigate('insights'));
   const urlInput = document.getElementById('cImgUrl');
   const preview = document.getElementById('createImgPreview');
   urlInput.addEventListener('input', ()=>{
@@ -2079,6 +2149,56 @@ function renderCreate(){
     preview.innerHTML = v ? `<img src="${esc(v)}" onerror="this.parentElement.innerHTML='<span class=&quot;plus&quot;>⚠️</span>'">` : `<span class="plus">🖼️</span>`;
   });
   document.getElementById('createSubmit').addEventListener('click', submitCreateCoin);
+}
+
+let insightsUnsub = null, insightsCountdownInterval = null, insightsTargetMs = null;
+function stopInsightsCountdown(){ if(insightsCountdownInterval){ clearInterval(insightsCountdownInterval); insightsCountdownInterval=null; } }
+function updateInsightsCountdownText(){
+  const el = document.getElementById('insightsCountdown');
+  if(!el || !insightsTargetMs) return;
+  const remaining = insightsTargetMs - Date.now();
+  if(remaining<=0){ el.textContent = 'Launching…'; return; }
+  const h = Math.floor(remaining/3600000);
+  const m = Math.floor((remaining%3600000)/60000);
+  const s = Math.floor((remaining%60000)/1000);
+  el.textContent = `${h>0?h+':':''}${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+async function renderInsights(){
+  const view = document.getElementById('view');
+  if(!canSeeInsights()){ view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div>Nothing to see here.</div>`; return; }
+  view.innerHTML = `
+    <div class="section-title">🔮 Insider Insights</div>
+    <div class="panel">
+      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.5;margin-bottom:14px;">A small number of upcoming Bot Market coins are decided ahead of time. Once one launches, it's guaranteed never to get rugged and built to hold up for the long haul — still a real, fully tradeable coin like any other, just with a head start on knowing it's coming.</div>
+      <div id="insightsBody"><div class="spinner" style="margin:10px 0;"></div></div>
+    </div>
+  `;
+  if(insightsUnsub) insightsUnsub();
+  insightsUnsub = onSnapshot(doc(db,'meta','insiderSchedule'), snap=>{
+    const data = snap.exists() ? snap.data() : {};
+    const today = new Date().toISOString().slice(0,10);
+    const spawnedToday = data.dayKey===today ? (data.spawnedToday||0) : 0;
+    const body = document.getElementById('insightsBody');
+    if(!body) return;
+    if(data.nextCoinTicker && data.nextSpawnAt){
+      insightsTargetMs = toMillisLoose(data.nextSpawnAt);
+      body.innerHTML = `
+        <div style="text-align:center;padding:10px 0;">
+          <div style="font-size:12px;color:var(--txt-faint);">NEXT INSIDER COIN</div>
+          <div style="font-size:22px;font-weight:700;margin:6px 0;">${esc(data.nextCoinName)} · $${esc(data.nextCoinTicker)}</div>
+          <div class="mono" id="insightsCountdown" style="font-size:28px;font-weight:700;color:var(--lime);margin:10px 0;">--:--:--</div>
+          <div style="font-size:11.5px;color:var(--txt-faint);">${spawnedToday}/${INSIDER_DAILY_CAP} revealed today</div>
+        </div>`;
+      stopInsightsCountdown();
+      updateInsightsCountdownText();
+      insightsCountdownInterval = setInterval(updateInsightsCountdownText, 1000);
+    } else {
+      insightsTargetMs = null;
+      stopInsightsCountdown();
+      body.innerHTML = `<div class="empty" style="padding:20px;">${spawnedToday>=INSIDER_DAILY_CAP ? `That's all ${INSIDER_DAILY_CAP} for today — check back tomorrow.` : 'Nothing scheduled right this second — check back in a bit.'}</div>`;
+    }
+  }, ()=>{ const body = document.getElementById('insightsBody'); if(body) body.innerHTML = `<div class="empty">Couldn't load — needs the meta/insiderSchedule Firestore rule (see SETUP.md).</div>`; });
+  state.unsubs.push(insightsUnsub);
 }
 
 async function submitCreateCoin(){

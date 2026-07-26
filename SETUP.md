@@ -104,6 +104,19 @@ service cloud.firestore {
       allow update: if false;
       allow delete: if isAdmin(); // wiping the global feed is part of a full economy reset
     }
+
+    match /meta/{docId} {
+      // Small shared docs used by client-side bot scheduling: botSpawnSchedule (next guaranteed
+      // ambient Bot Market spawn time) and insiderSchedule (the Insider Insights feature's
+      // upcoming-coin reveal + countdown). Same trust model as everything else bot-related in
+      // this app — any signed-in tab's bot loop can read/write these, not just the admin. The
+      // Insights *page* itself is still gated client-side to specific accounts (see
+      // canSeeInsights() in script.js) — like the other admin-flavored features, that's a UI
+      // gate, not a real access-control boundary, and this doc being broadly readable doesn't
+      // change that (there's nothing sensitive in it beyond a coin name arriving a bit early).
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
   }
 }
 ```
@@ -186,6 +199,18 @@ A force-spawned coin gets a whole set of guarantees, all driven by one `guarante
 Shown everywhere with a distinct 🚀 GUARANTEED GROWTH badge (lime, separate from the normal 🤖 BOT badge) so it's never ambiguous which coins these are.
 
 **If you have an active auto-snipe bot, it now buys into a force-spawned coin immediately and directly** — the Right Ctrl handler calls the snipe logic itself the moment the coin is created, rather than only relying on the snipe listener to notice it asynchronously through Firestore. The listener (see the reliability fix below) still independently catches it too, in case the direct call ever fails for some reason — a small in-flight guard (`snipeAttempted`) stops the two paths from double-buying the same coin.
+
+### Insider Insights (hidden page)
+A hidden "🔮 Insider Insights" link appears at the bottom of the Launch page, only for the gated admin account or a specific username (`J_Frosty`, case-insensitive) — checked via `canSeeInsights()`, same client-side-gate pattern as the admin's other tricks (a UI gate, not real access control; the underlying `meta/insiderSchedule` doc is readable by any signed-in user, same trust model as the rest of the bot scheduling).
+
+What it does: a small number of upcoming Bot Market coins (capped at `INSIDER_DAILY_CAP = 3` per calendar day) are decided *in advance* — name, ticker, and exact spawn time — and stashed in `meta/insiderSchedule` instead of being generated at spawn time like every other bot coin. The Insights page shows that upcoming coin's name/ticker and a live countdown to launch. Once the countdown hits zero, the next `botCoinTick` pass (same once-a-minute throttle as the ambient spawner) actually creates it using the exact identity that was revealed — then, if still under the daily cap, immediately schedules the next slot 20 minutes–4 hours out.
+
+Every insider-revealed coin is created with `guaranteedGrowth: true` — the same flag the Right-Ctrl force-spawn uses — so it can never be rugged and trades on the same heavily-bullish bias (see the force-spawn section above for exactly how that works). It does *not* get the Right-Ctrl-specific holder-count ramp or the fresh-$10k-then-2-minutes-quiet spawn behavior — those stay specific to that easter egg; an insider coin just spawns as a normal established bot coin, permanently rug-proof and bullish-biased from the moment it appears. Tagged `isInsider: true` on the coin doc if you want to distinguish it further later (not currently surfaced as a separate badge — it shares the same underlying mechanism as force-spawned coins).
+
+There's a small, accepted race risk worth knowing about: the scheduling reads/writes aren't wrapped in a Firestore transaction (the ticker-uniqueness check inside `makeUniqueBotTicker()` can't cleanly run inside one), so if two tabs both check at nearly the same instant, it's possible — rare — for a scheduled reveal to get overwritten by a second tab's own random pick right before it fires, or (very rarely) for the same preset coin to attempt spawning twice. Given this is a small friends app and the failure mode is "an insider coin's name flickers once" rather than anything actually breaking, this wasn't worth the complexity of proper transactional locking.
+
+### Guaranteed ambient Bot Market spawn cadence
+The ambient (non-insider) Bot Market spawner used to be a flat 5%-per-minute-check probability, which technically had an unbounded tail — if unlucky, it was possible (if unlikely) to go a very long stretch with no new coin at all. Replaced with a persisted `meta/botSpawnSchedule` doc holding a `nextSpawnAt` timestamp: every check, if `now >= nextSpawnAt`, a coin spawns immediately and the next slot is scheduled 5–60 minutes out (randomized fresh each time). This guarantees a new ambient coin lands somewhere in that window every time, while still feeling random since the exact minute is different each cycle. The empty-pool bootstrap (spawn 5 immediately if the Bot Market has never had anything in it) is unchanged.
 
 ### Auto-snipe reliability fix
 The snipe listener used to watch a small fixed window (the 5 most recent coins) and treat every newly-'added' document in that window as something to snipe. That missed coins whenever more than a handful were created close together — e.g. the 5-coin Bot Market bootstrap spawn, or a few Right Ctrl presses in a row — since Firestore doesn't guarantee one delivered event per document in that scenario, only a correct final state. Replaced with a timestamp-cursor approach: the listener records the exact instant it started watching, queries a much larger window (50) purely as a safety cap, and reacts to any coin whose actual `createdAt` is after that cursor — which works correctly no matter how many coins arrive in the same snapshot batch or how Firestore chunks delivery.
