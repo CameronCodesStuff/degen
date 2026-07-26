@@ -439,7 +439,7 @@ document.addEventListener('click', (e)=>{
 function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
-  const botCount = 10 + Math.floor(Math.random()*41); // 10-50
+  const botCount = 100 + Math.floor(Math.random()*51); // guaranteed at least 100, up to 150
   const durationMs = 10000;
   // Written to the coin doc itself (not local JS state) so it survives a hard refresh and is
   // visible to every client checking this coin, not just the tab that triggered the pump.
@@ -452,7 +452,43 @@ function triggerPump(coinId){
       botBuyOnCoin(coinId, usd, usd>800);
     }, delay);
   }
+  // Guarantee, regardless of how far underwater the coin currently is: once every random bot buy
+  // above has had a chance to land, top it up with one final buy sized to reach exactly +100%
+  // from the coin's own reference point (same one pctChange()/Gainers-Losers uses) — not just
+  // "a strong pump," an actual mathematical guarantee it clears +100% by the end.
+  setTimeout(()=> guaranteePumpToPositive100(coinId), durationMs+800);
   setTimeout(()=> activePumps.delete(coinId), durationMs+3000);
+}
+
+// Solves the constant-product AMM directly for the USD buy needed to reach a target price, then
+// executes it as one closing trade. price = solReserve/tokenReserve; buying dUSD raises
+// solReserve by dUSD and (via the k=solReserve*tokenReserve invariant) raises price to
+// (solReserve+dUSD)^2/k — so dUSD = sqrt(targetPrice*k) - solReserve solves for exactly that.
+async function guaranteePumpToPositive100(coinId){
+  try{
+    let whaleInfo = null;
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const coin = snap.data();
+      const hist = coin.priceHistory||[];
+      if(!hist.length || !(hist[0].p>0)) return;
+      const targetPrice = hist[0].p*2; // +100% from the same anchor pctChange() reads
+      if(priceOf(coin) >= targetPrice) return; // the random bot buys already cleared it on their own
+      const k = coin.solReserve*coin.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
+      if(!(dUSD>0)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
+      if(!(tokensOut>0)) return;
+      const botName = randBotName();
+      const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-14);
+      tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:h2, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
+      if(dUSD>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount:dUSD, type:'buy' };
+    });
+    if(whaleInfo) await writeWhaleActivity(coinId, whaleInfo);
+  }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
 /* ===================== ADMIN "RESET ECONOMY" CONTROL ===================== */
