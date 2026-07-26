@@ -653,6 +653,8 @@ function renderHome(){
 
 function loadHomeCoins(){
   if(homeUnsub) homeUnsub();
+  if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub = null; }
+  if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub = null; }
   const sortField = homeSort==='cap'?'marketCap':'createdAt';
   const sortDir = homeSort==='oldest'?'asc':'desc';
   // Bot Market is a server-side filter (needs a composite index — see SETUP.md); Community stays
@@ -700,6 +702,7 @@ function sparklineSvg(history, up){
 // coin card, just with a single-element array and its own badge (see the ⚠️ RISKY badge logic).
 let riskyScheduleUnsub = null, riskyCoinUnsub = null;
 function loadRiskyCoin(){
+  if(homeUnsub){ homeUnsub(); homeUnsub = null; }
   if(riskyScheduleUnsub) riskyScheduleUnsub();
   if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub = null; }
   const grid = document.getElementById('coinGrid');
@@ -1139,6 +1142,7 @@ function openSendCoinModal(coin){
     </div>`;
   document.body.appendChild(overlay);
   overlay.addEventListener('click', e=>{ if(e.target===overlay) overlay.remove(); });
+  attachUserAutocomplete(document.getElementById('sendCoinUser'));
   document.getElementById('sendCoinCancelBtn').addEventListener('click', ()=> overlay.remove());
   document.getElementById('sendCoinMaxBtn').addEventListener('click', ()=>{ document.getElementById('sendCoinAmount').value = holding; });
   document.getElementById('sendCoinConfirmBtn').addEventListener('click', async ()=>{
@@ -1686,7 +1690,7 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
 // this treats the "sell" purely as curve math (same constant-product formula ammSell uses for
 // real users) — it just pushes price back down instead of up. Without this, bot activity only
 // ever ratchets price upward, which reads as fake; real memecoin charts pump AND dump.
-async function botSellOnCoin(coinId, usdAmount, isDump){
+async function botSellOnCoin(coinId, usdAmount, isDump, maxSellFrac=0.05){
   try{
     let whaleInfo = null;
     await runTransaction(db, async (tx)=>{
@@ -1697,7 +1701,7 @@ async function botSellOnCoin(coinId, usdAmount, isDump){
       const price = priceOf(coin);
       if(!(price>0)) return;
       let tokenAmount = usdAmount/price;
-      const maxSellable = coin.tokenReserve*0.05; // cap so one dump can't crater the curve to near-zero
+      const maxSellable = coin.tokenReserve*maxSellFrac; // cap so one dump can't crater the curve to near-zero
       if(tokenAmount > maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) return;
@@ -1750,6 +1754,7 @@ const RISKY_MIN_SWING = 800;
 const RISKY_MAX_SWING = 15000;       // bigger than even Bot Market's normal whale range
 const RISKY_RUG_CHANCE = 0.012;      // ~8x the normal bot-coin rug chance
 const RISKY_RUG_MIN_AGE_MS = 5*60*1000; // short grace period so it can't rug the instant it's picked
+const RISKY_MEGA_CHANCE = 0.4; // 40% of trades are genuinely violent, sized off the coin's own reserve
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -2033,14 +2038,23 @@ async function riskyCoinTick(){
     const ageMs = Date.now()-toMillisLoose(coin.createdAt);
     if(ageMs>RISKY_RUG_MIN_AGE_MS && Math.random()<RISKY_RUG_CHANCE){ ruggedCoinEvent(coinId); return; }
     if(Math.random() >= RISKY_TRADE_CHANCE) return;
-    const usd = RISKY_MIN_SWING + Math.random()*(RISKY_MAX_SWING-RISKY_MIN_SWING);
+    // A flat dollar range can sometimes land as a fairly mild move depending on how deep this
+    // particular coin's liquidity happens to be. "Unhinged" means guaranteeing real violence a
+    // good chunk of the time — mega mode sizes the trade as a large fraction of the coin's OWN
+    // current reserve instead, which forces a genuinely dramatic bottom-to-top (or top-to-bottom)
+    // swing regardless of depth. Sell-side mega moves also need the normal 5%-of-supply safety
+    // cap relaxed, or they'd get clamped down to something tame.
+    const isMega = Math.random() < RISKY_MEGA_CHANCE;
+    const usd = isMega
+      ? coin.solReserve * (0.6+Math.random()*1.4) // 60%–200% of current liquidity — genuinely violent
+      : RISKY_MIN_SWING + Math.random()*(RISKY_MAX_SWING-RISKY_MIN_SWING);
     // Deliberately a flat 50/50 coin-flip, no trend bias at all — that's what makes it "extremely
     // unpredictable" rather than just volatile-but-still-biased like guaranteedGrowth or the
     // normal Bot Market trend logic.
     setTimeout(()=>{
       if(coinsWithPendingUserTrade.has(coinId)) return;
       if(Math.random()<0.5) botBuyOnCoin(coinId, usd, true);
-      else if(pumpAllowsSell(coin)) botSellOnCoin(coinId, usd, true);
+      else if(pumpAllowsSell(coin)) botSellOnCoin(coinId, usd, true, isMega?0.35:0.05);
     }, Math.random()*7000);
   }catch(err){ /* non-critical */ }
 }
@@ -2463,6 +2477,7 @@ function renderBank(){
   document.getElementById('bankSendBtn').addEventListener('click', ()=>{
     sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
   });
+  attachUserAutocomplete(document.getElementById('bankSendUser'));
 }
 
 /* ===================== PORTFOLIO ===================== */
@@ -3210,6 +3225,43 @@ function renderLeaderboard(){
 // Prefix search on usernameLower (already stored on every user doc for signup uniqueness checks).
 // A true fuzzy/substring search isn't practical with Firestore's query model, but prefix search
 // covers "jump straight to someone's profile by username" well enough for a friends-scale app.
+// Reusable "type to find a user" autocomplete for recipient inputs (bank send, coin send, copy
+// trade). Same prefix-search approach as the Leaderboard's user search, just rendered as a
+// small dropdown under whichever input it's attached to instead of a full results panel.
+function attachUserAutocomplete(inputEl){
+  if(!inputEl || inputEl.dataset.autocompleteAttached) return;
+  inputEl.dataset.autocompleteAttached = '1';
+  const parent = inputEl.parentElement;
+  parent.style.position = 'relative';
+  const dropdown = document.createElement('div');
+  dropdown.className = 'user-autocomplete-dropdown';
+  parent.appendChild(dropdown);
+  let debounceTimer = null;
+  function hide(){ dropdown.style.display='none'; dropdown.innerHTML=''; }
+  inputEl.addEventListener('input', ()=>{
+    clearTimeout(debounceTimer);
+    const term = inputEl.value.trim().toLowerCase().replace(/^@/,'');
+    if(!term){ hide(); return; }
+    debounceTimer = setTimeout(async ()=>{
+      try{
+        const snap = await getDocs(query(collection(db,'users'), orderBy('usernameLower'), where('usernameLower','>=',term), where('usernameLower','<',term+'\uf8ff'), limit(6)));
+        const results = snap.docs.map(d=>d.data()).filter(u=>u.username);
+        if(!results.length){ hide(); return; }
+        dropdown.style.display = 'block';
+        dropdown.innerHTML = results.map(u=>`
+          <div class="user-autocomplete-item" data-username="${esc(u.username)}">
+            <img src="${avatarFor(u.username,u.avatarURL)}">
+            <span>@${esc(u.username)}</span>
+          </div>`).join('');
+        dropdown.querySelectorAll('[data-username]').forEach(item=>{
+          item.addEventListener('mousedown', (e)=>{ e.preventDefault(); inputEl.value = item.dataset.username; hide(); });
+        });
+      }catch(err){ hide(); }
+    }, 200);
+  });
+  inputEl.addEventListener('blur', ()=> setTimeout(hide, 120)); // small delay so the click above still lands
+}
+
 async function runUserSearch(term){
   const box = document.getElementById('userSearchResults');
   if(!box) return;
@@ -3618,6 +3670,7 @@ function renderProfile(){
   document.getElementById('copyTargetAddBtn')?.addEventListener('click', ()=>{
     addCopyTarget(document.getElementById('copyTargetUser').value, parseFloat(document.getElementById('copyTargetAmount').value));
   });
+  if(document.getElementById('copyTargetUser')) attachUserAutocomplete(document.getElementById('copyTargetUser'));
   document.querySelectorAll('[data-remove-target]').forEach(btn=>{
     btn.addEventListener('click', ()=> removeCopyTarget(btn.dataset.removeTarget));
   });
