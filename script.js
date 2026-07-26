@@ -439,12 +439,16 @@ document.addEventListener('click', (e)=>{
 function triggerPump(coinId){
   if(activePumps.has(coinId)){ toast('Already pumping that one — let it finish.', 'err'); return; }
   activePumps.add(coinId);
-  const botCount = 100 + Math.floor(Math.random()*51); // guaranteed at least 100, up to 150
+  const botCount = 150 + Math.floor(Math.random()*101); // 150-250 real, individually-staggered buys
   const durationMs = 10000;
   // Written to the coin doc itself (not local JS state) so it survives a hard refresh and is
   // visible to every client checking this coin, not just the tab that triggered the pump.
   updateDoc(doc(db,'coins',coinId), { pumpSellSuppressUntil: Date.now()+5*60*1000 }).catch(()=>{});
-  toast(`🚀 Pump activated — ${botCount} bots aping in over the next 10 seconds (no bot sells on this coin for 5 min)`, 'ok');
+  toast(`🚀🌕 Pump activated — 1000+ bots aping in, rocketing straight to the moon!`, 'ok');
+  // Fires immediately, not staggered — this is the "instantly...to the moon" part. See
+  // instantMoonBoost() for why this represents "1000+ bots" without literally writing 1000+
+  // separate documents in a 10-second window.
+  instantMoonBoost(coinId);
   for(let i=0;i<botCount;i++){
     const delay = Math.random()*durationMs;
     setTimeout(()=>{
@@ -454,10 +458,47 @@ function triggerPump(coinId){
   }
   // Guarantee, regardless of how far underwater the coin currently is: once every random bot buy
   // above has had a chance to land, top it up with one final buy sized to reach exactly +100%
-  // from the coin's own reference point (same one pctChange()/Gainers-Losers uses) — not just
-  // "a strong pump," an actual mathematical guarantee it clears +100% by the end.
+  // from the coin's own reference point (same one pctChange()/Gainers-Losers uses) — kept as a
+  // safety net under the much bigger instant moon-boost above, in case that one somehow fails.
   setTimeout(()=> guaranteePumpToPositive100(coinId), durationMs+800);
   setTimeout(()=> activePumps.delete(coinId), durationMs+3000);
+}
+
+// "Make over 1000 bots buy in and instantly boost it to the moon" — literally firing 1000+
+// separate Firestore transactions in a burst would risk the exact rate-limit problem this app
+// already hit once before from far smaller volume (see the fix noted elsewhere in this file).
+// Instead: one immediate transaction that (a) solves the AMM directly for a genuinely massive
+// price jump — +700% to +1400% from the coin's own reference point, not just +100% — and (b)
+// adds a large tradeCount jump (3,000-8,000) standing in for that claimed scale of bot activity,
+// honestly, rather than pretending 1000+ individual trades actually happened one by one. The 150-
+// 250 real staggered buys already firing alongside this are genuine individual trades/writes;
+// this is what represents the rest of "1000+" without the write-volume risk.
+async function instantMoonBoost(coinId){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const coin = snap.data();
+      const hist = coin.priceHistory||[];
+      const anchor = (hist.length && hist[0].p>0) ? hist[0].p : priceOf(coin);
+      const currentPrice = priceOf(coin);
+      const targetPrice = Math.max(anchor, currentPrice) * (8+Math.random()*7); // +700% to +1400%
+      const k = coin.solReserve*coin.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
+      if(!(dUSD>0)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
+      if(!(tokensOut>0)) return;
+      const botName = randBotName();
+      const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
+      const tradeCountBoost = 3000+Math.floor(Math.random()*5000);
+      tx.update(coinRef, {
+        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin),
+        priceHistory:h2, recentTrades:trades, tradeCount:(coin.tradeCount||0)+tradeCountBoost, lastTickAt:Date.now()
+      });
+    });
+  }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
 }
 
 // Solves the constant-product AMM directly for the USD buy needed to reach a target price, then
@@ -483,7 +524,7 @@ async function guaranteePumpToPositive100(coinId){
       if(!(tokensOut>0)) return;
       const botName = randBotName();
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:h2, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       if(dUSD>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount:dUSD, type:'buy' };
     });
@@ -1448,6 +1489,25 @@ function drawNetWorthChart(canvasId, history){
 // everything else normally; this only pauses the one coin actively mid-transaction.
 const coinsWithPendingUserTrade = new Set();
 
+// Shows the trader's own avatar popping onto the chart, then resolves once it's actually been
+// visible for a moment — callers await this BEFORE running the real trade, so the profile shows
+// up first and the chart's price jump visibly happens after, not simultaneously with it. Only
+// does anything if this coin's own detail page (with its chart) is what's currently on screen;
+// resolves immediately otherwise so a buy/sell from Portfolio or a snipe/bot trade isn't delayed
+// waiting on an animation nobody would see.
+function previewTradeAvatar(coinId, type){
+  return new Promise(resolve=>{
+    if(state.route.name!=='coin' || state.route.param!==coinId){ resolve(); return; }
+    const wrap = document.querySelector('.chart-wrap');
+    if(!wrap){ resolve(); return; }
+    const img = document.createElement('img');
+    img.className = 'trade-avatar-preview '+(type==='buy'?'buy':'sell');
+    img.src = avatarFor(state.userDoc?.username, state.userDoc?.avatarURL);
+    wrap.appendChild(img);
+    setTimeout(()=>{ img.remove(); resolve(); }, 450);
+  });
+}
+
 async function doBuy(coinId, usdAmount, viaSnipe=false){
   if(!usdAmount || usdAmount<=0){ toast('Enter an amount to buy.', 'err'); return; }
   if(!state.userDoc){ toast("Still loading your account — try again in a second.", 'err'); return; }
@@ -1456,6 +1516,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
   if(btn){ btn.disabled=true; btn.textContent='Buying…'; }
   coinsWithPendingUserTrade.add(coinId);
   try{
+    await previewTradeAvatar(coinId, 'buy');
     const result = await runTransaction(db, async (tx)=>{
       const userRef = doc(db,'users',state.uid);
       const coinRef = doc(db,'coins',coinId);
@@ -1491,7 +1552,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
 
       if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
       tx.update(userRef, { balance: user.balance - finalUsd });
       // costBasis/totalBoughtUsd/realizedPnl power the open/closed positions shown on a profile.
@@ -1538,6 +1599,7 @@ async function doSell(coinId, tokenAmount){
   if(btn){ btn.disabled=true; btn.textContent='Selling…'; }
   coinsWithPendingUserTrade.add(coinId);
   try{
+    await previewTradeAvatar(coinId, 'sell');
     const result = await runTransaction(db, async (tx)=>{
       const userRef = doc(db,'users',state.uid);
       const coinRef = doc(db,'coins',coinId);
@@ -1558,7 +1620,7 @@ async function doSell(coinId, tokenAmount){
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
       if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
       tx.update(userRef, { balance: user.balance + usdOut });
       // Peel off this sell's proportional share of cost basis to get realized P&L for the trade,
@@ -1721,7 +1783,7 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       if(!(tokensOut>0)) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       if(usdAmount>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount, type:'buy' };
     });
@@ -1750,7 +1812,7 @@ async function botSellOnCoin(coinId, usdAmount, isDump, maxSellFrac=0.05){
       if(!(usdOut>0)) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-14);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now() });
       if(usdOut>=WHALE_THRESHOLD) whaleInfo = { username:botName, ticker:coin.ticker, coinName:coin.name, coinImage:coin.imageURL||'', usdAmount:usdOut, type:'sell' };
     });
@@ -1814,9 +1876,9 @@ function botCoinTrendBias(coinId, atMs){
 }
 function botCoinTradeSize(){
   const r = Math.random();
-  if(r<0.16) return 1200+Math.random()*6800;  // whale-sized swing — big, real volatility spikes
-  if(r<0.50) return 150+Math.random()*650;    // medium
-  return 10+Math.random()*120;                 // typical small/medium
+  if(r<0.40) return 1500+Math.random()*9000;  // whale-sized swing — now much more common, not a rare spike
+  if(r<0.78) return 400+Math.random()*1400;   // medium-large — still a real, visible move
+  return 100+Math.random()*350;                // smallest tier is still meaningful, no more tiny wobbles
 }
 
 // Fabricates a plausible "this coin has been live for hours" backstory at spawn time: a wobbly
@@ -2149,7 +2211,7 @@ async function catchUpBotCoin(coinId, coin){
       }
     }
   }
-  hist = hist.slice(-110); trades = trades.slice(-14);
+  hist = hist.slice(-110); trades = trades.slice(-110);
   const newPrice = solReserve/tokenReserve;
   try{
     await updateDoc(doc(db,'coins',coinId), {
@@ -2244,12 +2306,12 @@ async function botCoinTick(){
         if(Math.random() >= (hot?0.97:0.9)) return; // rapid-growth phase: very high trade chance
         const usd = botCoinTradeSize()*2.2; // bigger than normal for a dramatic climb
         const big = true;
-        const smallDip = Math.random() < 0.1; // occasional small drop, never a real reversal
-        const buyChance = smallDip ? 0.3 : 0.94;
+        const realDip = Math.random() < 0.28; // frequent, genuinely visible drops — not just a shallower buy
+        const buyChance = realDip ? 0.15 : 0.92;
         setTimeout(()=>{
           if(coinsWithPendingUserTrade.has(d.id)) return;
           if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, Math.min(usd, usd*0.3), false); // dips are shallow, not crashes
+          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd*(0.8+Math.random()*0.6), false); // real drop, not shallow — the overall bullish bias still wins out over time
         }, hotStagger(Math.random()*18000));
         return;
       }
@@ -2311,7 +2373,7 @@ async function ruggedCoinEvent(coinId){
       const newSol = c.solReserve*crashFactor;
       const newPrice = newSol/c.tokenReserve;
       const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-14);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-110);
       tx.update(coinRef, {
         solReserve:newSol, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
         priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1,
