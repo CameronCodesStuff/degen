@@ -483,8 +483,13 @@ document.addEventListener('keydown', (e)=>{
   if(rightCtrlDown) return;
   rightCtrlDown = true;
   if(!isPumpAdmin()) return;
-  spawnBotCoin(true);
   toast('🤖 Force-spawned a new bot coin — guaranteed 10k+ holders within the hour!', 'ok');
+  spawnBotCoin(true).then(coin=>{
+    // Snipe it directly and immediately, rather than waiting on the listener's round-trip
+    // through Firestore — guarantees it fires right away for the coin you just force-spawned,
+    // instead of depending on snapshot delivery timing.
+    if(coin) trySnipeBuy(coin.id, coin);
+  });
 });
 document.addEventListener('keyup', (e)=>{
   if(e.code!=='ControlRight') return;
@@ -1624,6 +1629,7 @@ const BOT_COIN_QUERY_LIMIT = 15;      // was 30 — fewer coins touched per tick
 const BOT_COIN_RUG_CHANCE = 0.0015;
 const BOT_COIN_RUG_MIN_AGE_MS = 15*60*1000; // too unfair to rug something seconds after it's born
 const RUGGED_RECOVERY_CHANCE = 0.06; // fixed low buy-chance for a rugged coin, replacing the normal trend-bias split
+const GUARANTEED_GROWTH_QUIET_MS = 2*60*1000; // Right-Ctrl coins sit ~flat for 2 min before the rapid-growth phase kicks in
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -1658,16 +1664,30 @@ const BOT_COIN_SUPPLY_CHOICES = [100_000, 500_000, 1_000_000, 5_000_000, 10_000_
 
 function simulateBotCoinLaunch(guaranteedGrowth=false){
   const totalSupply = BOT_COIN_SUPPLY_CHOICES[Math.floor(Math.random()*BOT_COIN_SUPPLY_CHOICES.length)];
+  const now = Date.now();
+
+  // Guaranteed-growth (Right Ctrl) coins always spawn genuinely fresh — 0 trades, a single flat
+  // price point, exactly $10,000 market cap, nothing fabricated. The "rapid growth" is a real,
+  // visible thing that happens afterward (see botCoinTick's guaranteedGrowth phase logic), not a
+  // fake backstory pretending it already happened.
+  if(guaranteedGrowth){
+    const initPrice = 10000/totalSupply;
+    return {
+      priceHistory: [{p:initPrice, t:now}],
+      currentPrice: initPrice,
+      tradeCountSeed: 0,
+      recentTrades: [],
+      totalSupply
+    };
+  }
+
   const startMcap = 2000+Math.random()*78000; // wide spread — some tiny, some near graduation-scale
   const initPrice = startMcap/totalSupply;
-  const now = Date.now();
 
   // ~30% of spawns are genuinely brand new — zero trades, flat single-point history, nothing
   // fabricated — instead of every single coin arriving with a fake multi-hour backstory. Gives
   // Explore a real mix: some coins you're seeing at literally trade #0, others already established.
-  // Guaranteed-growth (Right Ctrl) coins always skip this — "thousands of trades" is part of the
-  // guarantee, so they always get the established backstory below, never a from-scratch one.
-  if(!guaranteedGrowth && Math.random() < 0.3){
+  if(Math.random() < 0.3){
     return {
       priceHistory: [{p:initPrice, t:now}],
       currentPrice: initPrice,
@@ -1683,12 +1703,7 @@ function simulateBotCoinLaunch(guaranteedGrowth=false){
   const priceHistory = [];
   for(let i=0;i<steps;i++){
     let mult;
-    if(guaranteedGrowth){
-      // Mostly-upward fabricated history to match the "only goes up, occasional small drop"
-      // guarantee — even its fake past should already look like a winner, not a normal wobble.
-      if(Math.random()<0.08) mult = 1 - Math.random()*0.08; // rare small dip
-      else mult = 1 + Math.random()*0.10; // steady upward drift
-    } else if(Math.random()<0.14){
+    if(Math.random()<0.14){
       mult = 1 + (Math.random()<0.5?-1:1)*(0.35+Math.random()*0.55); // big jump
     } else {
       // Bigger and more frequent moves than a community coin's organic trading — this is what's
@@ -1700,16 +1715,14 @@ function simulateBotCoinLaunch(guaranteedGrowth=false){
   }
   const recentTrades = [];
   for(let i=0;i<14;i++){
-    const isBuy = guaranteedGrowth ? Math.random()<0.9 : Math.random()<0.5;
+    const isBuy = Math.random()<0.5;
     recentTrades.push({
       uid:'bot', username: randBotName(), type: isBuy?'buy':'sell',
       usdAmount: 8+Math.random()*300, tokenAmount: 20+Math.random()*5000,
       t: now-(14-i)*(stepGapMs/3), isBot:true
     });
   }
-  // Guaranteed-growth coins always start deep into "thousands of trades" (3,000–9,000) rather
-  // than the normal 900–6,100 range other established coins get.
-  const tradeCountSeed = guaranteedGrowth ? 3000+Math.floor(Math.random()*6000) : 900+Math.floor(Math.random()*5200);
+  const tradeCountSeed = 900+Math.floor(Math.random()*5200);
   return { priceHistory, currentPrice: p, tradeCountSeed, recentTrades, totalSupply };
 }
 
@@ -1748,7 +1761,7 @@ async function spawnBotCoin(forceSpawn=false){
     if(tokenReserve > MAX_TOK) tokenReserve = MAX_TOK;
     solReserve = currentPrice*tokenReserve; // keep price = solReserve/tokenReserve consistent after clamping
     const coinRef = doc(collection(db,'coins'));
-    await setDoc(coinRef, {
+    const coinData = {
       name, ticker,
       description: forceSpawn
         ? "Fully automated market. Word is this one's going to blow up — guaranteed to hit 10,000 holders within the hour."
@@ -1759,12 +1772,15 @@ async function spawnBotCoin(forceSpawn=false){
       priceHistory, recentTrades, tradeCount: tradeCountSeed,
       // guaranteedGrowth is the single flag botCoinTick checks to skip rug-eligibility and swap
       // in the heavily-bullish trade bias below; guaranteedHolderRampStart independently drives
-      // the simulated holder-count ramp (see refreshHolderCount).
+      // the simulated holder-count ramp (see refreshHolderCount) and the quiet→rapid-growth
+      // phase timing in botCoinTick.
       ...(forceSpawn ? { guaranteedGrowth: true, guaranteedHolderRampStart: Date.now() } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
-    });
+    };
+    await setDoc(coinRef, coinData);
     await setDoc(doc(db,'tickers',ticker), { coinId: coinRef.id });
-  }catch(err){ /* silent — e.g. a rare ticker race; next spawn check will just try again */ }
+    return { id: coinRef.id, ...coinData };
+  }catch(err){ /* silent — e.g. a rare ticker race; next spawn check will just try again */ return null; }
 }
 
 let botCoinSpawnCheckCounter = 0;
@@ -1870,19 +1886,34 @@ async function botCoinTick(){
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.guaranteedGrowth){
-        // Right-Ctrl force-spawned coins: never eligible for a rug-pull, and trade on a fixed
-        // heavily-bullish bias instead of the normal trend logic — mostly buys, with an
-        // occasional small dip rather than a real bearish swing. Skips the rug-eligibility
-        // check and the normal trend-bias branch entirely.
-        if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
-        const usd = botCoinTradeSize();
-        const big = usd>800;
-        const smallDip = Math.random() < 0.12; // occasional small drop, never a real reversal
-        const buyChance = smallDip ? 0.3 : 0.93;
+        // Right-Ctrl force-spawned coins: never eligible for a rug-pull (checked before this
+        // branch is even reached, see below). Two phases, timed off guaranteedHolderRampStart
+        // (set at spawn): a ~2-minute "quiet start" where it barely trades at all, so it's
+        // visibly sitting flat at $10k right after spawn — then a much more aggressive rapid-
+        // growth phase kicks in, heavy buy bias and bigger sizes, so the jump actually reads as
+        // a jump rather than a slow climb from the very first tick.
+        const spawnedAt = toMillisLoose(coin.guaranteedHolderRampStart||coin.createdAt);
+        const elapsed = Date.now()-spawnedAt;
+        const inQuietPhase = elapsed < GUARANTEED_GROWTH_QUIET_MS;
+        if(inQuietPhase){
+          if(Math.random() >= 0.12) return; // mostly nothing happens yet
+          const usd = 5+Math.random()*30; // small, unremarkable
+          setTimeout(()=>{
+            if(coinsWithPendingUserTrade.has(d.id)) return;
+            if(Math.random()<0.85) botBuyOnCoin(d.id, usd, false);
+            else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, usd*0.5, false);
+          }, Math.random()*18000);
+          return;
+        }
+        if(Math.random() >= 0.9) return; // rapid-growth phase: very high trade chance
+        const usd = botCoinTradeSize()*2.2; // bigger than normal for a dramatic climb
+        const big = true;
+        const smallDip = Math.random() < 0.1; // occasional small drop, never a real reversal
+        const buyChance = smallDip ? 0.3 : 0.94;
         setTimeout(()=>{
           if(coinsWithPendingUserTrade.has(d.id)) return;
           if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
-          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, Math.min(usd, usd*0.4), false); // dips are shallow, not crashes
+          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, Math.min(usd, usd*0.3), false); // dips are shallow, not crashes
         }, Math.random()*18000);
         return;
       }
@@ -2182,6 +2213,24 @@ const SNIPE_BOT_PRICE = 500; // one-time cost to unlock; pausing/resuming afterw
 // forward. Since Bot Market spawns happen more often than community launches, turning this on
 // means noticeably more frequent snipe buys than before.
 let snipeCursorMs = null;
+const snipeAttempted = new Set(); // guards against double-sniping the same coin (listener + direct call racing)
+function trySnipeBuy(coinId, c){
+  if(snipeAttempted.has(coinId)) return;
+  const snipe = state.userDoc?.snipeBot;
+  if(!snipe?.active) return;
+  // Now includes Bot Market spawns too, not just community launches.
+  if(c.creatorUid===state.uid && !c.isBotCoin) return; // don't snipe your own community launch
+  const amount = snipe.amountPerCoin||0;
+  if(!(amount>0)) return;
+  if((state.userDoc?.balance||0) < amount) return; // can't afford it right now — skip quietly
+  snipeAttempted.add(coinId);
+  doBuy(coinId, amount, true).then(result=>{
+    if(!result){ snipeAttempted.delete(coinId); return; } // buy failed — allow retrying this coin
+    toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', coinId));
+    logSnipeLedger(coinId, c.ticker, c.name, c.imageURL||'', amount);
+  });
+}
+
 function listenAutoSnipe(){
   snipeCursorMs = Date.now(); // only react to coins created after this instant
   // limit(50) is just a safety cap on the query itself, not the "how many can I catch" window —
@@ -2198,19 +2247,7 @@ function listenAutoSnipe(){
       const c = change.doc.data();
       const createdMs = toMillisLoose(c.createdAt);
       if(createdMs <= snipeCursorMs) return; // existed before we started watching — not new
-      const snipe = state.userDoc?.snipeBot;
-      if(!snipe?.active) return;
-      // Now includes Bot Market spawns too, not just community launches.
-      if(c.creatorUid===state.uid) return; // don't snipe your own launch
-      const amount = snipe.amountPerCoin||0;
-      if(!(amount>0)) return;
-      if((state.userDoc?.balance||0) < amount) return; // can't afford it right now — skip quietly
-      const coinId = change.doc.id;
-      doBuy(coinId, amount, true).then(result=>{
-        if(!result) return; // buy failed — don't log a snipe that didn't actually happen
-        toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', coinId));
-        logSnipeLedger(coinId, c.ticker, c.name, c.imageURL||'', amount);
-      });
+      trySnipeBuy(change.doc.id, c);
     });
   }, ()=>{ /* silent — non-critical */ });
   state.unsubs.push(un);
