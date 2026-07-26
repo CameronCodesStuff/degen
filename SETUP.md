@@ -200,6 +200,9 @@ Shown everywhere with a distinct 🚀 GUARANTEED GROWTH badge (lime, separate fr
 
 **If you have an active auto-snipe bot, it now buys into a force-spawned coin immediately and directly** — the Right Ctrl handler calls the snipe logic itself the moment the coin is created, rather than only relying on the snipe listener to notice it asynchronously through Firestore. The listener (see the reliability fix below) still independently catches it too, in case the direct call ever fails for some reason — a small in-flight guard (`snipeAttempted`) stops the two paths from double-buying the same coin.
 
+### Admin "spawn a normal coin" (full stop key)
+Same gated account — pressing **.** (period/full stop) instantly spawns a completely ordinary bot coin: no `guaranteedGrowth`, no holder-count ramp, no forced snipe, none of the Right Ctrl coin's special treatment. It's exactly what the ambient spawner would create on its own (same 30%-fresh/70%-established split, same normal trading behavior, can still eventually get rugged like any other bot coin), just triggered on demand instead of waiting for the scheduled window. Same key-repeat guard as the other two gestures.
+
 ### Insider Insights (hidden page)
 A hidden "🔮 Insider Insights" link appears at the bottom of the Launch page, only for the gated admin account or a specific username (`J_Frosty`, case-insensitive) — checked via `canSeeInsights()`, same client-side-gate pattern as the admin's other tricks (a UI gate, not real access control; the underlying `meta/insiderSchedule` doc is readable by any signed-in user, same trust model as the rest of the bot scheduling).
 

@@ -505,6 +505,24 @@ document.addEventListener('keyup', (e)=>{
 });
 window.addEventListener('blur', ()=>{ rightCtrlDown=false; });
 
+// Full stop / period key: instantly spawn a completely NORMAL bot coin (no guaranteedGrowth
+// treatment, no holder-count ramp, no snipe) — just an ordinary ambient-style spawn on demand,
+// distinct from Right Ctrl's guaranteed-growth version. Same key-repeat guard as the others.
+let periodKeyDown = false;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='Period') return;
+  if(periodKeyDown) return;
+  periodKeyDown = true;
+  if(!isPumpAdmin()) return;
+  toast('🤖 Spawned a normal bot coin.', 'ok');
+  spawnBotCoin(false);
+});
+document.addEventListener('keyup', (e)=>{
+  if(e.code!=='Period') return;
+  periodKeyDown = false;
+});
+window.addEventListener('blur', ()=>{ periodKeyDown=false; });
+
 function openResetConfirmModal(){
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
