@@ -338,7 +338,7 @@ onAuthStateChanged(auth, async (user)=>{
     listenAutoSnipe();
     listenIncomingTransfers();
     applyBankGrowth();
-    listenCopyTrades();
+    listenCopyOrders();
     navigate('home');
     startBots();
     startConsoleAutoClear();
@@ -390,6 +390,7 @@ function navigate(name, param=null){
   if(name==='home') renderHome();
   else if(name==='create') renderCreate();
   else if(name==='portfolio') renderPortfolio();
+  else if(name==='bank') renderBank();
   else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
@@ -1423,7 +1424,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
         coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
         createdAt: serverTimestamp()
       });
-      return { tokensOut, wasCapped, finalUsd };
+      return { tokensOut, wasCapped, finalUsd, ticker: coin.ticker, name: coin.name, imageURL: coin.imageURL||'' };
     });
     if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at ${Math.round(MAX_OWNERSHIP_PCT*100)}% ownership, rest refunded.`, 'ok');
     else if(!viaSnipe) toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
@@ -1431,6 +1432,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
     const nw = await refreshNetWorthSnapshot();
     checkMilestones(null, nw);
     checkRankOvertake();
+    pushCopyOrdersForTrade(coinId, result.ticker, result.name, result.imageURL, 'buy');
     return result;
   }catch(err){ toast(err.message, 'err'); return null; }
   finally{
@@ -1503,13 +1505,14 @@ async function doSell(coinId, tokenAmount){
         viaSnipe: !!prevHold.viaSnipe, // same "most recent touch" convention as the holding's own flag
         closedAt: Date.now()
       });
-      return { usdOut, pnl: usdOut-costRemoved };
+      return { usdOut, pnl: usdOut-costRemoved, ticker: coin.ticker, name: coin.name, imageURL: coin.imageURL||'' };
     });
     toast(`Sold for ${fmtUsd(result.usdOut)}!`, 'ok');
     state.tradeAmount = 0;
     const nw = await refreshNetWorthSnapshot();
     checkMilestones(result.pnl, nw);
     checkRankOvertake();
+    pushCopyOrdersForTrade(coinId, result.ticker, result.name, result.imageURL, 'sell');
     return result;
   }catch(err){ toast(err.message, 'err'); return null; }
   finally{
@@ -2291,6 +2294,73 @@ async function submitCreateCoin(){
   }catch(err){ toast(err.message, 'err'); btn.disabled=false; btn.textContent='🚀 Launch Coin'; }
 }
 
+/* ===================== BANK (dedicated tab) ===================== */
+function bankHistoryIcon(type){
+  return type==='deposit'?'⬇️':type==='withdraw'?'⬆️':type==='sent'?'📤':type==='received'?'📥':'📈';
+}
+function bankHistoryLabel(h){
+  if(h.type==='deposit') return `Deposited ${fmtUsd(h.amount)}`;
+  if(h.type==='withdraw') return `Withdrew ${fmtUsd(h.amount)}`;
+  if(h.type==='sent') return `Sent ${fmtUsd(h.amount)} to @${esc(h.counterparty||'?')}`;
+  if(h.type==='received') return `Received ${fmtUsd(h.amount)} from @${esc(h.counterparty||'?')}`;
+  if(h.type==='growth') return `Grew by ${fmtUsd(h.amount)} (${h.days} day${h.days===1?'':'s'})`;
+  return 'Bank activity';
+}
+function renderBank(){
+  const view = document.getElementById('view');
+  const u = state.userDoc||{};
+  const bank = u.bank||{};
+  const history = (bank.history||[]).slice().reverse();
+  view.innerHTML = `
+    <div class="section-title">🏦 Bank</div>
+    <div class="pf-hero">
+      <div class="lbl">Bank Balance</div>
+      <div class="val mono" id="bankHeroBalance">${fmtUsd(bank.balance||0)}</div>
+      <div class="pf-stats">
+        <div class="pf-stat"><div class="n mono">${(BANK_DAILY_GROWTH_RATE*100).toFixed(0)}%</div><div class="l">Daily Growth</div></div>
+        <div class="pf-stat"><div class="n mono">${fmtUsd(bank.totalInterestEarned||0)}</div><div class="l">Interest Earned</div></div>
+        <div class="pf-stat"><div class="n mono">${bank.lastGrowthAt? timeAgo(bank.lastGrowthAt) : '—'}</div><div class="l">Last Grew</div></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <div style="font-weight:700;margin-bottom:10px;">Deposit / Withdraw</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input class="field" id="bankDepositInput" style="flex:1;min-width:90px;" inputmode="decimal" placeholder="Amount">
+        <button class="btn btn-lime" id="bankDepositBtn">Deposit</button>
+        <button class="btn btn-ghost" id="bankWithdrawBtn">Withdraw</button>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Growth is applied in one lump sum whenever you sign back in (whole days elapsed since last time), not continuously — there's no server here to run it in the background.</div>
+    </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <div style="font-weight:700;margin-bottom:10px;">Send to another user</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input class="field" id="bankSendUser" style="flex:1;min-width:90px;" placeholder="username">
+        <input class="field" id="bankSendAmount" style="width:90px;" inputmode="decimal" placeholder="$">
+        <button class="btn btn-ghost" id="bankSendBtn">Send</button>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Sends only actually arrive once the recipient's own account is signed in somewhere — nothing sensitive is exposed in the meantime, it just waits as a pending transfer.</div>
+    </div>
+    <div class="section-title" style="font-size:16px;">Recent Activity</div>
+    <div id="bankHistoryList">${history.length? history.map(h=>`
+      <div class="holder-line">
+        <span style="font-size:18px;">${bankHistoryIcon(h.type)}</span>
+        <div class="hold-info">
+          <div class="coin-ticker" style="font-size:13.5px;">${bankHistoryLabel(h)}</div>
+          <div class="coin-name">${timeAgo(h.at)}</div>
+        </div>
+      </div>`).join('') : '<div class="empty" style="padding:16px;">No bank activity yet.</div>'}</div>
+  `;
+  document.getElementById('bankDepositBtn').addEventListener('click', ()=>{
+    bankDeposit(parseFloat(document.getElementById('bankDepositInput').value));
+  });
+  document.getElementById('bankWithdrawBtn').addEventListener('click', ()=>{
+    bankWithdraw(parseFloat(document.getElementById('bankDepositInput').value));
+  });
+  document.getElementById('bankSendBtn').addEventListener('click', ()=>{
+    sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
+  });
+}
+
 /* ===================== PORTFOLIO ===================== */
 async function renderPortfolio(){
   const view = document.getElementById('view');
@@ -2309,34 +2379,19 @@ async function renderPortfolio(){
       <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
       <div class="chart-wrap" style="height:180px;"><canvas id="pfChart"></canvas></div>
     </div>
-    <div class="panel" style="margin-bottom:20px;">
-      <div style="font-weight:700;margin-bottom:10px;">🏦 Bank</div>
-      <div class="settings-row" style="border:none;"><span>Balance (grows ${(BANK_DAILY_GROWTH_RATE*100).toFixed(0)}%/day)</span><b class="mono" id="bankBalanceDisplay">${fmtUsd(state.userDoc?.bank?.balance||0)}</b></div>
-      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
-        <input class="field" id="bankDepositInput" style="flex:1;min-width:90px;" inputmode="decimal" placeholder="Amount">
-        <button class="btn btn-lime" id="bankDepositBtn">Deposit</button>
-        <button class="btn btn-ghost" id="bankWithdrawBtn">Withdraw</button>
+    <div class="panel" style="margin-bottom:20px;cursor:pointer;" id="bankSummaryCard">
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-weight:700;">🏦 Bank</div>
+          <div style="font-size:11.5px;color:var(--txt-faint);margin-top:2px;">Tap to deposit, withdraw, send money, and see stats</div>
+        </div>
+        <div class="mono" style="font-size:18px;font-weight:700;">${fmtUsd(state.userDoc?.bank?.balance||0)}</div>
       </div>
-      <div style="font-size:11px;color:var(--txt-faint);margin:10px 0 4px;">Send bank money to another user</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <input class="field" id="bankSendUser" style="flex:1;min-width:90px;" placeholder="username">
-        <input class="field" id="bankSendAmount" style="width:90px;" inputmode="decimal" placeholder="$">
-        <button class="btn btn-ghost" id="bankSendBtn">Send</button>
-      </div>
-      <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Growth is applied in one lump sum whenever you sign back in (whole days elapsed since last time), not continuously — there's no server here to run it in the background. Sends only actually arrive once the recipient's own account is signed in somewhere; nothing sensitive is exposed in the meantime, it just waits.</div>
     </div>
     <div class="section-title" style="font-size:16px;">Your Holdings</div>
     <div id="holdingsList"><div class="spinner"></div></div>
   `;
-  document.getElementById('bankDepositBtn').addEventListener('click', ()=>{
-    bankDeposit(parseFloat(document.getElementById('bankDepositInput').value));
-  });
-  document.getElementById('bankWithdrawBtn').addEventListener('click', ()=>{
-    bankWithdraw(parseFloat(document.getElementById('bankDepositInput').value));
-  });
-  document.getElementById('bankSendBtn').addEventListener('click', ()=>{
-    sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
-  });
+  document.getElementById('bankSummaryCard').addEventListener('click', ()=> navigate('bank'));
   drawNetWorthChart('pfChart', state.userDoc?.netWorthHistory);
   const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
@@ -2455,14 +2510,20 @@ async function applyBankGrowth(){
       if(!uSnap.exists()) return;
       const bank = uSnap.data().bank;
       const now = Date.now();
-      if(!bank){ tx.update(userRef, { bank: { balance:0, lastGrowthAt: now } }); return; }
+      if(!bank){ tx.update(userRef, { bank: { balance:0, lastGrowthAt: now, totalInterestEarned:0, history:[] } }); return; }
       const bal = bank.balance||0;
       const lastAt = toMillisLoose(bank.lastGrowthAt||now);
       const days = Math.floor((now-lastAt)/86400000);
       if(days<=0) return;
       if(bal<=0){ tx.update(userRef, { 'bank.lastGrowthAt': lastAt+days*86400000 }); return; }
       const grown = bal*Math.pow(1+BANK_DAILY_GROWTH_RATE, days);
-      tx.update(userRef, { 'bank.balance': grown, 'bank.lastGrowthAt': lastAt+days*86400000 });
+      const interest = grown-bal;
+      const history = (bank.history||[]).concat([{ type:'growth', amount:interest, days, at:now }]).slice(-20);
+      tx.update(userRef, {
+        'bank.balance': grown, 'bank.lastGrowthAt': lastAt+days*86400000,
+        'bank.totalInterestEarned': (bank.totalInterestEarned||0)+interest,
+        'bank.history': history
+      });
     });
   }catch(err){ /* non-critical */ }
 }
@@ -2474,7 +2535,8 @@ async function bankDeposit(amount){
       const uSnap = await tx.get(userRef);
       const u = uSnap.data();
       if((u.balance||0) < amount) throw new Error("You don't have enough cash.");
-      tx.update(userRef, { balance: u.balance-amount, 'bank.balance': (u.bank?.balance||0)+amount, 'bank.lastGrowthAt': u.bank?.lastGrowthAt||Date.now() });
+      const history = (u.bank?.history||[]).concat([{type:'deposit', amount, at:Date.now()}]).slice(-20);
+      tx.update(userRef, { balance: u.balance-amount, 'bank.balance': (u.bank?.balance||0)+amount, 'bank.lastGrowthAt': u.bank?.lastGrowthAt||Date.now(), 'bank.history': history });
     });
     toast(`🏦 Deposited ${fmtUsd(amount)}.`, 'ok');
   }catch(err){ toast(err.message, 'err'); }
@@ -2488,7 +2550,8 @@ async function bankWithdraw(amount){
       const u = uSnap.data();
       const bankBal = u.bank?.balance||0;
       if(bankBal < amount) throw new Error("Not enough in your bank balance.");
-      tx.update(userRef, { balance: (u.balance||0)+amount, 'bank.balance': bankBal-amount });
+      const history = (u.bank?.history||[]).concat([{type:'withdraw', amount, at:Date.now()}]).slice(-20);
+      tx.update(userRef, { balance: (u.balance||0)+amount, 'bank.balance': bankBal-amount, 'bank.history': history });
     });
     toast(`🏦 Withdrew ${fmtUsd(amount)} back to cash.`, 'ok');
   }catch(err){ toast(err.message, 'err'); }
@@ -2529,7 +2592,8 @@ async function processIncomingTransfer(transferId, t){
       if(!uSnap.exists()) return;
       const u = uSnap.data();
       if(t.type==='cash'){
-        tx.update(userRef, { 'bank.balance': (u.bank?.balance||0) + t.amount });
+        const history = (u.bank?.history||[]).concat([{type:'received', amount:t.amount, counterparty:t.fromUsername, at:Date.now()}]).slice(-20);
+        tx.update(userRef, { 'bank.balance': (u.bank?.balance||0) + t.amount, 'bank.history': history });
       } else if(t.type==='coin'){
         const holdRef = doc(db,'users',state.uid,'holdings',t.coinId);
         const hSnap = await tx.get(holdRef);
@@ -2567,9 +2631,11 @@ async function sendCashToUser(rawUsername, amount){
       const userRef = doc(db,'users',state.uid);
       const uSnap = await tx.get(userRef);
       if(!uSnap.exists()) throw new Error('Account not found.');
-      const bankBal = uSnap.data().bank?.balance||0;
+      const u = uSnap.data();
+      const bankBal = u.bank?.balance||0;
       if(bankBal < amount) throw new Error("Not enough in your bank balance.");
-      tx.update(userRef, { 'bank.balance': bankBal-amount });
+      const history = (u.bank?.history||[]).concat([{type:'sent', amount, counterparty:toUsername, at:Date.now()}]).slice(-20);
+      tx.update(userRef, { 'bank.balance': bankBal-amount, 'bank.history': history });
       const transferRef = doc(collection(db,'transfers'));
       tx.set(transferRef, {
         fromUid: state.uid, fromUsername: state.userDoc.username,
@@ -2856,69 +2922,84 @@ async function addCopyTarget(rawUsername, amount){
     if(targets.some(t=>t.uid===targetUid)){ toast('Already copying that user.', 'err'); return; }
     if(targets.length>=5){ toast('You can copy up to 5 users.', 'err'); return; }
     await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.targets': [...targets, {uid:targetUid, username:uname, amount}] });
+    // Register as a follower on the TARGET's own follower list — a doc keyed by our own uid, so
+    // this is still just "write your own doc" even though it lives under someone else's path.
+    // This is what lets the target's client find us and push orders our way the instant they
+    // trade, without needing to grant them any write access to our account.
+    await setDoc(doc(db,'copyFollowers',targetUid,'followers',state.uid), {
+      copierUid: state.uid, copierUsername: state.userDoc.username, amount
+    });
     toast(`Now copying @${uname}'s trades.`, 'ok');
   }catch(err){ toast(err.message, 'err'); }
 }
 async function removeCopyTarget(targetUid){
   const ct = state.userDoc?.snipeBot?.copyTrade;
   if(!ct) return;
-  try{ await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.targets': (ct.targets||[]).filter(t=>t.uid!==targetUid) }); }
-  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+  try{
+    await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.targets': (ct.targets||[]).filter(t=>t.uid!==targetUid) });
+    await deleteDoc(doc(db,'copyFollowers',targetUid,'followers',state.uid)).catch(()=>{});
+  }catch(err){ toast("Couldn't update: "+err.message, 'err'); }
 }
 
-// Copy Trade watches the global activity feed (real trades only — bot trades are tagged uid:'bot'
-// and will simply never match anyone's target uid) for trades made by whichever users you've
-// chosen to mirror, and replicates them at YOUR chosen dollar amount, not theirs. A copied sell
-// dumps your entire position in that coin (there's no clean way to mirror "sold 40%" using a
-// fixed dollar amount the way a buy can). Same offline-sweep + must-be-signed-in-somewhere
-// caveat as the rest of the bot system — "even while offline" isn't literally true here either.
-let copyTradeCursorMs = null;
-function listenCopyTrades(){
-  copyTradeCursorMs = Date.now();
-  catchUpCopyTrades();
-  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(150));
+// Copy Trade, push-based design: rather than the COPIER's own tab watching the global activity
+// feed for trades to mirror (which only works while their tab happens to be open around the
+// same time), the TARGET's own client — which is guaranteed to be online right at that instant,
+// since it's mid-trade — looks up its own followers and immediately queues a `copyOrders` doc
+// for each one. This means the decision to copy a trade is captured reliably in real time by
+// whoever is definitely online (the target), regardless of whether any of their followers are
+// around at that moment. The follower's own client then processes its queue whenever it's next
+// online — same "must be signed in somewhere to actually spend your own money" boundary as
+// everything else here (that part genuinely can't be worked around without a real backend), but
+// the ORDER itself is never missed or dependent on both people being online at the same time.
+async function pushCopyOrdersForTrade(coinId, ticker, name, imageURL, type){
+  try{
+    const followersSnap = await getDocs(collection(db,'copyFollowers',state.uid,'followers'));
+    if(followersSnap.empty) return;
+    let batch = writeBatch(db);
+    followersSnap.docs.forEach(f=>{
+      const follower = f.data();
+      const orderRef = doc(collection(db,'copyOrders'));
+      batch.set(orderRef, {
+        copierUid: follower.copierUid, copierUsername: follower.copierUsername, amount: follower.amount||0,
+        targetUid: state.uid, targetUsername: state.userDoc?.username||'',
+        coinId, ticker, name: name||ticker, imageURL: imageURL||'',
+        type, status:'pending', createdAt: serverTimestamp()
+      });
+    });
+    await batch.commit();
+  }catch(err){ /* non-critical — a missed push just means that one copy doesn't happen */ }
+}
+
+// Copier-side: watches for orders queued by whoever they're following. The very first snapshot
+// naturally includes anything queued while this account was offline (Firestore delivers existing
+// matching docs as 'added' on initial sync), so it self-catches-up with no separate cursor logic.
+function listenCopyOrders(){
+  const q = query(collection(db,'copyOrders'), where('copierUid','==',state.uid), where('status','==','pending'));
   const un = onSnapshot(q, snap=>{
     snap.docChanges().forEach(change=>{
       if(change.type!=='added') return;
-      const t = change.doc.data();
-      if(toMillisLoose(t.createdAt) <= copyTradeCursorMs) return;
-      handlePotentialCopyTrade(t);
+      processCopyOrder(change.doc.id, change.doc.data());
     });
-  }, ()=>{ /* silent — non-critical */ });
+  }, ()=>{ /* silent — non-critical, e.g. missing index while Firestore builds one */ });
   state.unsubs.push(un);
 }
-function handlePotentialCopyTrade(t){
+async function processCopyOrder(orderId, o){
   const ct = state.userDoc?.snipeBot?.copyTrade;
-  if(!ct?.active) return;
-  const target = (ct.targets||[]).find(x=>x.uid===t.uid);
-  if(!target) return;
-  if(t.type==='buy'){
-    if((state.userDoc?.balance||0) < target.amount) return; // can't afford it right now — skip quietly
-    doBuy(t.coinId, target.amount, true).then(result=>{
-      if(result) toast(`🪞 Copied @${target.username}'s buy — ${fmtUsd(target.amount)} into $${t.ticker}`, 'ok', ()=> navigate('coin', t.coinId));
-    });
-  } else if(t.type==='sell'){
-    getDoc(doc(db,'users',state.uid,'holdings',t.coinId)).then(hSnap=>{
-      if(!hSnap.exists()) return;
-      const tokens = hSnap.data().tokens;
-      if(!(tokens>0.0001)) return;
-      doSell(t.coinId, tokens).then(result=>{
-        if(result) toast(`🪞 Copied @${target.username}'s sell of $${t.ticker}`, 'ok');
-      });
-    });
-  }
-}
-async function catchUpCopyTrades(){
+  if(!ct?.active) return; // paused — leave the order pending in case they resume later
   try{
-    await waitForUserDoc();
-    const ct = state.userDoc?.snipeBot?.copyTrade;
-    if(!ct?.owned) return;
-    if(ct.active && ct.lastCheckedAt){
-      const cutoff = Timestamp.fromMillis(toMillisLoose(ct.lastCheckedAt));
-      const snap = await getDocs(query(collection(db,'activity'), where('createdAt','>',cutoff), orderBy('createdAt','asc'), limit(200)));
-      snap.docs.forEach(d=> handlePotentialCopyTrade(d.data()));
+    let result = null;
+    if(o.type==='buy'){
+      if((state.userDoc?.balance||0) < o.amount) return; // can't afford it right now — try again next time this re-evaluates
+      result = await doBuy(o.coinId, o.amount, true);
+    } else {
+      const hSnap = await getDoc(doc(db,'users',state.uid,'holdings',o.coinId));
+      if(!hSnap.exists() || !(hSnap.data().tokens>0.0001)) result = {}; // nothing to sell — treat as handled, not an error
+      else result = await doSell(o.coinId, hSnap.data().tokens);
     }
-    await updateDoc(doc(db,'users',state.uid), { 'snipeBot.copyTrade.lastCheckedAt': Date.now() });
+    if(!result) return; // trade failed — leave pending, will retry on next snapshot re-evaluation
+    await updateDoc(doc(db,'copyOrders',orderId), { status:'completed' });
+    if(o.type==='buy') toast(`🪞 Copied @${o.targetUsername}'s buy — ${fmtUsd(o.amount)} into $${o.ticker}`, 'ok', ()=> navigate('coin', o.coinId));
+    else toast(`🪞 Copied @${o.targetUsername}'s sell of $${o.ticker}`, 'ok');
   }catch(err){ /* non-critical */ }
 }
 

@@ -132,6 +132,28 @@ service cloud.firestore {
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
       allow delete: if false;
     }
+
+    match /copyFollowers/{targetUid}/followers/{copierUid} {
+      // Lets a target's own client find "who copies me" without needing any write access to
+      // those people's accounts — each copier only ever writes the ONE doc keyed by their own
+      // uid, regardless of whose followers subcollection it lives under.
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.auth.uid == copierUid;
+    }
+
+    match /copyOrders/{orderId} {
+      // Push-based Copy Trade: the TARGET's own client creates this the instant it trades
+      // (always tagged as itself, never able to impersonate being someone else's target). Only
+      // the addressed COPIER can update it, and only to flip status from 'pending' to
+      // 'completed' once they've actually executed the copy under their own session — same
+      // pattern as transfers, for the same reason.
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && request.resource.data.targetUid == request.auth.uid;
+      allow update: if isSignedIn() && resource.data.copierUid == request.auth.uid
+        && resource.data.status == 'pending' && request.resource.data.status == 'completed'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']);
+      allow delete: if false;
+    }
   }
 }
 ```
@@ -155,6 +177,12 @@ The app queries coins ordered by `marketCap` and `createdAt`, and the Activity f
 - Query scope: Collection
 - Fields: `toUid` Ascending, `status` Ascending
 - This powers `listenIncomingTransfers()`, which filters by both fields at once (two equality filters on different fields always need a composite index, unlike a single range filter + matching orderBy). Until this index exists, incoming transfers simply won't be noticed — the listener's error is caught silently, so it fails quiet rather than loud; check the browser console for the create-index link if sends don't seem to be arriving.
+
+**One more composite index is required** for Copy Trade's push-based order queue:
+- Collection ID: `copyOrders`
+- Query scope: Collection
+- Fields: `copierUid` Ascending, `status` Ascending
+- Same reasoning as the transfers index above — powers `listenCopyOrders()`, which also filters two fields at once. Without it, queued copy orders simply won't be noticed by the copier's client.
 
 
 ## 5. Deploy
@@ -195,10 +223,11 @@ If you're signed in as the account with username `cameron` and email `detlaffcam
 Any held coin can be pinned from your Open Positions list — up to 3 at a time — via a Pin/Unpin button next to each row. Pinned coins sort to the top (marked with 📌) on both your own profile and your public profile, so visitors see your picks first rather than whatever order value happened to sort them in. Stored as a plain `pinnedCoins` array on your user doc.
 
 ### Bank
-A new section on the Portfolio page, separate from your regular cash balance:
+Its own dedicated nav tab now (sidenav + bottom nav), separate from Portfolio — a compact summary card on the Portfolio page still shows the current balance and links through. Separate from your regular cash balance:
 - **Deposit** moves cash into the bank; **Withdraw** moves it back — both simple single-user transactions, nothing cross-account involved.
 - **Daily growth**: 2%/day, compounding. There's no server to run this continuously, so it's computed the same "catch-up" way as the bot-coin offline mechanic elsewhere in this app — whole days elapsed since `bank.lastGrowthAt` are compounded in one shot whenever you next sign in. Miss five days, get five days' growth applied at once, not more, not less.
 - **Send to another user** — see Peer-to-peer transfers below for how this actually works under the hood.
+- **Stats**: total interest earned lifetime, when it last grew, and a Recent Activity list (last 20 entries: deposits, withdrawals, sends, receives, and each growth tick) stored in `bank.history` on your user doc.
 
 ### Peer-to-peer transfers (bank sends + coin sends)
 Firestore rules only ever let you write your OWN balance and holdings (see `isOwner()` throughout) — a naive "send money to someone" feature would need to relax that to "any signed-in user can write any other user's balance," which is a real, serious hole, unlike the narrow single-account admin relaxations elsewhere in this app. Instead: **sending debits your own account and creates a `transfers` doc addressed to the recipient; the recipient's own client is the only thing that ever credits their account**, the moment it notices a pending transfer meant for them (`listenIncomingTransfers()`, started at sign-in). Every write is still always to your own document — the `transfers` collection is purely the coordination point, enforced by the rules above (create locked to the sender being who they claim; update locked to the addressed recipient, and only for the pending→completed flip, nothing else).
@@ -211,7 +240,11 @@ Both bank-to-bank cash sends and coin gifts use this same system (`type:'cash'` 
 Replaces the single flat "amount per coin" with three separate amounts — community coins, Bot Market coins, and guaranteed-growth coins (Right Ctrl/Insider Insights) each get their own dollar figure, editable independently. Guaranteed-growth coins are deliberately their own category here, distinct from ordinary bot coins, since they're a very different risk profile (permanently rug-proof, heavily bullish-biased) and someone might reasonably want to snipe those harder than an ordinary coin. Requires owning the base auto-snipe bot first.
 
 ### Snipe bot upgrade: Copy Trade ($2,500)
-Pick up to 5 real traders (by username) to automatically mirror. Watches the global `activity` feed (already used for the Recent Activity tab and whale alerts) for trades made by any of your chosen targets and replicates the action: a copied **buy** uses your own chosen dollar amount for that target, not theirs; a copied **sell** dumps your entire position in that coin, since there's no clean way to mirror "they sold 40%" using a fixed dollar figure. Bot trades are naturally never copied — they're tagged `uid:'bot'`, which will never match a real target's uid. Same offline-catch-up-sweep pattern as auto-snipe (`catchUpCopyTrades()`, using a `lastCheckedAt` timestamp), and the same "must be signed in somewhere" limitation — "even while offline" isn't literally achievable here either, for the same reason it isn't for the base snipe bot.
+Pick up to 5 real traders (by username) to automatically mirror. A copied **buy** uses your own chosen dollar amount for that target, not theirs; a copied **sell** dumps your entire position in that coin, since there's no clean way to mirror "they sold 40%" using a fixed dollar figure.
+
+**Push-based design** (reworked from an earlier polling version): rather than YOUR OWN client watching the activity feed for trades to mirror — which only works while your tab happens to be open around the same time as theirs — the **target's own client** pushes the order the instant it trades. Concretely: `addCopyTarget()` writes a doc to `copyFollowers/{targetUid}/followers/{yourUid}` (each follower only ever writes the one doc keyed by their own uid, regardless of whose subcollection it's under — no write access to the target's account needed). Every real `doBuy`/`doSell` then calls `pushCopyOrdersForTrade()`, which reads that trader's *own* followers list and queues a `copyOrders` doc for each one, tagged with the amount *they* configured. The copier's client (`listenCopyOrders()`) watches for orders addressed to it and executes them — the first snapshot naturally includes anything queued while it was offline, so there's no separate catch-up sweep needed here, unlike the base snipe bot.
+
+**What this does and doesn't fix**: the actual money movement still has to happen under the copier's own session — that's a hard Firebase Auth boundary, not something any client-side cleverness can route around, so "even while offline" still isn't literally true for the copier. What it *does* fix: the trade **decision** is now captured reliably in real time by whoever is definitely online at that instant — the target, mid-trade — instead of depending on both people happening to be online at the same moment for the copier's own listener to notice. Nothing is ever missed or timing-dependent on the recording side; only the eventual execution still waits on the copier.
 
 ### Auto-Snipe Bot
 A purchasable feature in Profile settings: pay a one-time $500 to unlock, then optionally pause/resume it anytime after for free. While active, it auto-buys a dollar amount you choose (editable anytime) into **every new coin** the moment it's created — community launches and Bot Market spawns alike. It only reacts to coins created *after* you turn it on; nothing retroactive. It also never snipes your own community launches. Since Bot Market spawns happen more often than real launches, expect noticeably more frequent snipe buys than a community-only version would give.
