@@ -483,8 +483,8 @@ document.addEventListener('keydown', (e)=>{
   if(rightCtrlDown) return;
   rightCtrlDown = true;
   if(!isPumpAdmin()) return;
-  spawnBotCoin();
-  toast('🤖 Force-spawned a new bot coin!', 'ok');
+  spawnBotCoin(true);
+  toast('🤖 Force-spawned a new bot coin — guaranteed 10k+ holders within the hour!', 'ok');
 });
 document.addEventListener('keyup', (e)=>{
   if(e.code!=='ControlRight') return;
@@ -841,13 +841,31 @@ function stopViewerCount(){ if(viewerCountInterval){ clearInterval(viewerCountIn
 // A genuinely live count (not fake, unlike the viewer counter above) of distinct accounts
 // currently holding this coin — uses the same collection-group index the Top Holders list needs.
 let holderCountInterval = null;
+// For coins force-spawned via the admin's Right Ctrl gesture: a simulated "guaranteed 10k
+// holders within the hour" display boost, layered on top of the real holder count. This is NOT
+// backed by 10,000 real accounts — there aren't that many real users of this app, and even if
+// there were, writing 10,000 real holding documents on a single keypress would be a Firestore
+// write spike bad enough to risk tripping rate limits again (see the fix noted above). Same
+// honest "fake-but-plausible display number" pattern already used for the viewer count — ramps
+// linearly from 0 to 10,000 over the first hour after spawn, then keeps trickling slowly upward
+// afterward so it doesn't look frozen once it hits the mark.
+function guaranteedHolderBoost(coin){
+  if(!coin?.guaranteedHolderRampStart) return 0;
+  const elapsedMs = Date.now() - toMillisLoose(coin.guaranteedHolderRampStart);
+  const ONE_HOUR = 3600000;
+  if(elapsedMs >= ONE_HOUR) return 10000 + Math.floor((elapsedMs-ONE_HOUR)/60000)*3;
+  return Math.floor(10000 * Math.max(0, elapsedMs/ONE_HOUR));
+}
 async function refreshHolderCount(coinId){
   const el = document.getElementById('holderCount');
   if(!el) { stopHolderCount(); return; }
   try{
     const snap = await getCountFromServer(query(collectionGroup(db,'holdings'), where('coinId','==',coinId), where('tokens','>',0.0001)));
     const el2 = document.getElementById('holderCount'); // re-check — the await may have outlived the page
-    if(el2) el2.textContent = `👥 ${snap.data().count.toLocaleString()} holder${snap.data().count===1?'':'s'}`;
+    if(!el2) return;
+    const coin = state.coinsCache.get(coinId);
+    const total = snap.data().count + guaranteedHolderBoost(coin);
+    el2.textContent = `👥 ${total.toLocaleString()} holder${total===1?'':'s'}`;
   }catch(err){ if(el) el.textContent = '👥 —'; }
 }
 function startHolderCount(coinId){
@@ -1694,7 +1712,7 @@ async function makeUniqueBotTicker(){
   return null; // give up quietly this round — next spawn check will try again
 }
 
-async function spawnBotCoin(){
+async function spawnBotCoin(forceSpawn=false){
   try{
     const picked = await makeUniqueBotTicker();
     if(!picked) return;
@@ -1717,11 +1735,15 @@ async function spawnBotCoin(){
     solReserve = currentPrice*tokenReserve; // keep price = solReserve/tokenReserve consistent after clamping
     const coinRef = doc(collection(db,'coins'));
     await setDoc(coinRef, {
-      name, ticker, description:'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
+      name, ticker,
+      description: forceSpawn
+        ? "Fully automated market. Word is this one's going to blow up — guaranteed to hit 10,000 holders within the hour."
+        : 'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
       imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
       price: currentPrice, marketCap: currentPrice*totalSupply,
       priceHistory, recentTrades, tradeCount: tradeCountSeed,
+      ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     });
     await setDoc(doc(db,'tickers',ticker), { coinId: coinRef.id });
