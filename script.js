@@ -2090,14 +2090,15 @@ function listenWhaleAlerts(){
 
 /* ===================== AUTO-SNIPE BOT ===================== */
 const SNIPE_BOT_PRICE = 500; // one-time cost to unlock; pausing/resuming afterward is free
-// Watches for newly-launched COMMUNITY coins (bot coins aren't "made" by anyone, so they're not
-// what "snipe every new coin" means here) and auto-buys a fixed dollar amount into each one, for
-// as long as the feature is toggled on. Real, structural limitation worth being upfront about:
-// since there's no backend, this can only fire while YOUR OWN account is signed in on some open
-// tab of yours — unlike the ambient bot system (which just needs *any* tab open), this needs
-// specifically yours, because a buy has to run under your own authenticated session to touch
-// your own balance and holdings. It does NOT retroactively buy coins launched before you turned
-// it on — only ones launched from that point forward.
+// Watches for every newly-created coin — community launches AND Bot Market spawns alike — and
+// auto-buys a fixed dollar amount into each one, for as long as the feature is toggled on. Real,
+// structural limitation worth being upfront about: since there's no backend, this can only fire
+// while YOUR OWN account is signed in on some open tab of yours — unlike the ambient bot system
+// (which just needs *any* tab open), this needs specifically yours, because a buy has to run
+// under your own authenticated session to touch your own balance and holdings. It does NOT
+// retroactively buy coins launched before you turned it on — only ones launched from that point
+// forward. Since Bot Market spawns happen more often than community launches, turning this on
+// means noticeably more frequent snipe buys than before.
 let snipeListenerReady = false;
 function listenAutoSnipe(){
   snipeListenerReady = false;
@@ -2109,7 +2110,7 @@ function listenAutoSnipe(){
       const snipe = state.userDoc?.snipeBot;
       if(!snipe?.active) return;
       const c = change.doc.data();
-      if(c.isBotCoin) return; // only real launches count as "made"
+      // Now includes Bot Market spawns too, not just community launches.
       if(c.creatorUid===state.uid) return; // don't snipe your own launch
       const amount = snipe.amountPerCoin||0;
       if(!(amount>0)) return;
@@ -2534,9 +2535,9 @@ function renderProfile(){
             <button class="btn btn-ghost" id="snipeAmountSaveBtn">Save</button>
           </div>
         </div>
-        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys this amount into every new community coin launched from now on — only while your account is signed in on some open tab of yours. Doesn't touch coins launched before you turned this on, and never snipes your own launches.</div>
+        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys this amount into every new coin — community launches and Bot Market spawns alike — from now on, only while your account is signed in on some open tab of yours. Doesn't touch coins that already existed before you turned this on, and never snipes your own launches.</div>
       ` : `
-        <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Auto-buy a set dollar amount into every new community coin the moment it launches, for as long as it's toggled on. One-time unlock, pause/resume anytime after.</div>
+        <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Auto-buy a set dollar amount into every new coin the moment it launches — community coins and Bot Market spawns alike — for as long as it's toggled on. One-time unlock, pause/resume anytime after.</div>
         <button class="btn btn-lime btn-block" id="snipeBuyBtn">Unlock for ${fmtUsd(SNIPE_BOT_PRICE)}</button>
       `}
     </div>
