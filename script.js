@@ -668,7 +668,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -723,7 +723,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -935,7 +935,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -1430,6 +1430,7 @@ async function doSell(coinId, tokenAmount){
         coinId: coin.id||coinId, ticker: coin.ticker, name: coin.name, imageURL: coin.imageURL||'',
         tokensSold: tokenAmount, costBasis: costRemoved, proceeds: usdOut, pnl: usdOut-costRemoved,
         heldMs: Date.now() - (prevHold.firstBuyAt || Date.now()),
+        viaSnipe: !!prevHold.viaSnipe, // same "most recent touch" convention as the holding's own flag
         closedAt: Date.now()
       });
       return { usdOut, pnl: usdOut-costRemoved };
@@ -1655,7 +1656,7 @@ function botCoinTradeSize(){
 // supply, not a deeper curve.
 const BOT_COIN_SUPPLY_CHOICES = [100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000];
 
-function simulateBotCoinLaunch(){
+function simulateBotCoinLaunch(guaranteedGrowth=false){
   const totalSupply = BOT_COIN_SUPPLY_CHOICES[Math.floor(Math.random()*BOT_COIN_SUPPLY_CHOICES.length)];
   const startMcap = 2000+Math.random()*78000; // wide spread — some tiny, some near graduation-scale
   const initPrice = startMcap/totalSupply;
@@ -1664,7 +1665,9 @@ function simulateBotCoinLaunch(){
   // ~30% of spawns are genuinely brand new — zero trades, flat single-point history, nothing
   // fabricated — instead of every single coin arriving with a fake multi-hour backstory. Gives
   // Explore a real mix: some coins you're seeing at literally trade #0, others already established.
-  if(Math.random() < 0.3){
+  // Guaranteed-growth (Right Ctrl) coins always skip this — "thousands of trades" is part of the
+  // guarantee, so they always get the established backstory below, never a from-scratch one.
+  if(!guaranteedGrowth && Math.random() < 0.3){
     return {
       priceHistory: [{p:initPrice, t:now}],
       currentPrice: initPrice,
@@ -1680,23 +1683,34 @@ function simulateBotCoinLaunch(){
   const priceHistory = [];
   for(let i=0;i<steps;i++){
     let mult;
-    // Bigger and more frequent moves than a community coin's organic trading — this is what's
-    // "priced in" as the coin's whole simulated history, so it should already look properly wild.
-    if(Math.random()<0.14) mult = 1 + (Math.random()<0.5?-1:1)*(0.35+Math.random()*0.55); // big jump
-    else mult = 1 + (Math.random()-0.5)*0.22; // energetic wobble
+    if(guaranteedGrowth){
+      // Mostly-upward fabricated history to match the "only goes up, occasional small drop"
+      // guarantee — even its fake past should already look like a winner, not a normal wobble.
+      if(Math.random()<0.08) mult = 1 - Math.random()*0.08; // rare small dip
+      else mult = 1 + Math.random()*0.10; // steady upward drift
+    } else if(Math.random()<0.14){
+      mult = 1 + (Math.random()<0.5?-1:1)*(0.35+Math.random()*0.55); // big jump
+    } else {
+      // Bigger and more frequent moves than a community coin's organic trading — this is what's
+      // "priced in" as the coin's whole simulated history, so it should already look properly wild.
+      mult = 1 + (Math.random()-0.5)*0.22; // energetic wobble
+    }
     p = Math.max(initPrice*0.03, p*mult);
     priceHistory.push({ p, t: now-(steps-i)*stepGapMs });
   }
   const recentTrades = [];
   for(let i=0;i<14;i++){
-    const isBuy = Math.random()<0.5;
+    const isBuy = guaranteedGrowth ? Math.random()<0.9 : Math.random()<0.5;
     recentTrades.push({
       uid:'bot', username: randBotName(), type: isBuy?'buy':'sell',
       usdAmount: 8+Math.random()*300, tokenAmount: 20+Math.random()*5000,
       t: now-(14-i)*(stepGapMs/3), isBot:true
     });
   }
-  return { priceHistory, currentPrice: p, tradeCountSeed: 900+Math.floor(Math.random()*5200), recentTrades, totalSupply };
+  // Guaranteed-growth coins always start deep into "thousands of trades" (3,000–9,000) rather
+  // than the normal 900–6,100 range other established coins get.
+  const tradeCountSeed = guaranteedGrowth ? 3000+Math.floor(Math.random()*6000) : 900+Math.floor(Math.random()*5200);
+  return { priceHistory, currentPrice: p, tradeCountSeed, recentTrades, totalSupply };
 }
 
 async function makeUniqueBotTicker(){
@@ -1717,7 +1731,7 @@ async function spawnBotCoin(forceSpawn=false){
     const picked = await makeUniqueBotTicker();
     if(!picked) return;
     const { name, ticker } = picked;
-    const { priceHistory, currentPrice, tradeCountSeed, recentTrades, totalSupply } = simulateBotCoinLaunch();
+    const { priceHistory, currentPrice, tradeCountSeed, recentTrades, totalSupply } = simulateBotCoinLaunch(forceSpawn);
     // Liquidity depth is chosen directly in dollar terms (same order of magnitude as a real
     // community coin's $8,000 depth) rather than derived from the fabricated price walk. Deriving
     // it from price meant a coin whose random walk happened to land low ended up with almost no
@@ -1743,7 +1757,10 @@ async function spawnBotCoin(forceSpawn=false){
       solReserve, tokenReserve,
       price: currentPrice, marketCap: currentPrice*totalSupply,
       priceHistory, recentTrades, tradeCount: tradeCountSeed,
-      ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
+      // guaranteedGrowth is the single flag botCoinTick checks to skip rug-eligibility and swap
+      // in the heavily-bullish trade bias below; guaranteedHolderRampStart independently drives
+      // the simulated holder-count ramp (see refreshHolderCount).
+      ...(forceSpawn ? { guaranteedGrowth: true, guaranteedHolderRampStart: Date.now() } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     });
     await setDoc(doc(db,'tickers',ticker), { coinId: coinRef.id });
@@ -1852,6 +1869,23 @@ async function botCoinTick(){
     snap.docs.forEach(d=>{
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
+      if(coin.guaranteedGrowth){
+        // Right-Ctrl force-spawned coins: never eligible for a rug-pull, and trade on a fixed
+        // heavily-bullish bias instead of the normal trend logic — mostly buys, with an
+        // occasional small dip rather than a real bearish swing. Skips the rug-eligibility
+        // check and the normal trend-bias branch entirely.
+        if(Math.random() >= BOT_COIN_TRADE_CHANCE) return;
+        const usd = botCoinTradeSize();
+        const big = usd>800;
+        const smallDip = Math.random() < 0.12; // occasional small drop, never a real reversal
+        const buyChance = smallDip ? 0.3 : 0.93;
+        setTimeout(()=>{
+          if(coinsWithPendingUserTrade.has(d.id)) return;
+          if(Math.random() < buyChance) botBuyOnCoin(d.id, usd, big);
+          else if(pumpAllowsSell(coin)) botSellOnCoin(d.id, Math.min(usd, usd*0.4), false); // dips are shallow, not crashes
+        }, Math.random()*18000);
+        return;
+      }
       if(coin.ruggedAt){
         // Rugged coins stay in the pool forever now — no deletion, still fully tradeable — but
         // recovery is deliberately rare: buy chance is fixed low instead of using the normal
@@ -2147,17 +2181,25 @@ const SNIPE_BOT_PRICE = 500; // one-time cost to unlock; pausing/resuming afterw
 // retroactively buy coins launched before you turned it on — only ones launched from that point
 // forward. Since Bot Market spawns happen more often than community launches, turning this on
 // means noticeably more frequent snipe buys than before.
-let snipeListenerReady = false;
+let snipeCursorMs = null;
 function listenAutoSnipe(){
-  snipeListenerReady = false;
-  const q = query(collection(db,'coins'), orderBy('createdAt','desc'), limit(5));
+  snipeCursorMs = Date.now(); // only react to coins created after this instant
+  // limit(50) is just a safety cap on the query itself, not the "how many can I catch" window —
+  // the actual new-vs-already-existed decision is the createdAt-vs-cursor check below, which
+  // works correctly no matter how many coins arrive in one snapshot batch or how Firestore
+  // chunks delivery. The old approach (a tiny limit(5) + treat every 'added' as new) missed
+  // coins whenever more than a handful were created close together — e.g. the 5-coin bootstrap
+  // spawn, or a few Right Ctrl presses in a row — since Firestore doesn't guarantee one event
+  // per document in that scenario.
+  const q = query(collection(db,'coins'), orderBy('createdAt','desc'), limit(50));
   const un = onSnapshot(q, snap=>{
-    if(!snipeListenerReady){ snipeListenerReady = true; return; } // skip the initial existing batch
     snap.docChanges().forEach(change=>{
       if(change.type!=='added') return;
+      const c = change.doc.data();
+      const createdMs = toMillisLoose(c.createdAt);
+      if(createdMs <= snipeCursorMs) return; // existed before we started watching — not new
       const snipe = state.userDoc?.snipeBot;
       if(!snipe?.active) return;
-      const c = change.doc.data();
       // Now includes Bot Market spawns too, not just community launches.
       if(c.creatorUid===state.uid) return; // don't snipe your own launch
       const amount = snipe.amountPerCoin||0;
@@ -2203,12 +2245,13 @@ async function openSnipeStatsModal(){
   overlay.innerHTML = `
     <div class="modal-box">
       <h3>🎯 Auto-Snipe Stats</h3>
-      <div style="display:flex;gap:20px;margin:14px 0;">
+      <div style="display:flex;gap:20px;margin:14px 0;flex-wrap:wrap;">
         <div><div style="font-size:11px;color:var(--txt-faint);">TOTAL SPENT</div><div class="mono" style="font-size:18px;font-weight:700;">${fmtUsd(snipe.totalSpent||0)}</div></div>
         <div><div style="font-size:11px;color:var(--txt-faint);">COINS SNIPED</div><div class="mono" style="font-size:18px;font-weight:700;">${list.length}</div></div>
         <div><div style="font-size:11px;color:var(--txt-faint);">CURRENT VALUE</div><div class="mono" style="font-size:18px;font-weight:700;" id="snipeCurValue">—</div></div>
+        <div><div style="font-size:11px;color:var(--txt-faint);">REALIZED P&L (SOLD)</div><div class="mono" style="font-size:18px;font-weight:700;" id="snipeRealizedPnl">—</div></div>
       </div>
-      <div style="font-size:11px;color:var(--txt-faint);line-height:1.4;margin-bottom:10px;">Current value only counts coins you still hold from the list below — if you've also bought/sold any of these by hand, this blends both rather than isolating just the snipe portion.</div>
+      <div style="font-size:11px;color:var(--txt-faint);line-height:1.4;margin-bottom:10px;">Current value only counts coins you still hold from the list below. Realized P&L sums every past sell tagged as coming from a sniped position. Since a sniped coin's position can also get topped up or sold by hand, both numbers blend snipe and manual activity on the same coin rather than isolating just the snipe portion.</div>
       <div id="snipeCoinList" style="max-height:280px;overflow-y:auto;">${list.length? list.map(s=>`
         <div class="holder-line" data-coin="${s.coinId}" style="cursor:pointer;">
           <img class="coin-logo" src="${coinLogoFor(s.ticker, s.imageURL)}">
@@ -2242,6 +2285,20 @@ async function openSnipeStatsModal(){
     const el = document.getElementById('snipeCurValue');
     if(el) el.textContent = fmtUsd(total);
   }catch(err){ const el = document.getElementById('snipeCurValue'); if(el) el.textContent = '—'; }
+
+  try{
+    const closedSnap = await getDocs(collection(db,'users',state.uid,'closedPositions'));
+    const realizedPnl = closedSnap.docs
+      .map(d=>d.data())
+      .filter(c=>c.viaSnipe)
+      .reduce((sum,c)=> sum+(c.pnl||0), 0);
+    const el = document.getElementById('snipeRealizedPnl');
+    if(el){
+      const up = realizedPnl>=0;
+      el.style.color = up? 'var(--up)':'var(--down)';
+      el.textContent = `${up?'▲':'▼'} ${fmtUsd(Math.abs(realizedPnl))}`;
+    }
+  }catch(err){ const el = document.getElementById('snipeRealizedPnl'); if(el) el.textContent = '—'; }
 }
 
 async function purchaseSnipeBot(){

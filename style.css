@@ -153,6 +153,7 @@ label.flabel{font-size:12px;color:var(--txt-dim);font-weight:600;letter-spacing:
 .grad-badge{font-size:10px;background:rgba(198,255,61,.14);color:var(--lime);border:1px solid rgba(198,255,61,.3);padding:2px 7px;border-radius:100px;font-weight:700;flex-shrink:0;}
 .grad-badge.bot-badge{background:rgba(139,107,255,.16);color:#B8A6FF;border-color:rgba(139,107,255,.35);}
 .grad-badge.rug-badge{background:rgba(255,77,109,.16);color:var(--down);border-color:rgba(255,77,109,.4);}
+.grad-badge.guaranteed-badge{background:rgba(198,255,61,.16);color:var(--lime);border-color:rgba(198,255,61,.4);}
 .cat-blurb{font-size:12.5px;color:var(--txt-dim);margin:-6px 0 16px;line-height:1.5;}
 .coin-card-mid{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:10px;}
 .coin-price{font-family:var(--mono);font-weight:600;font-size:16px;}
