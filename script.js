@@ -474,6 +474,24 @@ document.addEventListener('keyup', (e)=>{
 });
 window.addEventListener('blur', ()=>{ rightShiftDown=false; hideResetFab(); });
 
+// Right Ctrl: instantly force-spawn a new bot coin, bypassing the normal probabilistic ~5%-a-
+// minute trickle and the pool cap (this is a deliberate admin action, not the ambient spawner).
+// Guarded against firing repeatedly from the browser's own key-repeat while held down.
+let rightCtrlDown = false;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ControlRight') return;
+  if(rightCtrlDown) return;
+  rightCtrlDown = true;
+  if(!isPumpAdmin()) return;
+  spawnBotCoin();
+  toast('🤖 Force-spawned a new bot coin!', 'ok');
+});
+document.addEventListener('keyup', (e)=>{
+  if(e.code!=='ControlRight') return;
+  rightCtrlDown = false;
+});
+window.addEventListener('blur', ()=>{ rightCtrlDown=false; });
+
 function openResetConfirmModal(){
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
@@ -592,9 +610,13 @@ function loadHomeCoins(){
   // Bot Market is a server-side filter (needs a composite index — see SETUP.md); Community stays
   // an unfiltered query + client-side exclusion so older coins launched before this feature
   // (which have no isBotCoin field at all) still show up correctly.
+  // No limit() — every coin that exists shows up, not just the most recent batch. Worth knowing:
+  // as the total coin count grows over a long-running app (nothing ever gets deleted now — see
+  // Rug-pull events and the persistence notes above), this reads every matching document on
+  // every Explore load, which is a real, unbounded cost tradeoff for "see literally everything."
   const q = homeCategory==='bot'
-    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,sortDir), limit(60))
-    : query(collection(db,'coins'), orderBy(sortField,sortDir), limit(60));
+    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,sortDir))
+    : query(collection(db,'coins'), orderBy(sortField,sortDir));
   homeUnsub = onSnapshot(q, snap=>{
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
