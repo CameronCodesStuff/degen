@@ -608,7 +608,7 @@ function renderHome(){
     <div class="chip-row" id="categoryChips">
       <div class="chip" data-cat="user">🧑‍🤝‍🧑 Community Coins</div>
       <div class="chip" data-cat="bot">🤖 Bot Market</div>
-      <div class="chip" data-cat="risky" style="margin-left:auto;">⚠️ Risky</div>
+      <div class="chip" data-cat="risky">⚠️ Risky</div>
     </div>
     <div class="cat-blurb" id="categoryBlurb"></div>
     <div id="sortSearchWrap">
