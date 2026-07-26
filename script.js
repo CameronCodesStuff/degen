@@ -329,6 +329,7 @@ onAuthStateChanged(auth, async (user)=>{
     listenUserDoc();
     listenTickerTape();
     listenWhaleAlerts();
+    listenAutoSnipe();
     navigate('home');
     startBots();
     startConsoleAutoClear();
@@ -2087,6 +2088,62 @@ function listenWhaleAlerts(){
   state.unsubs.push(un);
 }
 
+/* ===================== AUTO-SNIPE BOT ===================== */
+const SNIPE_BOT_PRICE = 500; // one-time cost to unlock; pausing/resuming afterward is free
+// Watches for newly-launched COMMUNITY coins (bot coins aren't "made" by anyone, so they're not
+// what "snipe every new coin" means here) and auto-buys a fixed dollar amount into each one, for
+// as long as the feature is toggled on. Real, structural limitation worth being upfront about:
+// since there's no backend, this can only fire while YOUR OWN account is signed in on some open
+// tab of yours — unlike the ambient bot system (which just needs *any* tab open), this needs
+// specifically yours, because a buy has to run under your own authenticated session to touch
+// your own balance and holdings. It does NOT retroactively buy coins launched before you turned
+// it on — only ones launched from that point forward.
+let snipeListenerReady = false;
+function listenAutoSnipe(){
+  snipeListenerReady = false;
+  const q = query(collection(db,'coins'), orderBy('createdAt','desc'), limit(5));
+  const un = onSnapshot(q, snap=>{
+    if(!snipeListenerReady){ snipeListenerReady = true; return; } // skip the initial existing batch
+    snap.docChanges().forEach(change=>{
+      if(change.type!=='added') return;
+      const snipe = state.userDoc?.snipeBot;
+      if(!snipe?.active) return;
+      const c = change.doc.data();
+      if(c.isBotCoin) return; // only real launches count as "made"
+      if(c.creatorUid===state.uid) return; // don't snipe your own launch
+      const amount = snipe.amountPerCoin||0;
+      if(!(amount>0)) return;
+      if((state.userDoc?.balance||0) < amount) return; // can't afford it right now — skip quietly
+      doBuy(change.doc.id, amount);
+      toast(`🎯 Auto-snipe: bought ${fmtUsd(amount)} of $${esc(c.ticker)}`, 'ok', ()=> navigate('coin', change.doc.id));
+    });
+  }, ()=>{ /* silent — non-critical */ });
+  state.unsubs.push(un);
+}
+
+async function purchaseSnipeBot(){
+  const bal = state.userDoc?.balance||0;
+  if(bal < SNIPE_BOT_PRICE){ toast(`Need ${fmtUsd(SNIPE_BOT_PRICE)} to unlock the auto-snipe bot.`, 'err'); return; }
+  try{
+    await updateDoc(doc(db,'users',state.uid), {
+      balance: bal - SNIPE_BOT_PRICE,
+      snipeBot: { owned:true, active:true, amountPerCoin:10 }
+    });
+    toast('🎯 Auto-snipe bot unlocked and active!', 'ok');
+  }catch(err){ toast('Purchase failed: '+err.message, 'err'); }
+}
+async function toggleSnipeBot(){
+  const snipe = state.userDoc?.snipeBot;
+  if(!snipe?.owned) return;
+  try{ await updateDoc(doc(db,'users',state.uid), { 'snipeBot.active': !snipe.active }); }
+  catch(err){ toast('Couldn\'t update: '+err.message, 'err'); }
+}
+async function updateSnipeAmount(newAmount){
+  if(!(newAmount>0)){ toast('Enter an amount greater than $0.', 'err'); return; }
+  try{ await updateDoc(doc(db,'users',state.uid), { 'snipeBot.amountPerCoin': newAmount }); toast('Snipe amount updated.', 'ok'); }
+  catch(err){ toast('Couldn\'t update: '+err.message, 'err'); }
+}
+
 function renderActivity(){
   const view = document.getElementById('view');
   view.innerHTML = `
@@ -2464,6 +2521,26 @@ function renderProfile(){
       <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
     </div>
     <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">🎯 Auto-Snipe Bot</div>
+      ${u.snipeBot?.owned ? `
+        <div class="settings-row">
+          <span>Status</span>
+          <button class="btn ${u.snipeBot.active?'btn-lime':'btn-ghost'}" id="snipeToggleBtn">${u.snipeBot.active?'Active — tap to pause':'Paused — tap to resume'}</button>
+        </div>
+        <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;">
+          <span>Amount per coin</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <input class="field" id="snipeAmountInput" style="width:90px;padding:8px 10px;" inputmode="decimal" value="${u.snipeBot.amountPerCoin||10}">
+            <button class="btn btn-ghost" id="snipeAmountSaveBtn">Save</button>
+          </div>
+        </div>
+        <div style="font-size:11.5px;color:var(--txt-faint);margin-top:8px;line-height:1.5;">Auto-buys this amount into every new community coin launched from now on — only while your account is signed in on some open tab of yours. Doesn't touch coins launched before you turned this on, and never snipes your own launches.</div>
+      ` : `
+        <div style="font-size:13px;color:var(--txt-dim);line-height:1.5;margin-bottom:12px;">Auto-buy a set dollar amount into every new community coin the moment it launches, for as long as it's toggled on. One-time unlock, pause/resume anytime after.</div>
+        <button class="btn btn-lime btn-block" id="snipeBuyBtn">Unlock for ${fmtUsd(SNIPE_BOT_PRICE)}</button>
+      `}
+    </div>
+    <div class="panel" style="margin-top:16px;">
       <div style="font-weight:700;margin-bottom:10px;">Net Worth Over Time</div>
       <div class="chart-wrap" style="height:180px;"><canvas id="profChart"></canvas></div>
     </div>
@@ -2476,6 +2553,12 @@ function renderProfile(){
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
+  document.getElementById('snipeBuyBtn')?.addEventListener('click', ()=> purchaseSnipeBot());
+  document.getElementById('snipeToggleBtn')?.addEventListener('click', ()=> toggleSnipeBot());
+  document.getElementById('snipeAmountSaveBtn')?.addEventListener('click', ()=>{
+    const v = parseFloat(document.getElementById('snipeAmountInput').value);
+    updateSnipeAmount(v);
+  });
   drawNetWorthChart('profChart', u.netWorthHistory);
   loadPositions(state.uid).then(({open, closed})=>{
     const openEl = document.getElementById('openPosList');
