@@ -99,12 +99,22 @@ const state = {
 };
 
 function clearUnsubs(){ state.unsubs.forEach(u=>u()); state.unsubs = []; }
+// Shared by fmtUsd and fmtTok — extended well past the old M/B cap since compounding growth
+// mechanics (guaranteed-growth, pump, bank interest, etc.) can realistically put some numbers
+// in this app into the billions and beyond. Ordered largest-first so the first match wins.
+const NUM_TIERS = [
+  { v: 1e33, s: 'Dc' }, { v: 1e30, s: 'No' }, { v: 1e27, s: 'Oc' }, { v: 1e24, s: 'Sp' },
+  { v: 1e21, s: 'Sx' }, { v: 1e18, s: 'Qi' }, { v: 1e15, s: 'Qa' }, { v: 1e12, s: 'T' },
+  { v: 1e9,  s: 'B'  }, { v: 1e6,  s: 'M'  }, { v: 1e3,  s: 'K'  }
+];
 function fmtUsd(n){
   if(n===undefined||n===null||isNaN(n)) n=0;
-  const abs=Math.abs(n);
-  if(abs>=1000000) return (n<0?'-':'')+'$'+(abs/1000000).toFixed(2)+'M';
-  if(abs>=1000) return (n<0?'-':'')+'$'+(abs/1000).toFixed(2)+'K';
-  return (n<0?'-':'')+'$'+abs.toFixed(abs<1?4:2);
+  const neg = n<0;
+  const abs = Math.abs(n);
+  for(const tier of NUM_TIERS){
+    if(abs>=tier.v) return (neg?'-':'')+'$'+(abs/tier.v).toFixed(2)+tier.s;
+  }
+  return (neg?'-':'')+'$'+abs.toFixed(abs<1?4:2);
 }
 const SUBSCRIPT_DIGITS = {'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉'};
 function fmtPrice(p){
@@ -121,10 +131,12 @@ function fmtPrice(p){
 }
 function fmtTok(n){
   if(n===undefined||n===null||isNaN(n)) n=0;
-  if(n>=1e9) return (n/1e9).toFixed(2)+'B';
-  if(n>=1e6) return (n/1e6).toFixed(2)+'M';
-  if(n>=1e3) return (n/1e3).toFixed(2)+'K';
-  return n.toFixed(2);
+  const neg = n<0;
+  const abs = Math.abs(n);
+  for(const tier of NUM_TIERS){
+    if(abs>=tier.v) return (neg?'-':'')+(abs/tier.v).toFixed(2)+tier.s;
+  }
+  return (neg?'-':'')+abs.toFixed(2);
 }
 function timeAgo(ts){
   if(!ts) return '';

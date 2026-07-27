@@ -225,6 +225,9 @@ The older +100%-minimum guarantee (`guaranteePumpToPositive100()`) still runs af
 
 Like the rest of the bot system, this is 100% client-side — it's a fun toggle for one account, not a real access-control feature, and a determined user could bypass the check via devtools.
 
+### Large number formatting (billions, trillions, and beyond)
+`fmtUsd()` and `fmtTok()` used to cap out at M (millions) and B (billions) respectively — anything larger just printed as an absurdly large number with that same suffix (e.g. a $50 billion net worth would've shown as "$50000.00M"). With compounding mechanics in this app now (guaranteed-growth, pump, bank interest, Copy Trade snowballing, etc.), real numbers can land well past that. Both functions now share one extended suffix ladder: K, M, B, T, Qa (quadrillion), Qi (quintillion), Sx (sextillion), Sp (septillion), Oc (octillion), No (nonillion), Dc (decillion) — comfortably covers anything up to 33 zeros. A number with 20 zeros, for example, now reads as something like "$150.00Qi" instead of an unreadable string of digits.
+
 ### Bot notifications toggle
 A "🔔 Bot notifications" On/Off toggle on your own profile settings — defaults to On (matches existing behavior). Turning it off suppresses two specific things: whale alert toasts for trades tagged `uid:'bot'` (real user whale trades are completely unaffected — those keep showing regardless), and the "💀 coin just got rugged" toast. Stored as `notifPrefs.botNotifications` on your user doc, checked via `botNotificationsEnabled()`. Deliberately scoped to ambient bot-market noise only — snipe-bot and Copy Trade confirmation toasts aren't touched by this setting, since those are actionable information about your own money moving, not background noise, even though they're technically automated too.
 
