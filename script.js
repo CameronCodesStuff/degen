@@ -394,6 +394,10 @@ function listenUserDoc(){
     document.getElementById('topAvatar').src = avatarFor(state.userDoc.username, state.userDoc.avatarURL);
     if(state.route.name==='profile') renderProfile();
     if(state.route.name==='portfolio') renderPortfolio();
+    const navAbyss = document.getElementById('navAbyss');
+    const unlocked = (state.userDoc.netWorth ?? state.userDoc.balance ?? 0) >= ABYSS_UNLOCK_NET_WORTH;
+    if(navAbyss) navAbyss.style.display = unlocked ? '' : 'none';
+    if(state.route.name==='abyss' && !unlocked) navigate('home'); // dropped below the threshold mid-visit
   });
   state.unsubs.push(un);
 }
@@ -419,6 +423,7 @@ function navigate(name, param=null){
   state.route = {name, param};
   if(name!=='coin'){ stopViewerCount(); stopHolderCount(); stopViewingMicroTick(); }
   if(name!=='home'){ if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub=null; } if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub=null; } }
+  if(name!=='abyss') stopAbyssListener();
   if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
@@ -427,6 +432,7 @@ function navigate(name, param=null){
   else if(name==='create') renderCreate();
   else if(name==='portfolio') renderPortfolio();
   else if(name==='bank') renderBank();
+  else if(name==='abyss') renderAbyss();
   else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
@@ -783,7 +789,7 @@ function loadHomeCoins(){
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
     if(homeCategory==='user') coins = coins.filter(c=> !c.isBotCoin);
-    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky); // Risky has its own dedicated tab
+    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky && !c.isAbyss); // Risky and the Abyss have their own dedicated tabs
     const term = (document.getElementById('homeSearch')?.value||'').toLowerCase();
     if(term) coins = coins.filter(c=> c.ticker.toLowerCase().includes(term) || c.name.toLowerCase().includes(term));
     if(homeSort==='gainers') coins = coins.slice().sort((a,b)=> pctChange(b.priceHistory)-pctChange(a.priceHistory));
@@ -813,6 +819,46 @@ function sparklineSvg(history, up){
 // doc directly. Reuses renderCoinGrid so the card looks and behaves identically to every other
 // coin card, just with a single-element array and its own badge (see the ⚠️ RISKY badge logic).
 let riskyScheduleUnsub = null, riskyCoinUnsub = null;
+let abyssScheduleUnsub = null, abyssCoinUnsub = null;
+function stopAbyssListener(){
+  if(abyssScheduleUnsub){ abyssScheduleUnsub(); abyssScheduleUnsub = null; }
+  if(abyssCoinUnsub){ abyssCoinUnsub(); abyssCoinUnsub = null; }
+}
+function renderAbyss(){
+  const view = document.getElementById('view');
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(netWorth < ABYSS_UNLOCK_NET_WORTH){
+    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div>The Abyss unlocks at ${fmtUsd(ABYSS_UNLOCK_NET_WORTH)}+ net worth. You're not there yet.</div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="section-title">💀 The Abyss</div>
+    <div class="panel" style="margin-bottom:16px;border-color:rgba(255,68,68,.35);">
+      <div style="font-size:13px;color:#FF6B6B;font-weight:700;margin-bottom:6px;">⚠️ Read before you touch this</div>
+      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.6;">One coin. The fastest-moving, most violent market in the entire app — bigger and more frequent swings than even the Risky tab. It can never be rugged, but that's not a mercy: the odds are deliberately stacked against you. Roughly 4 in 5 people who hold this end up losing money. The upside spikes are real and sometimes huge — but the house wins on net, by design. You unlocked this by crossing $1B net worth; that's the only gate here.</div>
+    </div>
+    <div id="abyssGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>
+  `;
+  stopAbyssListener();
+  abyssScheduleUnsub = onSnapshot(doc(db,'meta','abyssCoin'), snap=>{
+    const coinId = snap.exists() ? snap.data().coinId : null;
+    if(abyssCoinUnsub){ abyssCoinUnsub(); abyssCoinUnsub = null; }
+    const grid = document.getElementById('abyssGrid');
+    if(!coinId){
+      if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">💀</div>Hasn't been spawned yet — check back shortly.</div>`;
+      return;
+    }
+    abyssCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
+      const g = document.getElementById('abyssGrid');
+      if(!g) return;
+      if(!cSnap.exists()){ g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Gone.</div>`; return; }
+      const coin = {id:cSnap.id, ...cSnap.data()};
+      state.coinsCache.set(coin.id, coin);
+      renderCoinGrid([coin]);
+    });
+  }, ()=>{ const g=document.getElementById('abyssGrid'); if(g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load it.</div>`; });
+}
+
 function loadRiskyCoin(){
   if(homeUnsub){ homeUnsub(); homeUnsub = null; }
   if(riskyScheduleUnsub) riskyScheduleUnsub();
@@ -860,7 +906,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))))}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isAbyss?'<div class="grad-badge abyss-badge">💀 ABYSS</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')))))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -918,7 +964,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -1131,7 +1177,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -1899,6 +1945,20 @@ const RISKY_RUG_CHANCE = 0.035;      // ~23x the normal bot-coin rug chance — 
 const RISKY_RUG_MIN_AGE_MS = 5*60*1000; // short grace period so it can't rug the instant it's picked
 const RISKY_MEGA_CHANCE = 0.55; // 55% of trades are genuinely violent, sized off the coin's own reserve — was 0.4
 
+// The Abyss: a single permanent coin, gated behind $1B+ net worth, deliberately tuned to be the
+// single most extreme thing in the app. Distinct from Risky on purpose: Risky is unbiased chaos
+// (50/50, can get rugged entirely); the Abyss never rugs, but the odds are stacked against you —
+// it trades on a heavy, sustained sell bias, so holding it for any random stretch of time is a
+// losing bet more often than not. The occasional huge upward spike is real and can be caught, but
+// the house wins on net over time by design.
+const ABYSS_UNLOCK_NET_WORTH = 1e9;
+const ABYSS_TICK_MS = 4500;          // faster than every other coin in the app, including Risky's 9000
+const ABYSS_TRADE_CHANCE = 0.97;
+const ABYSS_SELL_BIAS = 0.68;        // ~68% of trades lean sell — this sustained drift is what actually produces "80% chance of losing"
+const ABYSS_MEGA_CHANCE = 0.6;
+const ABYSS_MIN_SWING = 1500;
+const ABYSS_MAX_SWING = 20000;
+
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
 
@@ -2007,7 +2067,7 @@ async function makeUniqueBotTicker(){
   return null; // give up quietly this round — next spawn check will try again
 }
 
-async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRisky=false){
+async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRisky=false, isAbyss=false){
   try{
     const picked = preset || await makeUniqueBotTicker();
     if(!picked) return;
@@ -2037,6 +2097,8 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRi
         ? "Fully automated market. Quietly seeded ahead of time — no rug risk, built to hold up for the long haul."
         : isRisky
         ? "Today's risky pick. No bias, no guarantees — could double, could get rugged. Extremely unpredictable on purpose."
+        : isAbyss
+        ? "The single most extreme market here. Never gets rugged — the odds are just stacked against you. Moves faster than anything else in the app."
         : 'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
       imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
@@ -2050,6 +2112,7 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRi
       ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
       ...(isInsider ? { isInsider: true } : {}),
       ...(isRisky ? { isRisky: true } : {}),
+      ...(isAbyss ? { isAbyss: true } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     };
     await setDoc(coinRef, coinData);
@@ -2167,6 +2230,51 @@ async function checkRiskySchedule(){
     if(newCoin) await setDoc(ref, { dayKey: today, coinId: newCoin.id });
   }catch(err){ /* ignore — e.g. a rare ticker/scheduling race, next check will just retry */ }
 }
+
+// Unlike Risky (replaced daily), the Abyss is a single PERMANENT coin — spawned exactly once,
+// ever, the first time any tab checks and finds meta/abyssCoin empty. Same once-a-minute
+// throttle as the other scheduling checks.
+let abyssCheckCounter = 0;
+async function checkAbyssSchedule(){
+  abyssCheckCounter++;
+  if(abyssCheckCounter!==1 && abyssCheckCounter%4!==0) return;
+  try{
+    const ref = doc(db,'meta','abyssCoin');
+    const snap = await getDoc(ref);
+    if(snap.exists() && snap.data().coinId) return; // already spawned, permanently — nothing to do, ever again
+    const picked = await makeUniqueBotTicker();
+    if(!picked) return;
+    const newCoin = await spawnBotCoin(false, picked, false, false, true);
+    if(newCoin) await setDoc(ref, { coinId: newCoin.id });
+  }catch(err){ /* ignore — e.g. a rare ticker/scheduling race, next check will just retry */ }
+}
+
+async function abyssCoinTick(){
+  try{
+    const snap = await getDoc(doc(db,'meta','abyssCoin'));
+    if(!snap.exists() || !snap.data().coinId) return;
+    const coinId = snap.data().coinId;
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const coinSnap = await getDoc(doc(db,'coins',coinId));
+    if(!coinSnap.exists()) return;
+    const coin = coinSnap.data();
+    if(Math.random() >= ABYSS_TRADE_CHANCE) return;
+    // Same "mega" idea as Risky — sizing relative to the coin's own current reserve guarantees a
+    // genuinely violent move regardless of depth — but skewed hard toward sells, which is what
+    // actually produces the sustained losing odds rather than just occasional big dumps.
+    const isMega = Math.random() < ABYSS_MEGA_CHANCE;
+    const usd = isMega
+      ? coin.solReserve * (0.7+Math.random()*1.8) // 70%-250% of current liquidity — even more violent than Risky's mega mode
+      : ABYSS_MIN_SWING + Math.random()*(ABYSS_MAX_SWING-ABYSS_MIN_SWING);
+    const isSell = Math.random() < ABYSS_SELL_BIAS;
+    setTimeout(()=>{
+      if(coinsWithPendingUserTrade.has(coinId)) return;
+      if(!isSell) botBuyOnCoin(coinId, usd, true);
+      else botSellOnCoin(coinId, usd, true, isMega?0.5:0.05); // mega sells relax the normal 5% cap, same idea as Risky
+    }, Math.random()*3000);
+  }catch(err){ /* non-critical */ }
+}
+
 
 async function riskyCoinTick(){
   try{
@@ -2319,6 +2427,7 @@ async function botCoinTick(){
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.isRisky) return; // handled entirely by its own dedicated riskyCoinTick loop instead
+      if(coin.isAbyss) return; // handled entirely by its own dedicated abyssCoinTick loop instead
       const hot = isCoinHot(coin);
       const hotStagger = (ms)=> hot ? ms*0.35 : ms; // hot coins fire sooner, not just more often
       if(coin.guaranteedGrowth){
@@ -2391,6 +2500,7 @@ async function botCoinTick(){
   maybeSpawnBotCoin();
   checkInsiderSchedule();
   checkRiskySchedule();
+  checkAbyssSchedule();
 }
 
 async function ruggedCoinEvent(coinId){
@@ -2493,9 +2603,11 @@ function startBots(){
   setTimeout(botTick, 3000);       // one early tick shortly after load
   setTimeout(botCoinTick, 4500);
   setTimeout(riskyCoinTick, 6000);
+  setTimeout(abyssCoinTick, 7000);
   scheduleNext(botTick, BOT_TICK_MS);
   scheduleNext(botCoinTick, BOT_TICK_MS);
   scheduleNext(riskyCoinTick, RISKY_TICK_MS);
+  scheduleNext(abyssCoinTick, ABYSS_TICK_MS);
 }
 function stopBots(){ botRunning = false; }
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }

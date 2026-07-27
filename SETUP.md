@@ -361,6 +361,20 @@ What makes it "risky":
 
 No new Firestore rules or indexes were needed for this — `meta/riskySchedule` reuses the same broad `meta/{docId}` rule already in place for bot scheduling.
 
+### The Abyss (sidenav-only, unlocked at $1B net worth)
+A new sidenav item ("💀 The Abyss") — deliberately **sidenav only**, not added to the bottom nav, which was already getting crowded at 8 items; mobile users without a visible sidenav can still reach it once unlocked via the URL/route directly, but there's no dedicated bottom-nav entry point for it. Hidden entirely (`display:none`) until net worth crosses `ABYSS_UNLOCK_NET_WORTH` ($1B, the same threshold as the Billionaire wealth tier and the billionaire trade explosion) — `listenUserDoc()` toggles its visibility live on every account update, and also redirects away from the page automatically if net worth ever drops back below the threshold mid-visit. Like the other wealth-gated features in this app, this is a client-side gate, not a real access-control boundary — consistent with how Insider Insights and the admin tricks already work.
+
+Unlike Risky (replaced daily), the Abyss is a **single permanent coin** — spawned exactly once, ever, the first time any tab checks `meta/abyssCoin` and finds it empty (`checkAbyssSchedule()`, same once-a-minute throttle as the other scheduling checks). It never gets replaced.
+
+What makes it the most extreme thing in the app, and deliberately different from Risky rather than just "Risky but more":
+- **Fastest tick in the app** — `abyssCoinTick()` runs every 4.5s, versus Risky's 9s and the main Bot Market loop's ~22s. Cheap to run this often since it's only ever touching one document.
+- **Heavily sell-biased, not unbiased like Risky.** This is the actual mechanism behind "80% chance of losing money": ~68% of trades (`ABYSS_SELL_BIAS`) lean sell rather than a 50/50 coin-flip, producing a sustained downward drift over any random holding period. The upside spikes are still real (mega-mode buys can be huge) and catchable if you time it — the odds are stacked against you, not impossible to beat.
+- **Even more violent mega-swings than Risky** — 60% of trades (`ABYSS_MEGA_CHANCE`) size themselves at 70%-250% of the coin's own current reserve (versus Risky's 60%-200%), and mega-sells relax the normal 5%-of-supply safety cap up to 50% (versus Risky's 35%).
+- **Never gets rugged, on purpose** — the opposite design choice from Risky, whose whole identity is being rug-prone. The Abyss doesn't need a rug mechanic; the sustained sell bias already does the work of making it a bad long-term bet, and permanence (never disappearing, unlike a daily-replaced Risky pick) matters more for a coin billionaires are meant to keep coming back to.
+- Still a completely real, fully tradeable coin — excluded from the normal Bot Market listing and the main bot tick loop (`isAbyss` coins are filtered out client-side and skipped in `botCoinTick`, same pattern as Risky) to avoid showing up twice or getting double-ticked from two loops at once.
+
+No new Firestore rules or indexes needed — `meta/abyssCoin` reuses the same broad `meta/{docId}` rule already in place.
+
 ### Rug-pull events
 Once a bot coin is at least 15 minutes old — and isn't a guaranteed-growth coin, which is permanently exempt (see above) — each 14s tick gives it a small (~0.15%) chance of a dramatic crash event: price collapses 90–98% in one shot and it gets a permanent 💀 RUGGED badge. This mirrors how real memecoins behave and gives holding a bot coin actual stakes instead of it being a risk-free chart to watch. A rugged coin is **not** deleted or delisted — it stays in the Bot Market pool forever and remains fully tradeable (the buy panel shows a clear warning instead of being disabled). What changes permanently is its odds: instead of the normal trend-bias buy/sell split, a rugged coin's bot trade decisions use a fixed low buy chance (`RUGGED_RECOVERY_CHANCE`, currently 6%), so it mostly keeps drifting down or sideways with only the rare small bounce — betting on a real comeback is meant to be a genuine long shot, not just a normal coin with a scary badge.
 
