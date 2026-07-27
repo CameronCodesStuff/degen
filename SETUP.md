@@ -225,6 +225,9 @@ The older +100%-minimum guarantee (`guaranteePumpToPositive100()`) still runs af
 
 Like the rest of the bot system, this is 100% client-side — it's a fun toggle for one account, not a real access-control feature, and a determined user could bypass the check via devtools.
 
+### Bot notifications toggle
+A "🔔 Bot notifications" On/Off toggle on your own profile settings — defaults to On (matches existing behavior). Turning it off suppresses two specific things: whale alert toasts for trades tagged `uid:'bot'` (real user whale trades are completely unaffected — those keep showing regardless), and the "💀 coin just got rugged" toast. Stored as `notifPrefs.botNotifications` on your user doc, checked via `botNotificationsEnabled()`. Deliberately scoped to ambient bot-market noise only — snipe-bot and Copy Trade confirmation toasts aren't touched by this setting, since those are actionable information about your own money moving, not background noise, even though they're technically automated too.
+
 ### Pinned coins
 **Portfolio-only and private** — pinning moved off both profile pages entirely. Any held coin can be pinned from the Portfolio holdings list — up to 3 at a time — via a Pin/Unpin button next to each row; pinned coins sort to the top (marked with 📌) there. This is purely a personal organizational tool now: nobody else can see what you've pinned, not even on your own public profile, which shows holdings in plain value order with no pin awareness at all. Stored as a plain `pinnedCoins` array on your user doc — same underlying field as before, just no longer read by either profile page's rendering.
 

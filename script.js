@@ -2380,7 +2380,7 @@ async function ruggedCoinEvent(coinId){
         ruggedAt: Date.now(), lastTickAt: Date.now()
       });
     });
-    if(ticker) toast(wasRisky
+    if(ticker && botNotificationsEnabled()) toast(wasRisky
       ? `💀 Today's risky pick ($${ticker}) just got rugged — wiped out almost entirely in seconds. That's the risk.`
       : `💀 $${ticker} just got rugged — crashed ~90%+ in seconds. Still tradeable, but don't expect a comeback.`, 'err');
   }catch(err){ /* silent — bot noise shouldn't surface errors to the user */ }
@@ -2731,6 +2731,16 @@ let activityUnsub = null;
 // EVERYONE currently online, not just whoever triggered the trade. Starts once at sign-in,
 // independent of whatever page you're on.
 let whaleAlertsReady = false;
+// Default is ON (matches existing behavior) unless the user has explicitly turned it off.
+function botNotificationsEnabled(){
+  return state.userDoc?.notifPrefs?.botNotifications !== false;
+}
+async function toggleBotNotifications(){
+  const current = botNotificationsEnabled();
+  try{ await updateDoc(doc(db,'users',state.uid), { 'notifPrefs.botNotifications': !current }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+
 function listenWhaleAlerts(){
   whaleAlertsReady = false;
   const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(5));
@@ -2740,6 +2750,7 @@ function listenWhaleAlerts(){
       if(change.type!=='added') return;
       const t = change.doc.data();
       if(!(t.usdAmount>=WHALE_THRESHOLD)) return;
+      if(t.uid==='bot' && !botNotificationsEnabled()) return; // ambient bot noise, suppressible — real user whale alerts are unaffected
       const verb = t.type==='buy' ? 'dropped' : 'pulled';
       toast(`🐋 @${t.username} just ${verb} ${fmtUsd(t.usdAmount)} ${t.type==='buy'?'into':'out of'} $${t.ticker}!`, 'ok', ()=> navigate('coin', t.coinId));
     });
@@ -3748,6 +3759,7 @@ function renderProfile(){
     <div class="panel">
       <div class="settings-row"><span>Avatar image URL</span><button class="btn btn-ghost" id="changeAvatarBtn">Edit</button></div>
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
+      <div class="settings-row"><span>🔔 Bot notifications</span><button class="btn ${botNotificationsEnabled()?'btn-lime':'btn-ghost'}" id="botNotifToggleBtn">${botNotificationsEnabled()?'On':'Off'}</button></div>
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
       <div class="settings-row"><span>Bank</span><b class="mono">${fmtUsd(u.bank?.balance||0)}</b></div>
@@ -3822,6 +3834,7 @@ function renderProfile(){
   `;
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
+  document.getElementById('botNotifToggleBtn').addEventListener('click', ()=> toggleBotNotifications().then(()=> renderProfile()));
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
   document.getElementById('snipeBuyBtn')?.addEventListener('click', ()=> purchaseSnipeBot());
   document.getElementById('snipeToggleBtn')?.addEventListener('click', ()=> toggleSnipeBot());
