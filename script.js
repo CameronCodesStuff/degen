@@ -107,6 +107,29 @@ const NUM_TIERS = [
   { v: 1e21, s: 'Sx' }, { v: 1e18, s: 'Qi' }, { v: 1e15, s: 'Qa' }, { v: 1e12, s: 'T' },
   { v: 1e9,  s: 'B'  }, { v: 1e6,  s: 'M'  }, { v: 1e3,  s: 'K'  }
 ];
+// Wealth-tier badges — same magnitude ladder as NUM_TIERS, starting at $1M (below that just isn't
+// interesting enough to badge). Shown next to a username wherever one appears: leaderboard,
+// activity feed, and both profile pages.
+const WEALTH_TIERS = [
+  { v: 1e33, icon: '♾️', label: 'Decillionaire' },
+  { v: 1e30, icon: '🌈', label: 'Nonillionaire' },
+  { v: 1e27, icon: '🛸', label: 'Octillionaire' },
+  { v: 1e24, icon: '🌠', label: 'Septillionaire' },
+  { v: 1e21, icon: '🔥', label: 'Sextillionaire' },
+  { v: 1e18, icon: '⚡', label: 'Quintillionaire' },
+  { v: 1e15, icon: '🌌', label: 'Quadrillionaire' },
+  { v: 1e12, icon: '👑', label: 'Trillionaire' },
+  { v: 1e9,  icon: '💎', label: 'Billionaire' },
+  { v: 1e6,  icon: '💰', label: 'Millionaire' },
+];
+function wealthTierFor(netWorth){
+  for(const t of WEALTH_TIERS) if(netWorth>=t.v) return t;
+  return null;
+}
+function wealthBadgeHtml(netWorth){
+  const t = wealthTierFor(netWorth);
+  return t ? `<span class="wealth-badge" title="${t.label}">${t.icon}</span>` : '';
+}
 function fmtUsd(n){
   if(n===undefined||n===null||isNaN(n)) n=0;
   const neg = n<0;
@@ -1582,6 +1605,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
       const activityRef = doc(collection(db,'activity'));
       tx.set(activityRef, {
         uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
+        netWorth: state.userDoc.netWorth||0,
         type:'buy', usdAmount: finalUsd, tokenAmount: tokensOut, viaSnipe: !!viaSnipe,
         coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
         createdAt: serverTimestamp()
@@ -1653,6 +1677,7 @@ async function doSell(coinId, tokenAmount){
       const activityRef = doc(collection(db,'activity'));
       tx.set(activityRef, {
         uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
+        netWorth: state.userDoc.netWorth||0,
         type:'sell', usdAmount: usdOut, tokenAmount,
         coinId: coin.id||coinId, ticker: coin.ticker, coinName: coin.name, coinImage: coin.imageURL||'',
         createdAt: serverTimestamp()
@@ -2586,7 +2611,7 @@ async function submitCreateCoin(){
 
 /* ===================== BANK (dedicated tab) ===================== */
 function bankHistoryIcon(type){
-  return type==='deposit'?'⬇️':type==='withdraw'?'⬆️':type==='sent'?'📤':type==='received'?'📥':'📈';
+  return type==='deposit'?'⬇️':type==='withdraw'?'⬆️':type==='sent'?'📤':type==='received'?'📥':type==='giveaway'?'🎉':'📈';
 }
 function bankHistoryLabel(h){
   if(h.type==='deposit') return `Deposited ${fmtUsd(h.amount)}`;
@@ -2594,6 +2619,7 @@ function bankHistoryLabel(h){
   if(h.type==='sent') return `Sent ${fmtUsd(h.amount)} to @${esc(h.counterparty||'?')}`;
   if(h.type==='received') return `Received ${fmtUsd(h.amount)} from @${esc(h.counterparty||'?')}`;
   if(h.type==='growth') return `Grew by ${fmtUsd(h.amount)} (${h.days} day${h.days===1?'':'s'})`;
+  if(h.type==='giveaway') return `Funded a giveaway — ${fmtUsd(h.amount)} to ${h.winners} people`;
   return 'Bank activity';
 }
 function renderBank(){
@@ -2630,6 +2656,16 @@ function renderBank(){
       </div>
       <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Sends only actually arrive once the recipient's own account is signed in somewhere — nothing sensitive is exposed in the meantime, it just waits as a pending transfer.</div>
     </div>
+    <div class="panel" style="margin-bottom:20px;">
+      <div style="font-weight:700;margin-bottom:10px;">🎉 Fund a Giveaway</div>
+      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.5;margin-bottom:10px;">Split a lump sum randomly between a handful of other active users — a public flex that actually benefits someone else, instead of the money just sitting there as a number.</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <input class="field" id="giveawayAmount" style="flex:1;min-width:90px;" inputmode="decimal" placeholder="Total amount">
+        <input class="field" id="giveawayWinners" style="width:110px;" inputmode="numeric" placeholder="# winners" value="5">
+        <button class="btn btn-lime" id="giveawayFundBtn">Fund it</button>
+      </div>
+      <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Winners are drawn from real people who've actually traded recently — not a fully random pull — and the split isn't perfectly even on purpose. Announced publicly in the Activity feed once it goes out.</div>
+    </div>
     <div class="section-title" style="font-size:16px;">Recent Activity</div>
     <div id="bankHistoryList">${history.length? history.map(h=>`
       <div class="holder-line">
@@ -2650,6 +2686,9 @@ function renderBank(){
     sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
   });
   attachUserAutocomplete(document.getElementById('bankSendUser'));
+  document.getElementById('giveawayFundBtn').addEventListener('click', ()=>{
+    fundGiveaway(parseFloat(document.getElementById('giveawayAmount').value), parseInt(document.getElementById('giveawayWinners').value,10));
+  });
 }
 
 /* ===================== PORTFOLIO ===================== */
@@ -2944,7 +2983,7 @@ async function sendCashToUser(rawUsername, amount){
       const bankBal = u.bank?.balance||0;
       if(bankBal < amount) throw new Error("Not enough in your bank balance.");
       const history = (u.bank?.history||[]).concat([{type:'sent', amount, counterparty:toUsername, at:Date.now()}]).slice(-20);
-      tx.update(userRef, { 'bank.balance': bankBal-amount, 'bank.history': history });
+      tx.update(userRef, { 'bank.balance': bankBal-amount, 'bank.history': history, totalGivenUsd: (u.totalGivenUsd||0)+amount });
       const transferRef = doc(collection(db,'transfers'));
       tx.set(transferRef, {
         fromUid: state.uid, fromUsername: state.userDoc.username,
@@ -2953,6 +2992,60 @@ async function sendCashToUser(rawUsername, amount){
       });
     });
     toast(`💸 Sent ${fmtUsd(amount)} to @${toUsername}!`, 'ok');
+  }catch(err){ toast(err.message, 'err'); }
+}
+
+// Reuses the exact same transfer system as a normal send — the funder debits their own bank
+// balance and creates one transfer doc per winner (still addressed correctly, still only ever
+// crediting each winner's own account via their own client, same as a regular send). Winners are
+// drawn from real names in the last 100 activity entries (excluding bots and the funder), so it's
+// biased toward people who've actually been active recently rather than a fully random uid pull.
+// Split isn't perfectly even on purpose — a little randomness makes "who got what" more fun to
+// find out.
+async function fundGiveaway(amount, winnerCount){
+  if(!(amount>0)){ toast('Enter an amount to fund.', 'err'); return; }
+  if(!(winnerCount>=1)){ toast('Pick at least 1 winner.', 'err'); return; }
+  try{
+    const actSnap = await getDocs(query(collection(db,'activity'), orderBy('createdAt','desc'), limit(100)));
+    const seen = new Map();
+    actSnap.docs.forEach(d=>{
+      const t = d.data();
+      if(t.uid && t.uid!=='bot' && t.uid!==state.uid && !seen.has(t.uid)) seen.set(t.uid, t.username);
+    });
+    const candidates = [...seen.entries()].map(([uid,username])=>({uid,username}));
+    if(!candidates.length){ toast('No other active users found to give to yet.', 'err'); return; }
+    const winners = candidates.sort(()=>Math.random()-0.5).slice(0, Math.min(winnerCount, candidates.length));
+    const weights = winners.map(()=> 0.3+Math.random());
+    const totalWeight = weights.reduce((a,b)=>a+b,0);
+    const shares = weights.map(w=> Math.round((w/totalWeight)*amount*100)/100);
+    const shareSum = shares.reduce((a,b)=>a+b,0);
+    shares[shares.length-1] = Math.max(0.01, shares[shares.length-1] + Math.round((amount-shareSum)*100)/100);
+
+    await runTransaction(db, async (tx)=>{
+      const userRef = doc(db,'users',state.uid);
+      const uSnap = await tx.get(userRef);
+      if(!uSnap.exists()) throw new Error('Account not found.');
+      const u = uSnap.data();
+      const bankBal = u.bank?.balance||0;
+      if(bankBal < amount) throw new Error("Not enough in your bank balance.");
+      const history = (u.bank?.history||[]).concat([{type:'giveaway', amount, winners:winners.length, at:Date.now()}]).slice(-20);
+      tx.update(userRef, { 'bank.balance': bankBal-amount, 'bank.history': history, totalGivenUsd: (u.totalGivenUsd||0)+amount });
+      winners.forEach((w,i)=>{
+        const transferRef = doc(collection(db,'transfers'));
+        tx.set(transferRef, {
+          fromUid: state.uid, fromUsername: state.userDoc.username,
+          toUid: w.uid, toUsername: w.username,
+          type:'cash', amount: shares[i], status:'pending', createdAt: serverTimestamp(), isGiveaway:true
+        });
+      });
+      const annRef = doc(collection(db,'activity'));
+      tx.set(annRef, {
+        uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
+        netWorth: state.userDoc.netWorth||0, type:'giveaway', usdAmount: amount, winnerCount: winners.length,
+        createdAt: serverTimestamp()
+      });
+    });
+    toast(`🎉 Giveaway funded! ${fmtUsd(amount)} split between ${winners.length} people.`, 'ok');
   }catch(err){ toast(err.message, 'err'); }
 }
 
@@ -2967,7 +3060,8 @@ async function sendCoinToUser(rawUsername, coinId, tokens){
     const toUid = unameSnap.data().uid;
     await runTransaction(db, async (tx)=>{
       const holdRef = doc(db,'users',state.uid,'holdings',coinId);
-      const hSnap = await tx.get(holdRef);
+      const userRef = doc(db,'users',state.uid);
+      const [hSnap, uSnap] = await Promise.all([tx.get(holdRef), tx.get(userRef)]);
       if(!hSnap.exists()) throw new Error("You don't hold any of this coin.");
       const h = hSnap.data();
       if(tokens > h.tokens){
@@ -2980,6 +3074,7 @@ async function sendCoinToUser(rawUsername, coinId, tokens){
       const avgCost = h.tokens>0 ? (h.costBasis||0)/h.tokens : 0;
       const costRemoved = Math.min(h.costBasis||0, avgCost*tokens);
       tx.set(holdRef, { tokens: h.tokens-tokens, costBasis: Math.max(0,(h.costBasis||0)-costRemoved) }, {merge:true});
+      if(uSnap.exists()) tx.update(userRef, { totalGivenUsd: (uSnap.data().totalGivenUsd||0)+valueAtSend });
       const transferRef = doc(collection(db,'transfers'));
       tx.set(transferRef, {
         fromUid: state.uid, fromUsername: state.userDoc.username,
@@ -3358,11 +3453,20 @@ function loadActivity(){
     if(!list) return;
     const items = snap.docs.map(d=>({id:d.id,...d.data()})).filter(t=>!t.isBot).slice(0,50);
     if(!items.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🕒</div>No trades yet — activity will show up here as people buy and sell.</div>`; return; }
-    list.innerHTML = items.map(t=>`
+    list.innerHTML = items.map(t=> t.type==='giveaway' ? `
       <div class="holder-line">
         <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
           <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
-          <span>@${esc(t.username)}${t.viaSnipe?'\'s 🎯 snipe bot':''}</span>
+          <span>@${esc(t.username)}${wealthBadgeHtml(t.netWorth||0)}</span>
+        </div>
+        <span class="coin-chg up" style="padding:2px 7px;">🎉 Funded a giveaway</span>
+        <span class="amt mono">${fmtUsd(t.usdAmount)} → ${t.winnerCount} people</span>
+        <span style="font-size:11px;color:var(--txt-faint);margin-left:8px;">${timeAgo(t.createdAt)}</span>
+      </div>` : `
+      <div class="holder-line">
+        <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
+          <span>@${esc(t.username)}${wealthBadgeHtml(t.netWorth||0)}${t.viaSnipe?'\'s 🎯 snipe bot':''}</span>
         </div>
         <span class="${t.type==='buy'?'coin-chg up':'coin-chg down'}" style="padding:2px 7px;">${t.type==='buy'?'Bought':'Sold'}</span>
         <span class="coin-tag" data-coin="${t.coinId||''}" style="cursor:pointer;font-weight:600;">$${esc(t.ticker)}</span>
@@ -3394,6 +3498,7 @@ function renderLeaderboard(){
       <div class="chip" data-cat="daily">📅 Daily</div>
       <div class="chip" data-cat="weekly">🗓️ Weekly</div>
       <div class="chip" data-cat="alltime">👑 All-Time</div>
+      <div class="chip" data-cat="philanthropy">🎁 Philanthropy</div>
     </div>
     <div id="lbList"><div class="spinner" style="margin-top:40px;"></div></div>
   `;
@@ -3409,10 +3514,10 @@ function renderLeaderboard(){
       lbCategory = c.dataset.cat;
       document.querySelectorAll('#lbChips .chip').forEach(x=>x.classList.remove('active'));
       c.classList.add('active');
-      loadLeaderboard();
+      if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else loadLeaderboard();
     });
   });
-  loadLeaderboard();
+  if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else loadLeaderboard();
 }
 
 // Prefix search on usernameLower (already stored on every user doc for signup uniqueness checks).
@@ -3555,7 +3660,7 @@ async function loadLeaderboard(){
         <span style="width:26px;text-align:center;font-weight:700;">${medal}</span>
         <div class="user-link" data-uid="${r.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
           <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
-          <span>@${esc(r.username)}</span>
+          <span>@${esc(r.username)}${wealthBadgeHtml(r.current)}</span>
         </div>
         <span class="mono" style="margin-left:auto;">${fmtUsd(r.current)}</span>
         <span class="coin-chg ${up?'up':'down'}" style="padding:2px 7px;">${up?'▲':'▼'} ${fmtUsd(Math.abs(r.change))}</span>
@@ -3564,6 +3669,71 @@ async function loadLeaderboard(){
     list.querySelectorAll('.user-link').forEach(el=> el.addEventListener('click', ()=> openProfile(el.dataset.uid)));
   }catch(err){
     list.innerHTML = `<div class="empty">Couldn't load the leaderboard: ${esc(err.message)}</div>`;
+  }
+}
+
+// Tracks totalGivenUsd (see sendCashToUser/sendCoinToUser) — a single-field sort, no composite
+// index needed. Reframes "having too much money" as a flex that actually helps other players,
+// instead of it just sitting there as a number nobody else benefits from.
+// Cosmetic flexes — pure vanity, no gameplay effect, unlocked at wealth milestones (reusing the
+// same thresholds as the wealth-tier badges). A cosmetic only actually shows if BOTH toggled on
+// AND currently still eligible — if net worth ever drops back below the threshold, it stops
+// showing rather than persisting as a stale flex from a wealth level someone's no longer at.
+const COSMETIC_UNLOCKS = { glow: 1e6, ring: 1e9, banner: 1e12 };
+const BANNER_PRESETS = {
+  sunset:  'linear-gradient(135deg,#FF6B6B,#FFD93D)',
+  neon:    'linear-gradient(135deg,#8B6BFF,#C6FF3D)',
+  aurora:  'linear-gradient(135deg,#00C9FF,#92FE9D)',
+  inferno: 'linear-gradient(135deg,#FF3DAE,#FF8A00)',
+};
+function activeCosmetics(u, netWorth){
+  const c = u.cosmetics||{};
+  return {
+    glow: !!c.glowOn && netWorth>=COSMETIC_UNLOCKS.glow,
+    ring: !!c.ringOn && netWorth>=COSMETIC_UNLOCKS.ring,
+    bannerGrad: (c.bannerPreset && netWorth>=COSMETIC_UNLOCKS.banner) ? BANNER_PRESETS[c.bannerPreset] : null,
+  };
+}
+
+async function toggleCosmetic(field){
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  const threshold = field==='glowOn' ? COSMETIC_UNLOCKS.glow : COSMETIC_UNLOCKS.ring;
+  if(netWorth < threshold){ toast(`Need ${fmtUsd(threshold)}+ net worth to unlock this.`, 'err'); return; }
+  const current = !!state.userDoc?.cosmetics?.[field];
+  try{ await updateDoc(doc(db,'users',state.uid), { [`cosmetics.${field}`]: !current }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+async function setBannerPreset(key){
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(key && netWorth < COSMETIC_UNLOCKS.banner){ toast(`Need ${fmtUsd(COSMETIC_UNLOCKS.banner)}+ net worth to unlock this.`, 'err'); return; }
+  if(key && !BANNER_PRESETS[key]) return;
+  try{ await updateDoc(doc(db,'users',state.uid), { 'cosmetics.bannerPreset': key||null }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+
+async function loadPhilanthropyLeaderboard(){
+  const list = document.getElementById('lbList');
+  if(!list) return;
+  list.innerHTML = `<div class="spinner" style="margin-top:40px;"></div>`;
+  try{
+    const snap = await getDocs(query(collection(db,'users'), orderBy('totalGivenUsd','desc'), limit(25)));
+    const rows = snap.docs.map(d=>({uid:d.id, ...d.data()})).filter(u=>u.username && (u.totalGivenUsd||0)>0);
+    if(!rows.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🎁</div>Nobody's given anything away yet — be the first.</div>`; return; }
+    list.innerHTML = rows.map((r,i)=>{
+      const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':`#${i+1}`;
+      return `
+      <div class="holder-line">
+        <span style="width:26px;text-align:center;font-weight:700;">${medal}</span>
+        <div class="user-link" data-uid="${r.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
+          <span>@${esc(r.username)}${wealthBadgeHtml(r.netWorth||r.balance||0)}</span>
+        </div>
+        <span class="mono" style="margin-left:auto;color:var(--lime);">🎁 ${fmtUsd(r.totalGivenUsd)}</span>
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.user-link').forEach(el=> el.addEventListener('click', ()=> openProfile(el.dataset.uid)));
+  }catch(err){
+    list.innerHTML = `<div class="empty">Couldn't load the philanthropy leaderboard: ${esc(err.message)}</div>`;
   }
 }
 
@@ -3660,12 +3830,15 @@ async function renderUserProfile(uid){
   const u = uSnap.data();
   const today = todaysChange(u);
   const todayUp = today.change>=0;
+  const cos = activeCosmetics(u, u.netWorth ?? u.balance ?? 0);
   view.innerHTML = `
     <div class="back-btn" id="backBtn">← Back</div>
-    <div class="profile-head">
-      <img class="avatar-lg" src="${avatarFor(u.username,u.avatarURL)}">
+    <div class="profile-head${cos.bannerGrad?' has-banner':''}" ${cos.bannerGrad?`style="background:${cos.bannerGrad};"`:''}>
+      <div class="avatar-ring-wrap${cos.ring?' ring-active':''}">
+        <img class="avatar-lg${cos.glow?' avatar-glow':''}" src="${avatarFor(u.username,u.avatarURL)}">
+      </div>
       <div>
-        <div class="profile-name">@${esc(u.username)}</div>
+        <div class="profile-name">@${esc(u.username)}${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
         <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
@@ -3758,12 +3931,15 @@ function renderProfile(){
   const view = document.getElementById('view');
   const today = todaysChange(u);
   const todayUp = today.change>=0;
+  const cos = activeCosmetics(u, u.netWorth ?? u.balance ?? 0);
   view.innerHTML = `
     <div class="section-title">Profile</div>
-    <div class="profile-head">
-      <img class="avatar-lg" id="profAvatarImg" src="${avatarFor(u.username,u.avatarURL)}">
+    <div class="profile-head${cos.bannerGrad?' has-banner':''}" ${cos.bannerGrad?`style="background:${cos.bannerGrad};"`:''}>
+      <div class="avatar-ring-wrap${cos.ring?' ring-active':''}">
+        <img class="avatar-lg${cos.glow?' avatar-glow':''}" id="profAvatarImg" src="${avatarFor(u.username,u.avatarURL)}">
+      </div>
       <div>
-        <div class="profile-name">@${esc(u.username)}</div>
+        <div class="profile-name">@${esc(u.username)}${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
         <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
@@ -3778,6 +3954,26 @@ function renderProfile(){
       <div class="settings-row"><span>Win rate</span><b class="mono" id="winRateStat">—</b></div>
       <div class="settings-row"><span>Streak</span><b class="mono" id="winStreakStat">—</b></div>
       <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
+    </div>
+    <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">🎨 Cosmetic Flexes</div>
+      <div style="font-size:11.5px;color:var(--txt-faint);margin-bottom:12px;line-height:1.5;">Pure vanity, no gameplay effect — unlocked automatically at wealth milestones. If net worth ever drops back below the threshold, the effect stops showing until it's crossed again.</div>
+      <div class="settings-row">
+        <span>✨ Avatar glow ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.glow?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.glow)}+)</span>`}</span>
+        <button class="btn ${u.cosmetics?.glowOn?'btn-lime':'btn-ghost'}" id="cosGlowBtn" ${(u.netWorth??u.balance??0)<COSMETIC_UNLOCKS.glow?'disabled style="opacity:.4;"':''}>${u.cosmetics?.glowOn?'On':'Off'}</button>
+      </div>
+      <div class="settings-row">
+        <span>💫 Animated ring ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.ring?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.ring)}+)</span>`}</span>
+        <button class="btn ${u.cosmetics?.ringOn?'btn-lime':'btn-ghost'}" id="cosRingBtn" ${(u.netWorth??u.balance??0)<COSMETIC_UNLOCKS.ring?'disabled style="opacity:.4;"':''}>${u.cosmetics?.ringOn?'On':'Off'}</button>
+      </div>
+      <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;">
+        <span>🎨 Profile banner ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.banner?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.banner)}+)</span>`}</span>
+        <div style="display:flex;gap:6px;">
+          ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.banner ? Object.keys(BANNER_PRESETS).map(key=>`
+            <button class="btn ${u.cosmetics?.bannerPreset===key?'btn-lime':'btn-ghost'}" data-banner-preset="${key}" style="padding:6px 10px;font-size:11px;text-transform:capitalize;">${key}</button>
+          `).join('') + `<button class="btn btn-ghost" data-banner-preset="" style="padding:6px 10px;font-size:11px;">None</button>` : ''}
+        </div>
+      </div>
     </div>
     <div class="panel" style="margin-top:16px;">
       <div style="font-weight:700;margin-bottom:10px;">🎯 Auto-Snipe Bot</div>
@@ -3847,6 +4043,11 @@ function renderProfile(){
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('botNotifToggleBtn').addEventListener('click', ()=> toggleBotNotifications().then(()=> renderProfile()));
+  document.getElementById('cosGlowBtn')?.addEventListener('click', ()=> toggleCosmetic('glowOn').then(()=> renderProfile()));
+  document.getElementById('cosRingBtn')?.addEventListener('click', ()=> toggleCosmetic('ringOn').then(()=> renderProfile()));
+  document.querySelectorAll('[data-banner-preset]').forEach(btn=>{
+    btn.addEventListener('click', ()=> setBannerPreset(btn.dataset.bannerPreset).then(()=> renderProfile()));
+  });
   document.getElementById('changeAvatarBtn').addEventListener('click', ()=> openAvatarModal());
   document.getElementById('snipeBuyBtn')?.addEventListener('click', ()=> purchaseSnipeBot());
   document.getElementById('snipeToggleBtn')?.addEventListener('click', ()=> toggleSnipeBot());
