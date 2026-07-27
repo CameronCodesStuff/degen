@@ -156,6 +156,14 @@ label.flabel{font-size:12px;color:var(--txt-dim);font-weight:600;letter-spacing:
 .coin-name{font-size:12px;color:var(--txt-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .grad-badge{font-size:10px;background:rgba(198,255,61,.14);color:var(--lime);border:1px solid rgba(198,255,61,.3);padding:2px 7px;border-radius:100px;font-weight:700;flex-shrink:0;}
 .wealth-badge{font-size:13px;margin-left:3px;cursor:default;}
+.billionaire-explosion-overlay{position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:rgba(5,5,10,.6);backdrop-filter:blur(4px);cursor:pointer;animation:bExplosionBgIn .25s ease,bExplosionBgOut .5s ease 4s forwards;padding:20px;}
+.billionaire-explosion-content{text-align:center;animation:bExplosionPop .6s cubic-bezier(.2,1.6,.4,1);}
+.billionaire-explosion-icon{font-size:76px;animation:bExplosionIconIn 1s ease;filter:drop-shadow(0 0 30px rgba(198,255,61,.7));}
+.billionaire-explosion-text{font-family:var(--disp);font-size:21px;font-weight:700;color:#fff;margin-top:14px;max-width:420px;line-height:1.5;text-shadow:0 4px 24px rgba(198,255,61,.5);}
+@keyframes bExplosionBgIn{from{opacity:0;}to{opacity:1;}}
+@keyframes bExplosionBgOut{to{opacity:0;}}
+@keyframes bExplosionPop{0%{transform:scale(.3);opacity:0;}60%{transform:scale(1.1);}100%{transform:scale(1);opacity:1;}}
+@keyframes bExplosionIconIn{0%{transform:scale(0) rotate(-25deg);}70%{transform:scale(1.3) rotate(8deg);}100%{transform:scale(1) rotate(0deg);}}
 .grad-badge.bot-badge{background:rgba(139,107,255,.16);color:#B8A6FF;border-color:rgba(139,107,255,.35);}
 .grad-badge.rug-badge{background:rgba(255,77,109,.16);color:var(--down);border-color:rgba(255,77,109,.4);}
 .grad-badge.guaranteed-badge{background:rgba(198,255,61,.16);color:var(--lime);border-color:rgba(198,255,61,.4);}
@@ -239,6 +247,9 @@ label.flabel{font-size:12px;color:var(--txt-dim);font-weight:600;letter-spacing:
 .avatar-ring-wrap.ring-active::before{content:'';position:absolute;inset:-4px;border-radius:50%;background:conic-gradient(from 0deg,var(--lime),var(--violet),var(--magenta),var(--lime));animation:ringSpin 3s linear infinite;z-index:-1;}
 @keyframes ringSpin{to{transform:rotate(360deg);}}
 .avatar-glow{box-shadow:0 0 22px 6px rgba(198,255,61,.5);}
+.username-gradient{background:linear-gradient(90deg,var(--lime),var(--violet),var(--magenta));-webkit-background-clip:text;background-clip:text;color:transparent;background-size:200% auto;animation:usernameShimmer 4s linear infinite;}
+@keyframes usernameShimmer{to{background-position:200% center;}}
+.flair-pill{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:100px;background:linear-gradient(90deg,rgba(198,255,61,.18),rgba(139,107,255,.18));border:1px solid rgba(198,255,61,.35);color:var(--lime);margin-left:6px;vertical-align:middle;}
 .profile-name{font-family:var(--disp);font-size:22px;font-weight:700;}
 .profile-bio{color:var(--txt-dim);font-size:13.5px;margin-top:2px;}
 .settings-row{display:flex;align-items:center;justify-content:space-between;padding:14px 0;border-bottom:1px solid var(--border);font-size:14px;}

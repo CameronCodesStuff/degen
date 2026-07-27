@@ -1148,6 +1148,7 @@ function rebuildTradePanel(coin){
 
 function buyPanelHtml(coin){
   const bal = state.userDoc?.balance||0;
+  const amts = state.userDoc?.tradeDefaults?.buyAmounts || [5,20,50];
   return `
     ${coin.ruggedAt?(coin.isRisky
       ? '<div class="empty" style="padding:10px 4px 16px;color:var(--down);font-size:12.5px;">💀 Today\'s risky pick got rugged. Buying and selling stay completely open — rugging never blocks trading, here or anywhere else — but recovery odds on this specific coin are essentially nil until it\'s replaced tomorrow.</div>'
@@ -1156,9 +1157,9 @@ function buyPanelHtml(coin){
     <div class="amt-display"><input id="tradeAmt" inputmode="decimal" placeholder="$0" value="${state.tradeAmount||''}"></div>
     <div class="amt-sub">Balance: ${fmtUsd(bal)}</div>
     <div class="quick-row">
-      <div class="quick-btn" data-amt="5">$5</div>
-      <div class="quick-btn" data-amt="20">$20</div>
-      <div class="quick-btn" data-amt="50">$50</div>
+      <div class="quick-btn" data-amt="${amts[0]}">${fmtUsd(amts[0])}</div>
+      <div class="quick-btn" data-amt="${amts[1]}">${fmtUsd(amts[1])}</div>
+      <div class="quick-btn" data-amt="${amts[2]}">${fmtUsd(amts[2])}</div>
       <div class="quick-btn" data-pct="1">MAX</div>
     </div>
     <button class="btn btn-lime btn-block" id="tradeSubmit">Buy $${esc(coin.ticker)}</button>
@@ -2645,6 +2646,13 @@ function renderBank(){
         <button class="btn btn-lime" id="bankDepositBtn">Deposit</button>
         <button class="btn btn-ghost" id="bankWithdrawBtn">Withdraw</button>
       </div>
+      <div class="quick-row" style="margin-top:8px;">
+        <div class="quick-btn" data-bankpct=".25">25%</div>
+        <div class="quick-btn" data-bankpct=".5">50%</div>
+        <div class="quick-btn" data-bankpct=".75">75%</div>
+        <div class="quick-btn" data-bankpct="1">All</div>
+      </div>
+      <div style="font-size:10.5px;color:var(--txt-faint);margin-top:6px;">% buttons fill the amount from your current cash balance — for withdrawing, just type an amount or use MAX-equivalent by checking your Bank balance above.</div>
       <div style="font-size:11px;color:var(--txt-faint);margin-top:10px;line-height:1.4;">Growth is applied in one lump sum whenever you sign back in (whole days elapsed since last time), not continuously — there's no server here to run it in the background.</div>
     </div>
     <div class="panel" style="margin-bottom:20px;">
@@ -2681,6 +2689,12 @@ function renderBank(){
   });
   document.getElementById('bankWithdrawBtn').addEventListener('click', ()=>{
     bankWithdraw(parseFloat(document.getElementById('bankDepositInput').value));
+  });
+  document.querySelectorAll('[data-bankpct]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const pct = parseFloat(btn.dataset.bankpct);
+      document.getElementById('bankDepositInput').value = ((state.userDoc?.balance||0)*pct).toFixed(2);
+    });
   });
   document.getElementById('bankSendBtn').addEventListener('click', ()=>{
     sendCashToUser(document.getElementById('bankSendUser').value, parseFloat(document.getElementById('bankSendAmount').value));
@@ -2800,6 +2814,10 @@ function listenWhaleAlerts(){
     snap.docChanges().forEach(change=>{
       if(change.type!=='added') return;
       const t = change.doc.data();
+      // Billionaire+ trades get a full-screen moment for everyone, real money moving at that
+      // scale — always shown regardless of the bot-notifications setting (that toggle is
+      // specifically for ambient bot noise; this is real trades from real people).
+      if((t.type==='buy'||t.type==='sell') && t.netWorth>=1e9) showBillionaireExplosion(t);
       if(!(t.usdAmount>=WHALE_THRESHOLD)) return;
       if(t.uid==='bot' && !botNotificationsEnabled()) return; // ambient bot noise, suppressible — real user whale alerts are unaffected
       const verb = t.type==='buy' ? 'dropped' : 'pulled';
@@ -2807,6 +2825,27 @@ function listenWhaleAlerts(){
     });
   }, ()=>{ /* silent — non-critical */ });
   state.unsubs.push(un);
+}
+
+// A dramatic full-screen moment, not just a toast — someone worth $1B+ just moved real money.
+// Auto-dismisses after ~4.5s, or click anywhere to jump straight to the coin. Paired with the
+// existing confetti burst for extra "explosion" feel.
+function showBillionaireExplosion(t){
+  const tier = wealthTierFor(t.netWorth) || { icon:'💎', label:'Billionaire' };
+  const overlay = document.createElement('div');
+  overlay.className = 'billionaire-explosion-overlay';
+  overlay.innerHTML = `
+    <div class="billionaire-explosion-content">
+      <div class="billionaire-explosion-icon">${tier.icon}</div>
+      <div class="billionaire-explosion-text">
+        <b>@${esc(t.username)}</b> the <b>${tier.label}</b><br>
+        just ${t.type==='buy'?'BOUGHT':'SOLD'} ${fmtUsd(t.usdAmount)} of $${esc(t.ticker)}!
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  confettiBurst();
+  overlay.addEventListener('click', ()=>{ overlay.remove(); navigate('coin', t.coinId); });
+  setTimeout(()=> overlay.remove(), 4500);
 }
 
 /* ===================== AUTO-SNIPE BOT ===================== */
@@ -2961,9 +3000,27 @@ async function processIncomingTransfer(transferId, t){
       }
       tx.update(transferRef, { status:'completed' });
     });
-    if(t.type==='cash') toast(`💸 @${t.fromUsername} sent you ${fmtUsd(t.amount)}!`, 'ok', ()=> navigate('portfolio'));
+    if(t.isGiveaway) showGiveawayWinOverlay(t);
+    else if(t.type==='cash') toast(`💸 @${t.fromUsername} sent you ${fmtUsd(t.amount)}!`, 'ok', ()=> navigate('portfolio'));
     else toast(`🎁 @${t.fromUsername} sent you ${fmtTok(t.tokens)} $${t.ticker}!`, 'ok', ()=> navigate('coin', t.coinId));
   }catch(err){ /* silent — will just get picked up again next time this listener re-evaluates */ }
+}
+
+// A proper celebratory moment for a giveaway winner — not just the generic "sent you money" toast
+// every other transfer gets. Reuses the same full-screen overlay pattern as the billionaire
+// explosion, plus confetti, since "you just won free money" deserves more than a small toast.
+function showGiveawayWinOverlay(t){
+  const overlay = document.createElement('div');
+  overlay.className = 'billionaire-explosion-overlay';
+  overlay.innerHTML = `
+    <div class="billionaire-explosion-content">
+      <div class="billionaire-explosion-icon">🎉</div>
+      <div class="billionaire-explosion-text">You won <b>${fmtUsd(t.amount)}</b>!<br>@${esc(t.fromUsername)} just funded a giveaway and you were picked.</div>
+    </div>`;
+  document.body.appendChild(overlay);
+  confettiBurst();
+  overlay.addEventListener('click', ()=>{ overlay.remove(); navigate('bank'); });
+  setTimeout(()=> overlay.remove(), 5000);
 }
 
 async function sendCashToUser(rawUsername, amount){
@@ -3042,6 +3099,7 @@ async function fundGiveaway(amount, winnerCount){
       tx.set(annRef, {
         uid: state.uid, username: state.userDoc.username, avatarURL: state.userDoc.avatarURL||'',
         netWorth: state.userDoc.netWorth||0, type:'giveaway', usdAmount: amount, winnerCount: winners.length,
+        winnerUsernames: winners.map(w=>w.username),
         createdAt: serverTimestamp()
       });
     });
@@ -3454,14 +3512,15 @@ function loadActivity(){
     const items = snap.docs.map(d=>({id:d.id,...d.data()})).filter(t=>!t.isBot).slice(0,50);
     if(!items.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🕒</div>No trades yet — activity will show up here as people buy and sell.</div>`; return; }
     list.innerHTML = items.map(t=> t.type==='giveaway' ? `
-      <div class="holder-line">
+      <div class="holder-line" style="flex-wrap:wrap;">
         <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
           <img class="avatar-sm" src="${avatarFor(t.username, t.avatarURL)}" style="border-radius:50%;">
           <span>@${esc(t.username)}${wealthBadgeHtml(t.netWorth||0)}</span>
         </div>
         <span class="coin-chg up" style="padding:2px 7px;">🎉 Funded a giveaway</span>
-        <span class="amt mono">${fmtUsd(t.usdAmount)} → ${t.winnerCount} people</span>
+        <span class="amt mono">${fmtUsd(t.usdAmount)}</span>
         <span style="font-size:11px;color:var(--txt-faint);margin-left:8px;">${timeAgo(t.createdAt)}</span>
+        ${(t.winnerUsernames||[]).length ? `<div style="width:100%;font-size:11.5px;color:var(--txt-dim);margin-top:6px;padding-left:34px;">🏆 Went to: ${t.winnerUsernames.map(w=>'@'+esc(w)).join(', ')}</div>` : ''}
       </div>` : `
       <div class="holder-line">
         <div class="user-link" data-uid="${t.uid||''}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
@@ -3679,28 +3738,48 @@ async function loadLeaderboard(){
 // same thresholds as the wealth-tier badges). A cosmetic only actually shows if BOTH toggled on
 // AND currently still eligible — if net worth ever drops back below the threshold, it stops
 // showing rather than persisting as a stale flex from a wealth level someone's no longer at.
-const COSMETIC_UNLOCKS = { glow: 1e6, ring: 1e9, banner: 1e12 };
+const COSMETIC_UNLOCKS = { glow: 1e6, ring: 1e9, color: 1e9, banner: 1e12, flair: 1e15 };
 const BANNER_PRESETS = {
-  sunset:  'linear-gradient(135deg,#FF6B6B,#FFD93D)',
-  neon:    'linear-gradient(135deg,#8B6BFF,#C6FF3D)',
-  aurora:  'linear-gradient(135deg,#00C9FF,#92FE9D)',
-  inferno: 'linear-gradient(135deg,#FF3DAE,#FF8A00)',
+  sunset:   'linear-gradient(135deg,#FF6B6B,#FFD93D)',
+  neon:     'linear-gradient(135deg,#8B6BFF,#C6FF3D)',
+  aurora:   'linear-gradient(135deg,#00C9FF,#92FE9D)',
+  inferno:  'linear-gradient(135deg,#FF3DAE,#FF8A00)',
+  midnight: 'linear-gradient(135deg,#0F0C29,#302B63,#24243E)',
+  gold:     'linear-gradient(135deg,#F7971E,#FFD200)',
+  royal:    'linear-gradient(135deg,#654EA3,#EAAFC8)',
+  matrix:   'linear-gradient(135deg,#000000,#00FF41)',
 };
 function activeCosmetics(u, netWorth){
   const c = u.cosmetics||{};
   return {
     glow: !!c.glowOn && netWorth>=COSMETIC_UNLOCKS.glow,
     ring: !!c.ringOn && netWorth>=COSMETIC_UNLOCKS.ring,
+    color: !!c.colorOn && netWorth>=COSMETIC_UNLOCKS.color,
     bannerGrad: (c.bannerPreset && netWorth>=COSMETIC_UNLOCKS.banner) ? BANNER_PRESETS[c.bannerPreset] : null,
+    flairText: (c.flairText && netWorth>=COSMETIC_UNLOCKS.flair) ? c.flairText : null,
   };
+}
+
+async function updateBuyDefaults(a, b, c){
+  const amts = [a,b,c].map(v=> Math.max(0.01, v||0));
+  if(amts.some(v=>!(v>0))){ toast('All three amounts must be greater than $0.', 'err'); return; }
+  try{ await updateDoc(doc(db,'users',state.uid), { 'tradeDefaults.buyAmounts': amts }); toast('Default buy amounts updated.', 'ok'); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
 }
 
 async function toggleCosmetic(field){
   const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
-  const threshold = field==='glowOn' ? COSMETIC_UNLOCKS.glow : COSMETIC_UNLOCKS.ring;
+  const threshold = field==='glowOn' ? COSMETIC_UNLOCKS.glow : field==='colorOn' ? COSMETIC_UNLOCKS.color : COSMETIC_UNLOCKS.ring;
   if(netWorth < threshold){ toast(`Need ${fmtUsd(threshold)}+ net worth to unlock this.`, 'err'); return; }
   const current = !!state.userDoc?.cosmetics?.[field];
   try{ await updateDoc(doc(db,'users',state.uid), { [`cosmetics.${field}`]: !current }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+async function setFlairText(text){
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(netWorth < COSMETIC_UNLOCKS.flair){ toast(`Need ${fmtUsd(COSMETIC_UNLOCKS.flair)}+ net worth to unlock this.`, 'err'); return; }
+  const clean = (text||'').trim().slice(0,24);
+  try{ await updateDoc(doc(db,'users',state.uid), { 'cosmetics.flairText': clean }); toast(clean?'Flair updated.':'Flair cleared.', 'ok'); }
   catch(err){ toast("Couldn't update: "+err.message, 'err'); }
 }
 async function setBannerPreset(key){
@@ -3838,7 +3917,7 @@ async function renderUserProfile(uid){
         <img class="avatar-lg${cos.glow?' avatar-glow':''}" src="${avatarFor(u.username,u.avatarURL)}">
       </div>
       <div>
-        <div class="profile-name">@${esc(u.username)}${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}</div>
+        <div class="profile-name"><span class="${cos.color?'username-gradient':''}">@${esc(u.username)}</span>${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}${cos.flairText?`<span class="flair-pill">${esc(cos.flairText)}</span>`:''}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
         <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
@@ -3939,7 +4018,7 @@ function renderProfile(){
         <img class="avatar-lg${cos.glow?' avatar-glow':''}" id="profAvatarImg" src="${avatarFor(u.username,u.avatarURL)}">
       </div>
       <div>
-        <div class="profile-name">@${esc(u.username)}${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}</div>
+        <div class="profile-name"><span class="${cos.color?'username-gradient':''}">@${esc(u.username)}</span>${wealthBadgeHtml(u.netWorth ?? u.balance ?? 0)}${cos.flairText?`<span class="flair-pill">${esc(cos.flairText)}</span>`:''}</div>
         <div class="profile-bio">${esc(u.bio)||'No bio yet.'}</div>
         <div class="mono" style="font-size:13px;font-weight:600;margin-top:4px;color:${todayUp?'var(--up)':'var(--down)'};">${todayUp?'▲':'▼'} ${Math.abs(today.pct).toFixed(1)}% today (${todayUp?'+':'-'}${fmtUsd(Math.abs(today.change))})</div>
       </div>
@@ -3956,6 +4035,16 @@ function renderProfile(){
       <div class="settings-row" style="border:none;"><span>Trading style</span><b class="mono" id="handsStat">—</b></div>
     </div>
     <div class="panel" style="margin-top:16px;">
+      <div style="font-weight:700;margin-bottom:10px;">💵 Default Buy Amounts</div>
+      <div style="font-size:11.5px;color:var(--txt-faint);margin-bottom:10px;line-height:1.5;">Replaces the quick-buy buttons on every coin's buy panel — set whatever amounts actually match how you trade instead of the default $5/$20/$50.</div>
+      <div style="display:flex;gap:8px;">
+        <input class="field" id="buyDefault1" style="flex:1;" inputmode="decimal" value="${state.userDoc?.tradeDefaults?.buyAmounts?.[0] ?? 5}">
+        <input class="field" id="buyDefault2" style="flex:1;" inputmode="decimal" value="${state.userDoc?.tradeDefaults?.buyAmounts?.[1] ?? 20}">
+        <input class="field" id="buyDefault3" style="flex:1;" inputmode="decimal" value="${state.userDoc?.tradeDefaults?.buyAmounts?.[2] ?? 50}">
+      </div>
+      <button class="btn btn-ghost btn-block" style="margin-top:10px;" id="saveBuyDefaultsBtn">Save</button>
+    </div>
+    <div class="panel" style="margin-top:16px;">
       <div style="font-weight:700;margin-bottom:10px;">🎨 Cosmetic Flexes</div>
       <div style="font-size:11.5px;color:var(--txt-faint);margin-bottom:12px;line-height:1.5;">Pure vanity, no gameplay effect — unlocked automatically at wealth milestones. If net worth ever drops back below the threshold, the effect stops showing until it's crossed again.</div>
       <div class="settings-row">
@@ -3966,13 +4055,25 @@ function renderProfile(){
         <span>💫 Animated ring ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.ring?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.ring)}+)</span>`}</span>
         <button class="btn ${u.cosmetics?.ringOn?'btn-lime':'btn-ghost'}" id="cosRingBtn" ${(u.netWorth??u.balance??0)<COSMETIC_UNLOCKS.ring?'disabled style="opacity:.4;"':''}>${u.cosmetics?.ringOn?'On':'Off'}</button>
       </div>
-      <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;">
+      <div class="settings-row">
+        <span>🌈 Gradient username ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.color?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.color)}+)</span>`}</span>
+        <button class="btn ${u.cosmetics?.colorOn?'btn-lime':'btn-ghost'}" id="cosColorBtn" ${(u.netWorth??u.balance??0)<COSMETIC_UNLOCKS.color?'disabled style="opacity:.4;"':''}>${u.cosmetics?.colorOn?'On':'Off'}</button>
+      </div>
+      <div class="settings-row" style="flex-wrap:wrap;gap:8px;">
         <span>🎨 Profile banner ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.banner?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.banner)}+)</span>`}</span>
-        <div style="display:flex;gap:6px;">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
           ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.banner ? Object.keys(BANNER_PRESETS).map(key=>`
             <button class="btn ${u.cosmetics?.bannerPreset===key?'btn-lime':'btn-ghost'}" data-banner-preset="${key}" style="padding:6px 10px;font-size:11px;text-transform:capitalize;">${key}</button>
           `).join('') + `<button class="btn btn-ghost" data-banner-preset="" style="padding:6px 10px;font-size:11px;">None</button>` : ''}
         </div>
+      </div>
+      <div class="settings-row" style="border:none;flex-wrap:wrap;gap:8px;">
+        <span>🏷️ Custom flair ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.flair?'':`<span style="color:var(--txt-faint);font-size:11px;">(needs ${fmtUsd(COSMETIC_UNLOCKS.flair)}+)</span>`}</span>
+        ${(u.netWorth??u.balance??0)>=COSMETIC_UNLOCKS.flair ? `
+          <div style="display:flex;gap:8px;">
+            <input class="field" id="flairTextInput" style="width:160px;padding:8px 10px;" maxlength="24" placeholder="e.g. Certified Degen" value="${esc(u.cosmetics?.flairText||'')}">
+            <button class="btn btn-ghost" id="saveFlairBtn">Save</button>
+          </div>` : ''}
       </div>
     </div>
     <div class="panel" style="margin-top:16px;">
@@ -4043,8 +4144,17 @@ function renderProfile(){
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('botNotifToggleBtn').addEventListener('click', ()=> toggleBotNotifications().then(()=> renderProfile()));
+  document.getElementById('saveBuyDefaultsBtn').addEventListener('click', ()=>{
+    updateBuyDefaults(
+      parseFloat(document.getElementById('buyDefault1').value),
+      parseFloat(document.getElementById('buyDefault2').value),
+      parseFloat(document.getElementById('buyDefault3').value)
+    );
+  });
   document.getElementById('cosGlowBtn')?.addEventListener('click', ()=> toggleCosmetic('glowOn').then(()=> renderProfile()));
   document.getElementById('cosRingBtn')?.addEventListener('click', ()=> toggleCosmetic('ringOn').then(()=> renderProfile()));
+  document.getElementById('cosColorBtn')?.addEventListener('click', ()=> toggleCosmetic('colorOn').then(()=> renderProfile()));
+  document.getElementById('saveFlairBtn')?.addEventListener('click', ()=> setFlairText(document.getElementById('flairTextInput').value).then(()=> renderProfile()));
   document.querySelectorAll('[data-banner-preset]').forEach(btn=>{
     btn.addEventListener('click', ()=> setBannerPreset(btn.dataset.bannerPreset).then(()=> renderProfile()));
   });
