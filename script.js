@@ -261,7 +261,16 @@ function circulatingOf(coin){ return totalSupplyOf(coin) - coin.tokenReserve; }
 // back as effectively 0 tokens and get rejected as "too small" even though $0.01 is a
 // perfectly valid trade. This formula computes the output directly with no cancellation.
 function ammBuy(coin, usdAmount){
-  const tokensOut = (coin.tokenReserve * usdAmount) / (coin.solReserve + usdAmount);
+  let tokensOut = (coin.tokenReserve * usdAmount) / (coin.solReserve + usdAmount);
+  // Safety clamp: cap at 99% of the reserve regardless of the math above. Mathematically
+  // tokensOut always stays strictly below tokenReserve for any finite usdAmount, but at extreme
+  // ratios (usdAmount many orders of magnitude larger than solReserve — which the moon-boost
+  // mechanics can produce on a coin that's been pumped many times) float64 precision loses
+  // enough significant digits that tokenReserve-tokensOut can round to zero or go negative,
+  // making newPrice = newSol/newTok come out as Infinity or NaN. Firestore rejects non-finite
+  // numbers outright with a 400, which is what was actually happening.
+  const maxTokensOut = coin.tokenReserve*0.99;
+  if(!(tokensOut < maxTokensOut)) tokensOut = maxTokensOut;
   const newSol = coin.solReserve + usdAmount;
   const newTok = coin.tokenReserve - tokensOut;
   return { tokensOut, newSol, newTok, newPrice: newSol/newTok };
@@ -542,9 +551,9 @@ async function instantMoonBoost(coinId){
       const targetPrice = Math.max(anchor, currentPrice) * (8+Math.random()*7); // +700% to +1400%
       const k = coin.solReserve*coin.tokenReserve;
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
-      if(!(dUSD>0)) return;
+      if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0)) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
       const botName = randBotName();
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
@@ -603,9 +612,9 @@ async function realityWarpBoost(coinId){
       const targetPrice = Math.max(anchor, currentPrice) * (3+Math.random()*4); // +200% to +600% — big, but smaller than the admin pump's +700-1400%
       const k = coin.solReserve*coin.tokenReserve;
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
-      if(!(dUSD>0)) return;
+      if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0)) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:`${state.userDoc?.username||'?'} (Reality Warp)`, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
       tx.update(coinRef, {
@@ -631,9 +640,9 @@ async function guaranteePumpToPositive100(coinId){
       if(priceOf(coin) >= targetPrice) return; // the random bot buys already cleared it on their own
       const k = coin.solReserve*coin.tokenReserve;
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
-      if(!(dUSD>0)) return;
+      if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0)) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
       const botName = randBotName();
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
@@ -1753,6 +1762,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
       const [userSnap, coinSnap, holdSnap] = await Promise.all([tx.get(userRef), tx.get(coinRef), tx.get(holdRef)]);
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
+      if(!isCoinHealthy(coin)) throw new Error("This coin's price data looks corrupted — try again in a moment, an ambient bot tick should repair it automatically.");
       // Same idea as the sell-side fix below: the MAX button rounds to 2 decimals, which can
       // occasionally round UP a fraction of a cent past the real balance. Clamp instead of
       // rejecting a legitimate "spend everything" buy.
@@ -1837,6 +1847,7 @@ async function doSell(coinId, tokenAmount){
       const [userSnap, coinSnap, holdSnap] = await Promise.all([tx.get(userRef), tx.get(coinRef), tx.get(holdRef)]);
       if(!userSnap.exists() || !coinSnap.exists()) throw new Error('Not found.');
       const user = userSnap.data(); const coin = coinSnap.data();
+      if(!isCoinHealthy(coin)) throw new Error("This coin's price data looks corrupted — try again in a moment, an ambient bot tick should repair it automatically.");
       const owned = holdSnap.exists()? holdSnap.data().tokens:0;
       // The MAX/25%/50%/75% quick buttons round the displayed amount to 4 decimal places, which
       // can occasionally round UP a hair past what's actually owned (e.g. selling "MAX" on a
@@ -2014,6 +2025,21 @@ function randBotName(){ return 'Bot'+(1000+Math.floor(Math.random()*9000)); }
 
 const WHALE_THRESHOLD = 2500; // usd — triggers a platform-wide whale alert toast for anyone online
 
+// If a coin's reserves are already non-finite (from before the fix above existed, or any other
+// corruption), every future read of it keeps producing NaN/Infinity downstream forever — Infinity
+// times anything is still Infinity. Rather than leaving a coin permanently stuck, the ambient bot
+// paths check for this and repair it back to sane reserves (proportioned the same way a fresh
+// spawn would be) instead of attempting a doomed trade.
+function isCoinHealthy(coin){
+  return isFinite(coin.solReserve) && isFinite(coin.tokenReserve) && coin.solReserve>0 && coin.tokenReserve>0;
+}
+function repairedReserves(coin){
+  const totalSupply = totalSupplyOf(coin);
+  const solReserve = 4000+Math.random()*12000;
+  const tokenReserve = totalSupply*0.5; // mid-curve — a reasonable, unremarkable starting point
+  return { solReserve, tokenReserve, price: solReserve/tokenReserve };
+}
+
 async function botBuyOnCoin(coinId, usdAmount, isExplosion){
   try{
     let whaleInfo = null;
@@ -2022,8 +2048,13 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
       const coinSnap = await tx.get(coinRef);
       if(!coinSnap.exists()) return;
       const coin = coinSnap.data();
+      if(!isCoinHealthy(coin)){
+        const r = repairedReserves(coin);
+        tx.update(coinRef, { solReserve:r.solReserve, tokenReserve:r.tokenReserve, price:r.price, marketCap:r.price*totalSupplyOf(coin), lastTickAt:Date.now() });
+        return;
+      }
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
-      if(!(tokensOut>0)) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-110);
@@ -2046,13 +2077,18 @@ async function botSellOnCoin(coinId, usdAmount, isDump, maxSellFrac=0.05){
       const coinSnap = await tx.get(coinRef);
       if(!coinSnap.exists()) return;
       const coin = coinSnap.data();
+      if(!isCoinHealthy(coin)){
+        const r = repairedReserves(coin);
+        tx.update(coinRef, { solReserve:r.solReserve, tokenReserve:r.tokenReserve, price:r.price, marketCap:r.price*totalSupplyOf(coin), lastTickAt:Date.now() });
+        return;
+      }
       const price = priceOf(coin);
-      if(!(price>0)) return;
+      if(!(price>0) || !isFinite(price)) return;
       let tokenAmount = usdAmount/price;
       const maxSellable = coin.tokenReserve*maxSellFrac; // cap so one dump can't crater the curve to near-zero
       if(tokenAmount > maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
-      if(!(usdOut>0)) return;
+      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-110);
