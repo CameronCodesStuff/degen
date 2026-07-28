@@ -553,7 +553,7 @@ async function instantMoonBoost(coinId){
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return;
       const botName = randBotName();
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
@@ -614,7 +614,7 @@ async function realityWarpBoost(coinId){
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return;
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:`${state.userDoc?.username||'?'} (Reality Warp)`, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
       tx.update(coinRef, {
@@ -642,7 +642,7 @@ async function guaranteePumpToPositive100(coinId){
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return;
       const botName = randBotName();
       const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
@@ -858,13 +858,14 @@ function loadHomeCoins(){
   // Bot Market is a server-side filter (needs a composite index — see SETUP.md); Community stays
   // an unfiltered query + client-side exclusion so older coins launched before this feature
   // (which have no isBotCoin field at all) still show up correctly.
-  // No limit() — every coin that exists shows up, not just the most recent batch. Worth knowing:
-  // as the total coin count grows over a long-running app (nothing ever gets deleted now — see
-  // Rug-pull events and the persistence notes above), this reads every matching document on
-  // every Explore load, which is a real, unbounded cost tradeoff for "see literally everything."
+  // Capped at 100 (was briefly fully unbounded) — that showed up directly in Firebase's own
+  // query-insights metrics as ~228 docs scanned per result returned once the coin collection
+  // grew large from months of nothing ever getting deleted (rugged coins persist, every special
+  // coin type accumulates too). 100 is still far more than the original 60-coin cap, just no
+  // longer literally unbounded against an ever-growing collection.
   const q = homeCategory==='bot'
-    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,sortDir))
-    : query(collection(db,'coins'), orderBy(sortField,sortDir));
+    ? query(collection(db,'coins'), where('isBotCoin','==',true), orderBy(sortField,sortDir), limit(100))
+    : query(collection(db,'coins'), orderBy(sortField,sortDir), limit(100));
   homeUnsub = onSnapshot(q, snap=>{
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
@@ -1790,7 +1791,7 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
         wasCapped = true;
       }
 
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) throw new Error('Amount too small to result in a trade.');
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
@@ -1860,7 +1861,7 @@ async function doSell(coinId, tokenAmount){
         else throw new Error("You don't own that many tokens.");
       }
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
-      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) throw new Error('Amount too small to result in a trade.');
+      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
@@ -2055,7 +2056,7 @@ async function botBuyOnCoin(coinId, usdAmount, isExplosion){
         return;
       }
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, usdAmount);
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'buy', usdAmount, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:!!isExplosion}]).slice(-110);
@@ -2089,7 +2090,7 @@ async function botSellOnCoin(coinId, usdAmount, isDump, maxSellFrac=0.05){
       const maxSellable = coin.tokenReserve*maxSellFrac; // cap so one dump can't crater the curve to near-zero
       if(tokenAmount > maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
-      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) return;
+      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return;
       const botName = randBotName();
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:botName, type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now(), isBot:true, isDump:!!isDump}]).slice(-110);
@@ -2695,7 +2696,7 @@ async function catchUpBotCoin(coinId, coin){
   }
   hist = hist.slice(-110); trades = trades.slice(-110);
   const newPrice = solReserve/tokenReserve;
-  if(!isFinite(solReserve) || !isFinite(tokenReserve) || !isFinite(newPrice) || solReserve<=0 || tokenReserve<=0) return; // compounded across many iterations — bail rather than write a corrupted final state
+  if(!isFinite(solReserve) || !isFinite(tokenReserve) || !isFinite(newPrice) || solReserve<=0 || tokenReserve<=0 || !isFinite(newPrice*totalSupplyOf(coin))) return; // compounded across many iterations — bail rather than write a corrupted final state
   try{
     await updateDoc(doc(db,'coins',coinId), {
       solReserve, tokenReserve, price:newPrice, marketCap:newPrice*totalSupplyOf(coin),
@@ -2869,6 +2870,7 @@ async function ruggedCoinEvent(coinId){
       const crashFactor = c.isRisky ? (0.002+Math.random()*0.018) : (0.02+Math.random()*0.08); // risky: keep 0.2-2% (98-99.8% crash) vs normal 2-10% (90-98% crash)
       const newSol = c.solReserve*crashFactor;
       const newPrice = newSol/c.tokenReserve;
+      if(!isFinite(newSol) || !isFinite(newPrice) || !isFinite(newPrice*totalSupplyOf(c))) return; // pre-crash price was already too extreme to safely shrink from
       const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'sell', usdAmount:c.solReserve-newSol, tokenAmount:0, t:Date.now(), isBot:true, isRug:true}]).slice(-110);
       tx.update(coinRef, {

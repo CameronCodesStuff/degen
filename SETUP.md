@@ -165,12 +165,20 @@ The app queries coins ordered by `marketCap` and `createdAt`, and the Activity f
 
 **Two composite indexes are required** for the Bot Market tab (`coins` filtered by `isBotCoin == true`, sorted by `marketCap` or `createdAt`) — see the Bot Market section below for the exact fields.
 
-**One collection-group index is required** for the coin-page Top Holders list:
-- Firestore Database → Indexes → Composite → Create Index
-- Collection ID: `holdings`
-- **Query scope: Collection group** (not "Collection" — this one's easy to miss, it's a dropdown/toggle right next to the Collection ID field)
-- Fields: `coinId` Ascending, `tokens` Descending
-- As always, the browser console will also print a direct "create index" link the first time the query runs if you'd rather use that.
+**Two collection-group indexes are required** on `holdings` — different query shapes, each needs its own (same lesson learned the hard way with the "Oldest" sort elsewhere in this doc: composite indexes aren't interchangeable across shapes/directions):
+
+1. For the coin-page Top Holders list (`orderBy('tokens','desc')`):
+   - Firestore Database → Indexes → Composite → Create Index
+   - Collection ID: `holdings`
+   - **Query scope: Collection group** (not "Collection" — this one's easy to miss, it's a dropdown/toggle right next to the Collection ID field)
+   - Fields: `coinId` Ascending, `tokens` Descending
+
+2. For the live holder count (`where('tokens','>',0.0001)`, no explicit orderBy) — **this one was missing from this doc for a while, and is very likely the actual cause if you're seeing `COLLECTION_GROUP holdings` failing 100% of the time in Firebase's query-insights panel** (Firestore Console → your database → Query insights) — it fires far more often than Top Holders does (every 60s for every active viewer of every coin page), which lines up with a high failure count:
+   - Collection ID: `holdings`
+   - Query scope: **Collection group**
+   - Fields: `coinId` Ascending, `tokens` Ascending
+
+As always, the browser console will also print a direct "create index" link the first time either query runs, pre-filled with the exact right config — that's the fastest way to be sure which one(s) you're actually missing, rather than guessing from a metrics screenshot alone.
 
 **One more composite index is required** for receiving peer-to-peer transfers (bank sends + coin sends):
 - Collection ID: `transfers`
@@ -197,7 +205,7 @@ Drop all files (`index.html`, `style.css`, `script.js`, `sw.js`, `manifest.json`
 - Launching a coin costs a $5 fee (from the $100 starting balance) to discourage spam.
 - Avatars and coin logos are plain image URLs — paste a link to any hosted image (e.g. Imgur), or leave it blank for an auto-generated default.
 - The chart has **1m / 5m / 1h / 1d / all** ranges and updates live in place (no page flicker, no losing whatever you were typing in the buy/sell box) whenever anyone trades.
-- Explore (both Community and Bot Market tabs) shows **every** coin that exists — no cap. This used to be capped at the 60 most recent per tab; that cap is gone now. **Worth knowing**: since this is a live (`onSnapshot`) listener with no `limit()`, it re-syncs on every single matching document's changes while someone has Explore open — including every bot coin's price tick. As the total coin count grows over a long-running app (nothing gets deleted anymore — see Rug-pull events and the persistence notes below), this is a real, unbounded cost/performance tradeoff for "see literally everything," and it's the kind of thing that contributed to hitting Firestore's rate limits once already (see the fix noted under Bot Market below). Worth keeping an eye on if the coin count grows very large.
+- Explore (both Community and Bot Market tabs) is capped at the 100 most recent coins per tab — up from an original 60, but no longer literally unbounded. It was briefly uncapped entirely ("show every coin that exists"), which showed up directly in Firebase's own query-insights metrics as ~228 documents scanned per result returned once the coin collection grew large from months of nothing ever getting deleted (rugged coins persist, every special coin type — Insider, Risky, Abyss, Singularity, Mystery — accumulates too, on top of every real community launch). Since this is a live (`onSnapshot`) listener, it re-syncs on every matching document's changes while someone has Explore open, so an unbounded version scales its ongoing cost directly with how large the collection has grown, indefinitely. 100 keeps that bounded while still showing far more than the original cap.
 
 ### Portfolio value now reflects real slippage
 Previously, your portfolio and net worth (and therefore the leaderboard) valued every holding as `tokens × current spot price`. That overstated what you could actually walk away with, because spot price is only the price of the *next* token — selling a large stack pushes the price down as you sell, same as any bonding curve/AMM. Portfolio value, the leaderboard, and each holding's shown value now run the actual sell math (`ammSell`) to show what you'd realistically get if you sold right now, which is what fixes the "it said I'd get $1,000 but I only got $100" issue.
@@ -349,6 +357,8 @@ Fixed in three layers:
 - **`doSell`** had the identical `if(!(usdOut>0))`-only check with the same `Infinity>0`-is-true blind spot. Same fix applied.
 - **The offline catch-up replay** (`catchUpBotCoin()`) simulates up to 350 compressed ticks in a tight loop, each one building on the *previous* iteration's already-updated reserves — exactly the kind of compounding that can drift into overflow given enough iterations, and the loop had zero validation inside it or before its single final write. Now checks `isFinite` inside both the buy and sell branches of the loop (an unhealthy computed step is simply skipped, same as the live loop would), validates the final compounded state before writing at all, and bails immediately if the coin was already unhealthy before the loop even started.
 - **`ruggedCoinEvent()`** now also checks `isCoinHealthy()` before rugging a coin — the crash factor only ever shrinks `solReserve`, so it can't create a new `Infinity`, but it would happily preserve and re-write an existing one.
+
+**Third round — the actual remaining gap, confirmed with a precise repro.** Every check above validated `newPrice`/`newSol`/`newTok` for finiteness, but **`marketCap` (`newPrice × totalSupply`) was never itself validated anywhere** — and it doesn't need `newPrice` to already be invalid to overflow. A price around `5×10³⁰⁰` is comfortably finite on its own (float64's ceiling is ~1.8×10³⁰⁸) and sails through every `isFinite(newPrice)` check that existed — but multiplying it by a completely ordinary total supply (say, 10⁹) pushes the *product* past that ceiling into `Infinity`, independent of whether the price itself was ever flagged as a problem. Given pumps compound multiplicatively (each one +200% to +1400% on top of whatever came before), a coin that's been pumped many times over a long testing session can realistically reach a price in that range without any single step along the way ever looking obviously wrong. Fixed by adding `isFinite(newPrice*totalSupplyOf(coin))` to every one of the validation gates above — all three moon-boost functions, `doBuy`, `doSell`, `botBuyOnCoin`, `botSellOnCoin`, the catch-up replay's final check, and `ruggedCoinEvent`.
 
 ### Guaranteed ambient Bot Market spawn cadence
 The ambient (non-insider) Bot Market spawner used to be a flat 5%-per-minute-check probability, which technically had an unbounded tail — if unlucky, it was possible (if unlikely) to go a very long stretch with no new coin at all. Replaced with a persisted `meta/botSpawnSchedule` doc holding a `nextSpawnAt` timestamp: every check, if `now >= nextSpawnAt`, a coin spawns immediately and the next slot is scheduled 5–60 minutes out (randomized fresh each time). This guarantees a new ambient coin lands somewhere in that window every time, while still feeling random since the exact minute is different each cycle. The empty-pool bootstrap (spawn 5 immediately if the Bot Market has never had anything in it) is unchanged.
