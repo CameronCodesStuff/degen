@@ -1784,12 +1784,13 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
         const denom = coin.tokenReserve - capTokens;
         if(!(capTokens>0) || denom<=0) throw new Error("Not enough of this coin left in the curve to buy more.");
         finalUsd = (capTokens*coin.solReserve)/denom;
+        if(!isFinite(finalUsd) || finalUsd<=0) throw new Error("Couldn't size that trade against the ownership cap — try a smaller amount.");
         const capped = ammBuy(coin, finalUsd);
         tokensOut = capped.tokensOut; newSol = capped.newSol; newTok = capped.newTok; newPrice = capped.newPrice;
         wasCapped = true;
       }
 
-      if(!(tokensOut>0)) throw new Error('Amount too small to result in a trade.');
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'buy', usdAmount:finalUsd, tokenAmount:tokensOut, t:Date.now(), viaSnipe:!!viaSnipe}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
@@ -1859,7 +1860,7 @@ async function doSell(coinId, tokenAmount){
         else throw new Error("You don't own that many tokens.");
       }
       const { usdOut, newSol, newTok, newPrice } = ammSell(coin, tokenAmount);
-      if(!(usdOut>0)) throw new Error('Amount too small to result in a trade.');
+      if(!(usdOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0) throw new Error('Amount too small to result in a trade.');
       const hist = (coin.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
       const trades = (coin.recentTrades||[]).concat([{uid:state.uid, username:state.userDoc.username, avatarURL:state.userDoc.avatarURL||'', type:'sell', usdAmount:usdOut, tokenAmount, t:Date.now()}]).slice(-110);
       tx.update(coinRef, { solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin), priceHistory:hist, recentTrades:trades, tradeCount:(coin.tradeCount||0)+1, lastTickAt:Date.now(), lastRealActivityAt:Date.now() });
@@ -2656,6 +2657,7 @@ const BOT_COIN_CATCHUP_MAX_TICKS = 350; // cap ~80 min worth of simulated ticks 
 function toMillisLoose(t){ if(!t) return Date.now(); if(t.toDate) return t.toDate().getTime(); if(t.seconds) return t.seconds*1000; return t; }
 
 async function catchUpBotCoin(coinId, coin){
+  if(!isCoinHealthy(coin)) return; // already corrupted — the next live bot tick will repair it instead
   const lastTs = toMillisLoose(coin.lastTickAt || (coin.priceHistory?.length ? coin.priceHistory[coin.priceHistory.length-1].t : Date.now()));
   const elapsed = Date.now()-lastTs;
   const ticksOwed = Math.floor(elapsed/BOT_TICK_MS);
@@ -2673,7 +2675,7 @@ async function catchUpBotCoin(coinId, coin){
     const usd = botCoinTradeSize();
     if(Math.random() < buyChance){
       const { tokensOut, newSol, newTok, newPrice } = ammBuy({solReserve,tokenReserve}, usd);
-      if(tokensOut>0){
+      if(tokensOut>0 && isFinite(newSol) && isFinite(newTok) && isFinite(newPrice) && newTok>0){
         solReserve=newSol; tokenReserve=newTok; tradeCount++;
         hist.push({p:newPrice,t:simTime});
         trades.push({uid:'bot',username:randBotName(),type:'buy',usdAmount:usd,tokenAmount:tokensOut,t:simTime,isBot:true});
@@ -2684,7 +2686,7 @@ async function catchUpBotCoin(coinId, coin){
       const maxSellable = tokenReserve*0.05;
       if(tokenAmount>maxSellable) tokenAmount = maxSellable;
       const { usdOut, newSol, newTok, newPrice } = ammSell({solReserve,tokenReserve}, tokenAmount);
-      if(usdOut>0){
+      if(usdOut>0 && isFinite(newSol) && isFinite(newTok) && isFinite(newPrice) && newTok>0){
         solReserve=newSol; tokenReserve=newTok; tradeCount++;
         hist.push({p:newPrice,t:simTime});
         trades.push({uid:'bot',username:randBotName(),type:'sell',usdAmount:usdOut,tokenAmount,t:simTime,isBot:true});
@@ -2693,6 +2695,7 @@ async function catchUpBotCoin(coinId, coin){
   }
   hist = hist.slice(-110); trades = trades.slice(-110);
   const newPrice = solReserve/tokenReserve;
+  if(!isFinite(solReserve) || !isFinite(tokenReserve) || !isFinite(newPrice) || solReserve<=0 || tokenReserve<=0) return; // compounded across many iterations — bail rather than write a corrupted final state
   try{
     await updateDoc(doc(db,'coins',coinId), {
       solReserve, tokenReserve, price:newPrice, marketCap:newPrice*totalSupplyOf(coin),
@@ -2851,6 +2854,7 @@ async function ruggedCoinEvent(coinId){
       if(!snap.exists()) return;
       const c = snap.data();
       if(c.ruggedAt) return; // already rugged by another tab racing this same tick
+      if(!isCoinHealthy(c)) return; // corrupted — let the next live bot tick repair it instead of rugging garbage
       ticker = c.ticker;
       wasRisky = !!c.isRisky;
       // Risky coins crash much harder than a normal rug — the whole point is a real chance of
