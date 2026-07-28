@@ -374,6 +374,7 @@ onAuthStateChanged(auth, async (user)=>{
     listenIncomingTransfers();
     applyBankGrowth();
     listenCopyOrders();
+    listenSingularityMirror();
     navigate('home');
     startBots();
     startConsoleAutoClear();
@@ -394,10 +395,19 @@ function listenUserDoc(){
     document.getElementById('topAvatar').src = avatarFor(state.userDoc.username, state.userDoc.avatarURL);
     if(state.route.name==='profile') renderProfile();
     if(state.route.name==='portfolio') renderPortfolio();
+    const nw = state.userDoc.netWorth ?? state.userDoc.balance ?? 0;
     const navAbyss = document.getElementById('navAbyss');
-    const unlocked = (state.userDoc.netWorth ?? state.userDoc.balance ?? 0) >= ABYSS_UNLOCK_NET_WORTH;
-    if(navAbyss) navAbyss.style.display = unlocked ? '' : 'none';
-    if(state.route.name==='abyss' && !unlocked) navigate('home'); // dropped below the threshold mid-visit
+    const abyssUnlocked = nw >= ABYSS_UNLOCK_NET_WORTH;
+    if(navAbyss) navAbyss.style.display = abyssUnlocked ? '' : 'none';
+    if(state.route.name==='abyss' && !abyssUnlocked) navigate('home'); // dropped below the threshold mid-visit
+    const navSingularity = document.getElementById('navSingularity');
+    const singularityUnlocked = nw >= SINGULARITY_UNLOCK_NET_WORTH;
+    if(navSingularity) navSingularity.style.display = singularityUnlocked ? '' : 'none';
+    if(state.route.name==='singularity' && !singularityUnlocked) navigate('home');
+    const navMystery = document.getElementById('navMystery');
+    const mysteryUnlocked = nw >= MYSTERY_UNLOCK_NET_WORTH;
+    if(navMystery) navMystery.style.display = mysteryUnlocked ? '' : 'none';
+    if(state.route.name==='mystery' && !mysteryUnlocked) navigate('home');
   });
   state.unsubs.push(un);
 }
@@ -424,6 +434,8 @@ function navigate(name, param=null){
   if(name!=='coin'){ stopViewerCount(); stopHolderCount(); stopViewingMicroTick(); }
   if(name!=='home'){ if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub=null; } if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub=null; } }
   if(name!=='abyss') stopAbyssListener();
+  if(name!=='singularity') stopSingularityListener();
+  if(name!=='mystery') stopMysteryListener();
   if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
@@ -433,6 +445,8 @@ function navigate(name, param=null){
   else if(name==='portfolio') renderPortfolio();
   else if(name==='bank') renderBank();
   else if(name==='abyss') renderAbyss();
+  else if(name==='singularity') renderSingularity();
+  else if(name==='mystery') renderMystery();
   else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
@@ -546,6 +560,62 @@ async function instantMoonBoost(coinId){
 // executes it as one closing trade. price = solReserve/tokenReserve; buying dUSD raises
 // solReserve by dUSD and (via the k=solReserve*tokenReserve invariant) raises price to
 // (solReserve+dUSD)^2/k — so dUSD = sqrt(targetPrice*k) - solReserve solves for exactly that.
+const REALITY_WARP_UNLOCK_NET_WORTH = 1e18; // Qi — same tier as the Singularity
+const HALL_OF_LEGENDS_NET_WORTH = 1e18; // Qi — a permanent record, distinct from the live wealth-tier badge
+// A personal, scaled-down version of the admin's Right Alt pump — any Qi+ user can trigger it,
+// once per real calendar day, on any coin they choose. Reuses the same underlying mechanics
+// (staggered bot buys + a solved-AMM moon-boost) rather than building a parallel system, just
+// smaller and gated by a cooldown instead of an admin-only account check.
+async function triggerRealityWarp(coinId, ticker){
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(netWorth < REALITY_WARP_UNLOCK_NET_WORTH){ toast(`Reality Warp unlocks at ${fmtUsd(REALITY_WARP_UNLOCK_NET_WORTH)}+ net worth.`, 'err'); return; }
+  const lastAt = state.userDoc?.lastRealityWarpAt;
+  if(lastAt && Date.now()-toMillisLoose(lastAt) < 24*3600*1000){
+    const hrsLeft = Math.ceil((24*3600*1000-(Date.now()-toMillisLoose(lastAt)))/3600000);
+    toast(`Only once per real day — try again in about ${hrsLeft}h.`, 'err');
+    return;
+  }
+  try{
+    await updateDoc(doc(db,'users',state.uid), { lastRealityWarpAt: Date.now() });
+    updateDoc(doc(db,'coins',coinId), { pumpSellSuppressUntil: Date.now()+3*60*1000 }).catch(()=>{});
+    toast(`🌌 @${state.userDoc.username} warped reality on $${ticker}!`, 'ok');
+    const botCount = 40+Math.floor(Math.random()*30); // fewer bots than the admin's 150-250 — this is a personal ability, not the official pump
+    for(let i=0;i<botCount;i++){
+      setTimeout(()=>{
+        const usd = 100+Math.random()*1800;
+        botBuyOnCoin(coinId, usd, usd>800);
+      }, Math.random()*8000);
+    }
+    setTimeout(()=> realityWarpBoost(coinId), 8500);
+  }catch(err){ toast("Couldn't warp reality: "+err.message, 'err'); }
+}
+async function realityWarpBoost(coinId){
+  try{
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const coin = snap.data();
+      const hist = coin.priceHistory||[];
+      const anchor = (hist.length && hist[0].p>0) ? hist[0].p : priceOf(coin);
+      const currentPrice = priceOf(coin);
+      const targetPrice = Math.max(anchor, currentPrice) * (3+Math.random()*4); // +200% to +600% — big, but smaller than the admin pump's +700-1400%
+      const k = coin.solReserve*coin.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
+      if(!(dUSD>0)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(coin, dUSD);
+      if(!(tokensOut>0)) return;
+      const h2 = hist.concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (coin.recentTrades||[]).concat([{uid:'bot', username:`${state.userDoc?.username||'?'} (Reality Warp)`, type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
+      tx.update(coinRef, {
+        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(coin),
+        priceHistory:h2, recentTrades:trades, tradeCount:(coin.tradeCount||0)+(400+Math.floor(Math.random()*1200)),
+        lastTickAt:Date.now()
+      });
+    });
+  }catch(err){ /* silent — non-critical */ }
+}
+
 async function guaranteePumpToPositive100(coinId){
   try{
     let whaleInfo = null;
@@ -789,7 +859,7 @@ function loadHomeCoins(){
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
     if(homeCategory==='user') coins = coins.filter(c=> !c.isBotCoin);
-    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky && !c.isAbyss); // Risky and the Abyss have their own dedicated tabs
+    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky && !c.isAbyss && !c.isSingularity && !c.isMystery); // each has its own dedicated tab
     const term = (document.getElementById('homeSearch')?.value||'').toLowerCase();
     if(term) coins = coins.filter(c=> c.ticker.toLowerCase().includes(term) || c.name.toLowerCase().includes(term));
     if(homeSort==='gainers') coins = coins.slice().sort((a,b)=> pctChange(b.priceHistory)-pctChange(a.priceHistory));
@@ -859,6 +929,78 @@ function renderAbyss(){
   }, ()=>{ const g=document.getElementById('abyssGrid'); if(g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load it.</div>`; });
 }
 
+let singularityScheduleUnsub = null, singularityCoinUnsub = null;
+function stopSingularityListener(){
+  if(singularityScheduleUnsub){ singularityScheduleUnsub(); singularityScheduleUnsub = null; }
+  if(singularityCoinUnsub){ singularityCoinUnsub(); singularityCoinUnsub = null; }
+}
+function renderSingularity(){
+  const view = document.getElementById('view');
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(netWorth < SINGULARITY_UNLOCK_NET_WORTH){
+    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div>The Singularity unlocks at ${fmtUsd(SINGULARITY_UNLOCK_NET_WORTH)}+ net worth. You're not there yet.</div>`;
+    return;
+  }
+  view.innerHTML = `
+    <div class="section-title">🌀 The Singularity</div>
+    <div class="panel" style="margin-bottom:16px;border-color:rgba(139,107,255,.35);">
+      <div style="font-size:13px;color:#B8A8FF;font-weight:700;margin-bottom:6px;">This coin has no behavior of its own</div>
+      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.6;">Every other coin in this app — even the wildest ones — trades on some kind of internal logic, random or otherwise. This one doesn't. Its price only ever moves as an echo of real trades happening anywhere else in the app, right now, scaled down. No bot randomization drives it. What that means in practice: nobody can predict it, including whoever built this — it depends entirely on what real people actually do elsewhere, at this exact moment.</div>
+    </div>
+    <div id="singularityGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>
+  `;
+  stopSingularityListener();
+  singularityScheduleUnsub = onSnapshot(doc(db,'meta','singularityCoin'), snap=>{
+    const coinId = snap.exists() ? snap.data().coinId : null;
+    if(singularityCoinUnsub){ singularityCoinUnsub(); singularityCoinUnsub = null; }
+    const grid = document.getElementById('singularityGrid');
+    if(!coinId){
+      if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">🌀</div>Hasn't been spawned yet — check back shortly.</div>`;
+      return;
+    }
+    singularityCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
+      const g = document.getElementById('singularityGrid');
+      if(!g) return;
+      if(!cSnap.exists()){ g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Gone.</div>`; return; }
+      const coin = {id:cSnap.id, ...cSnap.data()};
+      state.coinsCache.set(coin.id, coin);
+      renderCoinGrid([coin]);
+    });
+  }, ()=>{ const g=document.getElementById('singularityGrid'); if(g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load it.</div>`; });
+}
+
+// Deliberately no description panel, no warning, no explanation of odds — just the coin. That's
+// the entire design brief for this one.
+let mysteryScheduleUnsub = null, mysteryCoinUnsub = null;
+function stopMysteryListener(){
+  if(mysteryScheduleUnsub){ mysteryScheduleUnsub(); mysteryScheduleUnsub = null; }
+  if(mysteryCoinUnsub){ mysteryCoinUnsub(); mysteryCoinUnsub = null; }
+}
+function renderMystery(){
+  const view = document.getElementById('view');
+  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
+  if(netWorth < MYSTERY_UNLOCK_NET_WORTH){
+    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div></div>`;
+    return;
+  }
+  view.innerHTML = `<div id="mysteryGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>`;
+  stopMysteryListener();
+  mysteryScheduleUnsub = onSnapshot(doc(db,'meta','mysteryCoin'), snap=>{
+    const coinId = snap.exists() ? snap.data().coinId : null;
+    if(mysteryCoinUnsub){ mysteryCoinUnsub(); mysteryCoinUnsub = null; }
+    const grid = document.getElementById('mysteryGrid');
+    if(!coinId){ if(grid) grid.innerHTML = ''; return; }
+    mysteryCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
+      const g = document.getElementById('mysteryGrid');
+      if(!g) return;
+      if(!cSnap.exists()){ g.innerHTML = ''; return; }
+      const coin = {id:cSnap.id, ...cSnap.data()};
+      state.coinsCache.set(coin.id, coin);
+      renderCoinGrid([coin]);
+    });
+  }, ()=>{});
+}
+
 function loadRiskyCoin(){
   if(homeUnsub){ homeUnsub(); homeUnsub = null; }
   if(riskyScheduleUnsub) riskyScheduleUnsub();
@@ -906,7 +1048,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isAbyss?'<div class="grad-badge abyss-badge">💀 ABYSS</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':'')))))}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isSingularity?'<div class="grad-badge singularity-badge">🌀 SINGULARITY</div>':(c.isAbyss?'<div class="grad-badge abyss-badge">💀 ABYSS</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))))))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -964,7 +1106,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))))}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isSingularity?'<span class="grad-badge singularity-badge">🌀 THE SINGULARITY</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -1021,11 +1163,15 @@ function buildCoinDetailShell(coin){
           </div>
           <div id="tradePanelInner">${state.tradeMode==='buy'? buyPanelHtml(coin) : sellPanelHtml(coin)}</div>
         </div>
+        ${(state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0) >= REALITY_WARP_UNLOCK_NET_WORTH ? `
+        <button class="btn btn-block" id="realityWarpBtn" style="margin-top:12px;background:linear-gradient(90deg,#8B6BFF,#00C9FF);color:#fff;font-weight:700;">🌌 Reality Warp</button>
+        ` : ''}
       </div>
     </div>
   `;
 
   document.getElementById('backBtn').addEventListener('click', ()=> navigate('home'));
+  document.getElementById('realityWarpBtn')?.addEventListener('click', ()=> triggerRealityWarp(coin.id, coin.ticker));
   wireUserLinks(view);
   loadTopHolders(coin.id);
   startViewerCount(coin);
@@ -1177,7 +1323,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':'')))))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isSingularity?'<span class="grad-badge singularity-badge">🌀 THE SINGULARITY</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -1779,7 +1925,19 @@ async function refreshNetWorthSnapshot(){
     let hist = (u.netWorthHistory||[]).filter(h=>h.t>=cutoffKeep);
     hist.push({t:now, nw:netWorth});
     if(hist.length>300) hist = hist.slice(-300);
-    await updateDoc(doc(db,'users',state.uid), { netWorth, netWorthHistory: hist });
+    const update = { netWorth, netWorthHistory: hist };
+    // Hall of Legends: a PERMANENT record, distinct from the live wealth-tier badge (which
+    // reflects current standing and disappears if net worth drops). Once you cross Qi, this
+    // never gets cleared — legendAchievedAt is the presence marker (also what the Legends
+    // leaderboard sorts are filtered by, implicitly — see loadHallOfLegends), and
+    // legendPeakNetWorth keeps climbing if net worth goes even higher afterward.
+    if(netWorth>=HALL_OF_LEGENDS_NET_WORTH && !u.legendAchievedAt){
+      update.legendAchievedAt = serverTimestamp();
+      update.legendPeakNetWorth = netWorth;
+    } else if(netWorth>=HALL_OF_LEGENDS_NET_WORTH && netWorth>(u.legendPeakNetWorth||0)){
+      update.legendPeakNetWorth = netWorth;
+    }
+    await updateDoc(doc(db,'users',state.uid), update);
     return netWorth;
   }catch(err){ return null; /* leaderboard snapshotting is best-effort */ }
 }
@@ -1958,6 +2116,22 @@ const ABYSS_SELL_BIAS = 0.68;        // ~68% of trades lean sell — this sustai
 const ABYSS_MEGA_CHANCE = 0.6;
 const ABYSS_MIN_SWING = 1500;
 const ABYSS_MAX_SWING = 20000;
+
+// The Singularity: unlike every other bot-driven coin (which trades on its own internal random
+// logic), this one has no independent behavior of its own at all — its price only ever moves as
+// an echo of REAL trades happening anywhere else in the app, scaled down. Genuinely emergent:
+// nobody, including the person who built this, can predict its path in advance, since it depends
+// entirely on what real people actually do elsewhere.
+const SINGULARITY_UNLOCK_NET_WORTH = 1e18; // Qi
+const SINGULARITY_MIRROR_CHANCE = 0.4;     // not every real trade gets echoed — keeps write volume sane
+const SINGULARITY_MIRROR_FRAC_MIN = 0.05, SINGULARITY_MIRROR_FRAC_MAX = 0.2;
+
+// The unnamed one: unlocked one tier above the Singularity, with zero in-app explanation of odds
+// or mechanics by design — no warning panel, no description, just the coin. Structurally
+// unpredictable rather than just big: each tick randomly picks a completely different behavior
+// mode from the ones already built elsewhere in this file, so there's no single pattern to learn.
+const MYSTERY_UNLOCK_NET_WORTH = 1e21; // Sx
+const MYSTERY_TICK_MS = 3500;
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -2275,6 +2449,107 @@ async function abyssCoinTick(){
   }catch(err){ /* non-critical */ }
 }
 
+/* ===================== THE SINGULARITY (emergent, driven by real activity elsewhere) ===================== */
+let singularityCheckCounter = 0;
+async function checkSingularitySchedule(){
+  singularityCheckCounter++;
+  if(singularityCheckCounter!==1 && singularityCheckCounter%4!==0) return;
+  try{
+    const ref = doc(db,'meta','singularityCoin');
+    const snap = await getDoc(ref);
+    if(snap.exists() && snap.data().coinId) return; // spawned once, permanently, same as the Abyss
+    const picked = await makeUniqueBotTicker();
+    if(!picked) return;
+    const newCoin = await spawnBotCoin(false, picked, false, false, false);
+    if(newCoin){
+      await setDoc(ref, { coinId: newCoin.id });
+      await updateDoc(doc(db,'coins',newCoin.id), { isSingularity: true });
+    }
+  }catch(err){ /* ignore — next check retries */ }
+}
+// Watches the global activity feed for REAL trades (bots are always tagged uid:'bot' and never
+// match) happening on any OTHER coin, and echoes a scaled-down version onto the Singularity.
+// This is its entire behavior — it has no independent randomization of its own at all, which is
+// what makes it genuinely emergent rather than just another flavor of randomized volatility.
+let singularityListenerReady = false;
+function listenSingularityMirror(){
+  singularityListenerReady = false;
+  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(20));
+  const un = onSnapshot(q, snap=>{
+    if(!singularityListenerReady){ singularityListenerReady = true; return; } // skip the initial existing batch
+    snap.docChanges().forEach(change=>{
+      if(change.type!=='added') return;
+      const t = change.doc.data();
+      if(t.uid==='bot') return; // only real trades feed it — that's the whole point
+      if(t.type!=='buy' && t.type!=='sell') return; // skip giveaway-type entries etc
+      mirrorToSingularity(t);
+    });
+  }, ()=>{ /* silent — non-critical */ });
+  state.unsubs.push(un);
+}
+async function mirrorToSingularity(t){
+  if(Math.random() >= SINGULARITY_MIRROR_CHANCE) return; // not every real trade gets echoed
+  try{
+    const schedSnap = await getDoc(doc(db,'meta','singularityCoin'));
+    if(!schedSnap.exists() || !schedSnap.data().coinId) return;
+    const coinId = schedSnap.data().coinId;
+    if(t.coinId===coinId) return; // don't mirror trades on the Singularity itself — avoids a feedback loop
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const frac = SINGULARITY_MIRROR_FRAC_MIN + Math.random()*(SINGULARITY_MIRROR_FRAC_MAX-SINGULARITY_MIRROR_FRAC_MIN);
+    const usd = Math.max(10, (t.usdAmount||0)*frac);
+    if(t.type==='buy') botBuyOnCoin(coinId, usd, usd>800);
+    else botSellOnCoin(coinId, usd, usd>800);
+  }catch(err){ /* non-critical */ }
+}
+
+/* ===================== THE UNNAMED ONE (deliberately unexplained) ===================== */
+let mysteryCheckCounter = 0;
+async function checkMysterySchedule(){
+  mysteryCheckCounter++;
+  if(mysteryCheckCounter!==1 && mysteryCheckCounter%4!==0) return;
+  try{
+    const ref = doc(db,'meta','mysteryCoin');
+    const snap = await getDoc(ref);
+    if(snap.exists() && snap.data().coinId) return;
+    const picked = await makeUniqueBotTicker();
+    if(!picked) return;
+    const newCoin = await spawnBotCoin(false, picked, false, false, false);
+    if(newCoin){
+      await setDoc(ref, { coinId: newCoin.id });
+      await updateDoc(doc(db,'coins',newCoin.id), { isMystery: true });
+    }
+  }catch(err){ /* ignore — next check retries */ }
+}
+// Each tick randomly picks a completely different behavior mode already built elsewhere in this
+// file — sometimes it acts rug-recovery-slow, sometimes Abyss-style sell-biased, sometimes
+// Risky-style unbiased chaos, sometimes guaranteed-growth-style bullish. No single pattern to
+// learn by watching it, which is deliberately the entire point.
+async function mysteryCoinTick(){
+  try{
+    const snap = await getDoc(doc(db,'meta','mysteryCoin'));
+    if(!snap.exists() || !snap.data().coinId) return;
+    const coinId = snap.data().coinId;
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const coinSnap = await getDoc(doc(db,'coins',coinId));
+    if(!coinSnap.exists()) return;
+    const coin = coinSnap.data();
+    if(Math.random() >= 0.95) return;
+    const mode = Math.floor(Math.random()*4);
+    const isMega = Math.random() < 0.5;
+    const usd = isMega ? coin.solReserve*(0.5+Math.random()*2) : (500+Math.random()*10000);
+    let buyChance;
+    if(mode===0) buyChance = 0.5;        // unbiased chaos
+    else if(mode===1) buyChance = 0.25;  // heavy sell lean
+    else if(mode===2) buyChance = 0.9;   // heavy buy lean
+    else buyChance = Math.random();      // fully random each tick — no lean at all
+    setTimeout(()=>{
+      if(coinsWithPendingUserTrade.has(coinId)) return;
+      if(Math.random()<buyChance) botBuyOnCoin(coinId, usd, true);
+      else botSellOnCoin(coinId, usd, true, isMega?0.45:0.05);
+    }, Math.random()*2500);
+  }catch(err){ /* non-critical */ }
+}
+
 
 async function riskyCoinTick(){
   try{
@@ -2428,6 +2703,8 @@ async function botCoinTick(){
       const coin = d.data();
       if(coin.isRisky) return; // handled entirely by its own dedicated riskyCoinTick loop instead
       if(coin.isAbyss) return; // handled entirely by its own dedicated abyssCoinTick loop instead
+      if(coin.isSingularity) return; // has no independent tick at all — only ever moves via listenSingularityMirror()
+      if(coin.isMystery) return; // handled entirely by its own dedicated mysteryCoinTick loop instead
       const hot = isCoinHot(coin);
       const hotStagger = (ms)=> hot ? ms*0.35 : ms; // hot coins fire sooner, not just more often
       if(coin.guaranteedGrowth){
@@ -2501,6 +2778,8 @@ async function botCoinTick(){
   checkInsiderSchedule();
   checkRiskySchedule();
   checkAbyssSchedule();
+  checkSingularitySchedule();
+  checkMysterySchedule();
 }
 
 async function ruggedCoinEvent(coinId){
@@ -2604,10 +2883,12 @@ function startBots(){
   setTimeout(botCoinTick, 4500);
   setTimeout(riskyCoinTick, 6000);
   setTimeout(abyssCoinTick, 7000);
+  setTimeout(mysteryCoinTick, 8000);
   scheduleNext(botTick, BOT_TICK_MS);
   scheduleNext(botCoinTick, BOT_TICK_MS);
   scheduleNext(riskyCoinTick, RISKY_TICK_MS);
   scheduleNext(abyssCoinTick, ABYSS_TICK_MS);
+  scheduleNext(mysteryCoinTick, MYSTERY_TICK_MS);
 }
 function stopBots(){ botRunning = false; }
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
@@ -3670,6 +3951,7 @@ function renderLeaderboard(){
       <div class="chip" data-cat="weekly">🗓️ Weekly</div>
       <div class="chip" data-cat="alltime">👑 All-Time</div>
       <div class="chip" data-cat="philanthropy">🎁 Philanthropy</div>
+      <div class="chip" data-cat="legends">🏛️ Legends</div>
     </div>
     <div id="lbList"><div class="spinner" style="margin-top:40px;"></div></div>
   `;
@@ -3685,10 +3967,10 @@ function renderLeaderboard(){
       lbCategory = c.dataset.cat;
       document.querySelectorAll('#lbChips .chip').forEach(x=>x.classList.remove('active'));
       c.classList.add('active');
-      if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else loadLeaderboard();
+      if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else if(lbCategory==='legends') loadHallOfLegends(); else loadLeaderboard();
     });
   });
-  if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else loadLeaderboard();
+  if(lbCategory==='philanthropy') loadPhilanthropyLeaderboard(); else if(lbCategory==='legends') loadHallOfLegends(); else loadLeaderboard();
 }
 
 // Prefix search on usernameLower (already stored on every user doc for signup uniqueness checks).
@@ -3900,6 +4182,38 @@ async function setBannerPreset(key){
   if(key && !BANNER_PRESETS[key]) return;
   try{ await updateDoc(doc(db,'users',state.uid), { 'cosmetics.bannerPreset': key||null }); }
   catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
+
+// Sorted by legendPeakNetWorth — a single-field orderBy with no where clause needed at all.
+// Anyone who's never crossed Qi simply doesn't have this field set, and Firestore excludes docs
+// missing the ordered field from range/order queries entirely — so this naturally returns only
+// legends, correctly sorted, without a composite index (same trick already used for Philanthropy).
+async function loadHallOfLegends(){
+  const list = document.getElementById('lbList');
+  if(!list) return;
+  list.innerHTML = `<div class="spinner" style="margin-top:40px;"></div>`;
+  try{
+    const snap = await getDocs(query(collection(db,'users'), orderBy('legendPeakNetWorth','desc'), limit(25)));
+    const rows = snap.docs.map(d=>({uid:d.id, ...d.data()})).filter(u=>u.username && u.legendAchievedAt);
+    if(!rows.length){ list.innerHTML = `<div class="empty"><div class="em-ic">🏛️</div>Nobody's crossed ${fmtUsd(HALL_OF_LEGENDS_NET_WORTH)} yet — this record is permanent once someone does.</div>`; return; }
+    list.innerHTML = `
+      <div style="font-size:11.5px;color:var(--txt-faint);margin-bottom:12px;line-height:1.5;">A permanent record, not a live ranking — everyone here crossed ${fmtUsd(HALL_OF_LEGENDS_NET_WORTH)} at some point and stays listed even if net worth drops later. Sorted by peak, not current standing.</div>
+      ${rows.map((r,i)=>{
+        const medal = i===0?'🥇':i===1?'🥈':i===2?'🥉':`#${i+1}`;
+        return `
+        <div class="holder-line">
+          <span style="width:26px;text-align:center;font-weight:700;">${medal}</span>
+          <div class="user-link" data-uid="${r.uid}" style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+            <img class="avatar-sm" src="${avatarFor(r.username, r.avatarURL)}" style="border-radius:50%;">
+            <span>@${esc(r.username)}${wealthBadgeHtml(r.netWorth||r.balance||0)}</span>
+          </div>
+          <span class="mono" style="margin-left:auto;color:#B8A8FF;">🏛️ ${fmtUsd(r.legendPeakNetWorth)}</span>
+        </div>`;
+      }).join('')}`;
+    list.querySelectorAll('.user-link').forEach(el=> el.addEventListener('click', ()=> openProfile(el.dataset.uid)));
+  }catch(err){
+    list.innerHTML = `<div class="empty">Couldn't load the Hall of Legends: ${esc(err.message)}</div>`;
+  }
 }
 
 async function loadPhilanthropyLeaderboard(){
