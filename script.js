@@ -373,6 +373,7 @@ onAuthStateChanged(auth, async (user)=>{
     listenAutoSnipe();
     listenIncomingTransfers();
     applyBankGrowth();
+    refreshNetWorthSnapshot(); // also catches Hall of Legends crossings from passive gains (bank interest, held coins appreciating) — not just right after a trade
     listenCopyOrders();
     listenSingularityMirror();
     navigate('home');
@@ -2110,8 +2111,8 @@ const RISKY_MEGA_CHANCE = 0.55; // 55% of trades are genuinely violent, sized of
 // losing bet more often than not. The occasional huge upward spike is real and can be caught, but
 // the house wins on net over time by design.
 const ABYSS_UNLOCK_NET_WORTH = 1e9;
-const ABYSS_TICK_MS = 4500;          // faster than every other coin in the app, including Risky's 9000
-const ABYSS_TRADE_CHANCE = 0.97;
+const ABYSS_TICK_MS = 900;           // comfortably under 1000ms so "at least once a second" is reliable, not just an average
+const ABYSS_TRADE_CHANCE = 0.98;
 const ABYSS_SELL_BIAS = 0.68;        // ~68% of trades lean sell — this sustained drift is what actually produces "80% chance of losing"
 const ABYSS_MEGA_CHANCE = 0.6;
 const ABYSS_MIN_SWING = 1500;
@@ -2132,6 +2133,8 @@ const SINGULARITY_MIRROR_FRAC_MIN = 0.05, SINGULARITY_MIRROR_FRAC_MAX = 0.2;
 // mode from the ones already built elsewhere in this file, so there's no single pattern to learn.
 const MYSTERY_UNLOCK_NET_WORTH = 1e21; // Sx
 const MYSTERY_TICK_MS = 3500;
+const SINGULARITY_TICK_MS = 450; // aims for "at least twice a second"
+let abyssIntervalId = null, singularityIntervalId = null;
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
@@ -2441,11 +2444,9 @@ async function abyssCoinTick(){
       ? coin.solReserve * (0.7+Math.random()*1.8) // 70%-250% of current liquidity — even more violent than Risky's mega mode
       : ABYSS_MIN_SWING + Math.random()*(ABYSS_MAX_SWING-ABYSS_MIN_SWING);
     const isSell = Math.random() < ABYSS_SELL_BIAS;
-    setTimeout(()=>{
-      if(coinsWithPendingUserTrade.has(coinId)) return;
-      if(!isSell) botBuyOnCoin(coinId, usd, true);
-      else botSellOnCoin(coinId, usd, true, isMega?0.5:0.05); // mega sells relax the normal 5% cap, same idea as Risky
-    }, Math.random()*3000);
+    if(coinsWithPendingUserTrade.has(coinId)) return; // re-check right before firing — no stagger delay at this tick rate, it would eat into the per-second guarantee
+    if(!isSell) botBuyOnCoin(coinId, usd, true);
+    else botSellOnCoin(coinId, usd, true, isMega?0.5:0.05); // mega sells relax the normal 5% cap, same idea as Risky
   }catch(err){ /* non-critical */ }
 }
 
@@ -2487,6 +2488,7 @@ function listenSingularityMirror(){
   }, ()=>{ /* silent — non-critical */ });
   state.unsubs.push(un);
 }
+let lastSingularityActivityAt = 0;
 async function mirrorToSingularity(t){
   if(Math.random() >= SINGULARITY_MIRROR_CHANCE) return; // not every real trade gets echoed
   try{
@@ -2497,8 +2499,29 @@ async function mirrorToSingularity(t){
     if(coinsWithPendingUserTrade.has(coinId)) return;
     const frac = SINGULARITY_MIRROR_FRAC_MIN + Math.random()*(SINGULARITY_MIRROR_FRAC_MAX-SINGULARITY_MIRROR_FRAC_MIN);
     const usd = Math.max(10, (t.usdAmount||0)*frac);
+    lastSingularityActivityAt = Date.now();
     if(t.type==='buy') botBuyOnCoin(coinId, usd, usd>800);
     else botSellOnCoin(coinId, usd, usd>800);
+  }catch(err){ /* non-critical */ }
+}
+// A small friends app realistically won't produce two real trades every second for the mirror
+// mechanism above to echo — so on its own, "at least twice a second" isn't achievable purely
+// from real activity without abandoning the Singularity's whole premise. This is the honest
+// compromise: real mirrored trades still drive the bulk of its behavior and direction whenever
+// they're actually happening (this baseline stays silent for a beat after any real mirror
+// fires); a small, low-key filler trade only kicks in when real activity has gone quiet for a
+// moment, purely to sustain the requested pace rather than to add its own opinion about
+// direction — it's a 50/50 coin-flip, not biased either way.
+async function singularityBaselineTick(){
+  try{
+    if(Date.now()-lastSingularityActivityAt < 400) return; // recent real-mirror activity already covered this window
+    const schedSnap = await getDoc(doc(db,'meta','singularityCoin'));
+    if(!schedSnap.exists() || !schedSnap.data().coinId) return;
+    const coinId = schedSnap.data().coinId;
+    if(coinsWithPendingUserTrade.has(coinId)) return;
+    const usd = 20+Math.random()*200; // small and low-key — real mirrored trades are still what actually drives it
+    if(Math.random()<0.5) botBuyOnCoin(coinId, usd, false);
+    else botSellOnCoin(coinId, usd, false);
   }catch(err){ /* non-critical */ }
 }
 
@@ -2882,15 +2905,26 @@ function startBots(){
   setTimeout(botTick, 3000);       // one early tick shortly after load
   setTimeout(botCoinTick, 4500);
   setTimeout(riskyCoinTick, 6000);
-  setTimeout(abyssCoinTick, 7000);
   setTimeout(mysteryCoinTick, 8000);
   scheduleNext(botTick, BOT_TICK_MS);
   scheduleNext(botCoinTick, BOT_TICK_MS);
   scheduleNext(riskyCoinTick, RISKY_TICK_MS);
-  scheduleNext(abyssCoinTick, ABYSS_TICK_MS);
   scheduleNext(mysteryCoinTick, MYSTERY_TICK_MS);
+  // Abyss and the Singularity run on plain setInterval instead of scheduleNext's jitter — that
+  // jitter (base ± 3000ms) is fine at tick rates measured in seconds-to-minutes, but at
+  // sub-second timescales it could delay an individual tick by several seconds or even land
+  // negative, which would break the "at least once a second" / "at least twice a second"
+  // guarantees these two specifically need. Precise fixed intervals instead.
+  if(abyssIntervalId) clearInterval(abyssIntervalId);
+  if(singularityIntervalId) clearInterval(singularityIntervalId);
+  abyssIntervalId = setInterval(()=>{ if(botRunning) abyssCoinTick(); }, ABYSS_TICK_MS);
+  singularityIntervalId = setInterval(()=>{ if(botRunning) singularityBaselineTick(); }, SINGULARITY_TICK_MS);
 }
-function stopBots(){ botRunning = false; }
+function stopBots(){
+  botRunning = false;
+  if(abyssIntervalId){ clearInterval(abyssIntervalId); abyssIntervalId = null; }
+  if(singularityIntervalId){ clearInterval(singularityIntervalId); singularityIntervalId = null; }
+}
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
 
 /* ===================== CREATE COIN ===================== */
