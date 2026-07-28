@@ -386,7 +386,7 @@ onAuthStateChanged(auth, async (user)=>{
     listenCopyOrders();
     listenSingularityMirror();
     navigate('home');
-    startBots();
+    if(!document.hidden) startBots(); // a tab that starts already hidden shouldn't run the bot economy either — visibilitychange only fires on a transition, not the initial state
     startConsoleAutoClear();
   } else {
     state.uid = null; state.userDoc = null;
@@ -2968,6 +2968,19 @@ function stopBots(){
   if(abyssIntervalId){ clearInterval(abyssIntervalId); abyssIntervalId = null; }
   if(singularityIntervalId){ clearInterval(singularityIntervalId); singularityIntervalId = null; }
 }
+
+// The entire ambient bot economy — every tick loop in this file — only actually does anything
+// while botRunning is true; scheduleNext() and both setInterval callbacks already check it
+// before firing. That flag just never used to react to whether anyone was actually looking at
+// the tab. A backgrounded or minimized tab was running every tick loop at full speed for no
+// visible benefit to anyone, which is real, wasted load. Now: hide the tab, everything pauses
+// completely; come back, startBots() restarts it (its own guard against double-starting already
+// exists) and immediately re-runs the same catch-up sweep it already does on a fresh sign-in, so
+// time spent hidden gets fast-forwarded the same way time spent fully offline already was.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden){ stopBots(); }
+  else if(state.uid){ startBots(); }
+});
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
 
 /* ===================== CREATE COIN ===================== */
