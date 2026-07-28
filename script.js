@@ -2148,7 +2148,7 @@ const RISKY_MEGA_CHANCE = 0.55; // 55% of trades are genuinely violent, sized of
 // losing bet more often than not. The occasional huge upward spike is real and can be caught, but
 // the house wins on net over time by design.
 const ABYSS_UNLOCK_NET_WORTH = 1e9;
-const ABYSS_TICK_MS = 900;           // comfortably under 1000ms so "at least once a second" is reliable, not just an average
+const ABYSS_TICK_MS = 3500;          // walked back from 900ms — that rate, multiplied across every open tab, was directly causing real slowness and load failures across the whole app. Still much faster than Risky's 9000ms.
 const ABYSS_TRADE_CHANCE = 0.98;
 const ABYSS_SELL_BIAS = 0.68;        // ~68% of trades lean sell — this sustained drift is what actually produces "80% chance of losing"
 const ABYSS_MEGA_CHANCE = 0.6;
@@ -2170,7 +2170,7 @@ const SINGULARITY_MIRROR_FRAC_MIN = 0.05, SINGULARITY_MIRROR_FRAC_MAX = 0.2;
 // mode from the ones already built elsewhere in this file, so there's no single pattern to learn.
 const MYSTERY_UNLOCK_NET_WORTH = 1e21; // Sx
 const MYSTERY_TICK_MS = 3500;
-const SINGULARITY_TICK_MS = 450; // aims for "at least twice a second"
+const SINGULARITY_TICK_MS = 2000; // walked back from 450ms — same reasoning as the Abyss above
 let abyssIntervalId = null, singularityIntervalId = null;
 
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
@@ -2707,7 +2707,10 @@ async function catchUpBotCoin(coinId, coin){
 async function catchUpAllBotCoins(){
   try{
     const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT)));
-    for(const d of snap.docs) await catchUpBotCoin(d.id, d.data());
+    // Parallel, not sequential — awaiting each coin one at a time meant up to 15 sequential
+    // network round-trips stacking up on every single sign-in before the app felt usable. These
+    // are independent documents, so there's no correctness reason to serialize them.
+    await Promise.all(snap.docs.map(d=> catchUpBotCoin(d.id, d.data())));
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
 }
 
