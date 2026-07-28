@@ -2704,7 +2704,10 @@ async function catchUpBotCoin(coinId, coin){
   }catch(err){ /* another tab may have just done the same catch-up — fine either way */ }
 }
 
+let catchUpInFlight = false;
 async function catchUpAllBotCoins(){
+  if(catchUpInFlight) return; // a previous call is still running — don't pile another one on top of it
+  catchUpInFlight = true;
   try{
     const snap = await getDocs(query(collection(db,'coins'), where('isBotCoin','==',true), limit(BOT_COIN_QUERY_LIMIT)));
     // Parallel, not sequential — awaiting each coin one at a time meant up to 15 sequential
@@ -2712,6 +2715,7 @@ async function catchUpAllBotCoins(){
     // are independent documents, so there's no correctness reason to serialize them.
     await Promise.all(snap.docs.map(d=> catchUpBotCoin(d.id, d.data())));
   }catch(err){ /* ignore — e.g. missing index while Firestore builds one */ }
+  finally{ catchUpInFlight = false; }
 }
 
 // "Hot" coins — someone real looked at this coin's page recently, or actually traded it
@@ -2977,9 +2981,19 @@ function stopBots(){
 // completely; come back, startBots() restarts it (its own guard against double-starting already
 // exists) and immediately re-runs the same catch-up sweep it already does on a fresh sign-in, so
 // time spent hidden gets fast-forwarded the same way time spent fully offline already was.
+let visibilityDebounceTimer = null;
 document.addEventListener('visibilitychange', ()=>{
-  if(document.hidden){ stopBots(); }
-  else if(state.uid){ startBots(); }
+  clearTimeout(visibilityDebounceTimer);
+  // Debounced — some browsers/embedded or preview contexts can fire visibilitychange rapidly or
+  // spuriously rather than on a single clean transition. Without this, rapid flapping meant
+  // repeated stopBots()/startBots() cycles, each one kicking off a fresh catchUpAllBotCoins()
+  // that could overlap with a still-in-flight previous one — many concurrent transactions
+  // hitting the same handful of coins at once, which is exactly what produces a fast burst of
+  // errors. Only react once visibility has actually been stable for a moment.
+  visibilityDebounceTimer = setTimeout(()=>{
+    if(document.hidden){ stopBots(); }
+    else if(state.uid){ startBots(); }
+  }, 800);
 });
 function stopConsoleAutoClear(){ if(consoleClearInterval){ clearInterval(consoleClearInterval); consoleClearInterval = null; } }
 
