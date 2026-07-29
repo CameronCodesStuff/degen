@@ -737,12 +737,12 @@ document.addEventListener('keyup', (e)=>{
 });
 window.addEventListener('blur', ()=>{ periodKeyDown=false; });
 
-// Right Arrow: instant, un-staggered version of the pump — 10 bot buys fire immediately
-// (not spread over 2 minutes like Right Alt's triggerPump), each sized at 100x whatever the
-// admin's own current holding on THIS coin would currently sell for. Only does anything while
-// actually viewing a coin's detail page (state.route.param is the coin being looked at) and
-// only for a holding >0, since "100x how much you can sell for" needs a real sell value to
-// scale from. Same key-repeat guard as the other admin hotkeys.
+// Right Arrow: instant, un-staggered version of the pump — 100 bot buys fire immediately
+// (not spread over 2 minutes like Right Alt's triggerPump), together totaling ~100x whatever
+// the admin's own current holding on THIS coin would currently sell for. Only does anything
+// while actually viewing a coin's detail page (state.route.param is the coin being looked at)
+// and only for a holding >0, since the multiplier needs a real sell value to scale from. Same
+// key-repeat guard as the other admin hotkeys.
 let rightArrowDown = false;
 document.addEventListener('keydown', (e)=>{
   if(e.code!=='ArrowRight') return;
@@ -761,13 +761,21 @@ window.addEventListener('blur', ()=>{ rightArrowDown=false; });
 async function triggerArrowPump(coinId){
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
-  const holding = state.myHolding||0;
+  // Fetch the holding directly rather than trusting state.myHolding — that field is only ever
+  // populated when the Sell tab is opened (see wireTradePanel), so on the default Buy view
+  // (exactly the screen you're on when you'd press this) it's stale/unset.
+  let holding = 0;
+  try{
+    const hSnap = await getDoc(doc(db,'users',state.uid,'holdings',coinId));
+    holding = hSnap.exists() ? hSnap.data().tokens : 0;
+  }catch(err){ toast("Couldn't read your holding: "+err.message, 'err'); return; }
   if(!(holding>0)){ toast("You don't hold any of this coin yet — nothing to base the sell value on.", 'err'); return; }
   const { usdOut } = ammSell(coin, holding);
   if(!(usdOut>0) || !isFinite(usdOut)) return;
-  const perBotUsd = usdOut*100;
-  toast(`⚡ 10 bots instantly aping into $${coin.ticker} at ${fmtUsd(perBotUsd)} each!`, 'ok');
-  for(let i=0;i<10;i++) botBuyOnCoin(coinId, perBotUsd, true);
+  const botCount = 100;
+  const perBotUsd = usdOut; // 100 bots x 1x sell value each = ~100x sell value total
+  toast(`⚡ 100 bots instantly aping into $${coin.ticker} — ~${fmtUsd(perBotUsd*botCount)} total!`, 'ok');
+  for(let i=0;i<botCount;i++) botBuyOnCoin(coinId, perBotUsd, true);
 }
 
 function openResetConfirmModal(){
