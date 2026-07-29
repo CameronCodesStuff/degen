@@ -7,7 +7,7 @@ import {
   initializeFirestore, persistentLocalCache, persistentMultipleTabManager,
   doc, getDoc, setDoc, updateDoc, onSnapshot, collection, collectionGroup,
   query, orderBy, limit, runTransaction, serverTimestamp, where, getDocs, deleteField, Timestamp,
-  getCountFromServer, writeBatch, deleteDoc, setLogLevel
+  getCountFromServer, writeBatch, deleteDoc, setLogLevel, documentId
 } from "https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js";
 const firebaseConfig = {
   apiKey: "AIzaSyCMDe_UPrNTjKnEoO2ngTe7wE6P7_G06ms",
@@ -97,6 +97,25 @@ const state = {
   tradeMode: 'buy',
   tradeAmount: 0,
 };
+
+// Batch-fetches whichever of the given coin IDs aren't already in state.coinsCache, using
+// Firestore's documentId() 'in' queries (chunked to Firestore's 30-value limit per query) fired
+// concurrently via Promise.all — instead of the old pattern of a sequential `for` loop doing one
+// `await getDoc` at a time. That old pattern turned "load a page with N holdings" into N
+// back-to-back network round-trips; this turns it into ceil(N/30) round-trips that all happen at
+// once. Every caller just awaits this once, then reads state.coinsCache synchronously.
+async function ensureCoinsCached(coinIds){
+  const missing = [...new Set(coinIds)].filter(id=> id && !state.coinsCache.has(id));
+  if(!missing.length) return;
+  const chunks = [];
+  for(let i=0;i<missing.length;i+=30) chunks.push(missing.slice(i,i+30));
+  await Promise.all(chunks.map(async chunk=>{
+    try{
+      const snap = await getDocs(query(collection(db,'coins'), where(documentId(),'in',chunk)));
+      snap.docs.forEach(d=> state.coinsCache.set(d.id, {id:d.id, ...d.data()}));
+    }catch(err){ /* silent — callers already treat a cache miss as "coin unavailable" */ }
+  }));
+}
 
 function clearUnsubs(){ state.unsubs.forEach(u=>u()); state.unsubs = []; }
 // Shared by fmtUsd and fmtTok — extended well past the old M/B cap since compounding growth
@@ -1690,9 +1709,10 @@ async function doBuy(coinId, usdAmount, viaSnipe=false){
     if(result.wasCapped) toast(`Bought ${fmtTok(result.tokensOut)} tokens for ${fmtUsd(result.finalUsd)} — capped at ${Math.round(MAX_OWNERSHIP_PCT*100)}% ownership, rest refunded.`, 'ok');
     else if(!viaSnipe) toast(`Bought ${fmtTok(result.tokensOut)} tokens!`, 'ok');
     state.tradeAmount = 0;
-    const nw = await refreshNetWorthSnapshot();
-    checkMilestones(null, nw);
-    checkRankOvertake();
+    // Fire-and-forget: the trade itself already succeeded and the UI shouldn't sit on a
+    // disabled button waiting for this. refreshNetWorthSnapshot batches its own coin lookups
+    // internally, but even a fast batch call is still latency the person shouldn't have to watch.
+    refreshNetWorthSnapshot().then(nw=>{ checkMilestones(null, nw); checkRankOvertake(); });
     pushCopyOrdersForTrade(coinId, result.ticker, result.name, result.imageURL, 'buy');
     return result;
   }catch(err){ toast(err.message, 'err'); return null; }
@@ -1773,9 +1793,8 @@ async function doSell(coinId, tokenAmount){
     });
     toast(`Sold for ${fmtUsd(result.usdOut)}!`, 'ok');
     state.tradeAmount = 0;
-    const nw = await refreshNetWorthSnapshot();
-    checkMilestones(result.pnl, nw);
-    checkRankOvertake();
+    // Fire-and-forget — see the matching comment in doBuy above.
+    refreshNetWorthSnapshot().then(nw=>{ checkMilestones(result.pnl, nw); checkRankOvertake(); });
     pushCopyOrdersForTrade(coinId, result.ticker, result.name, result.imageURL, 'sell');
     return result;
   }catch(err){ toast(err.message, 'err'); return null; }
@@ -1793,10 +1812,10 @@ async function refreshNetWorthSnapshot(){
   try{
     const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
     const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+    await ensureCoinsCached(holdings.map(h=>h.id));
     let holdingsVal = 0;
     for(const h of holdings){
-      let coin = state.coinsCache.get(h.id);
-      if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()) coin = {id:cs.id,...cs.data()}; }
+      const coin = state.coinsCache.get(h.id);
       if(coin) holdingsVal += sellValue(coin, h.tokens);
     }
     const uSnap = await getDoc(doc(db,'users',state.uid));
@@ -2888,11 +2907,11 @@ async function renderPortfolio(){
   drawNetWorthChart('pfChart', state.userDoc?.netWorthHistory);
   const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+  await ensureCoinsCached(holdings.map(h=>h.id));
   let holdingsVal = 0;
   const rows = [];
   for(const h of holdings){
-    let coin = state.coinsCache.get(h.id);
-    if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()) coin = {id:cs.id,...cs.data()}; }
+    const coin = state.coinsCache.get(h.id);
     if(!coin) continue;
     const price = priceOf(coin);
     const val = sellValue(coin, h.tokens);
@@ -3446,19 +3465,21 @@ async function openSnipeStatsModal(){
   // without navigating to the coin's own page first.
   try{
     const uniqueCoinIds = [...new Set(list.map(s=>s.coinId))];
+    const uniqueSet = new Set(uniqueCoinIds);
+    const holdSnap = await getDocs(collection(db,'users',state.uid,'holdings'));
+    const holdings = holdSnap.docs
+      .filter(d=> uniqueSet.has(d.id))
+      .map(d=>({id:d.id,...d.data()}))
+      .filter(h=>h.tokens>0.0001);
+    await ensureCoinsCached(holdings.map(h=>h.id));
     let total = 0;
     const held = [];
-    for(const coinId of uniqueCoinIds){
-      const holdSnap = await getDoc(doc(db,'users',state.uid,'holdings',coinId));
-      if(!holdSnap.exists()) continue;
-      const h = holdSnap.data();
-      if(!(h.tokens>0.0001)) continue;
-      let coin = state.coinsCache.get(coinId);
-      if(!coin){ const cs = await getDoc(doc(db,'coins',coinId)); if(cs.exists()){ coin = {id:cs.id,...cs.data()}; state.coinsCache.set(coinId, coin); } }
+    for(const h of holdings){
+      const coin = state.coinsCache.get(h.id);
       if(!coin) continue;
       const val = sellValue(coin, h.tokens);
       total += val;
-      held.push({ coinId, ticker: h.ticker, imageURL: h.imageURL, tokens: h.tokens, val, pnl: val-(h.costBasis||0) });
+      held.push({ coinId: h.id, ticker: h.ticker, imageURL: h.imageURL, tokens: h.tokens, val, pnl: val-(h.costBasis||0) });
     }
     const el = document.getElementById('snipeCurValue');
     if(el) el.textContent = fmtUsd(total);
@@ -3831,12 +3852,11 @@ function todaysChange(u){
 async function liveNetWorthFor(uid, cashBalance){
   try{
     const holdSnap = await getDocs(collection(db,'users',uid,'holdings'));
+    const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+    await ensureCoinsCached(holdings.map(h=>h.id));
     let holdingsVal = 0;
-    for(const d of holdSnap.docs){
-      const h = d.data();
-      if(!(h.tokens>0.0001)) continue;
-      let coin = state.coinsCache.get(d.id);
-      if(!coin){ const cs = await getDoc(doc(db,'coins',d.id)); if(cs.exists()){ coin = {id:cs.id,...cs.data()}; state.coinsCache.set(d.id, coin); } }
+    for(const h of holdings){
+      const coin = state.coinsCache.get(h.id);
       if(coin) holdingsVal += sellValue(coin, h.tokens);
     }
     return (cashBalance||0) + holdingsVal;
@@ -4006,10 +4026,10 @@ async function loadPhilanthropyLeaderboard(){
 async function loadPositions(uid){
   const holdSnap = await getDocs(collection(db,'users',uid,'holdings'));
   const holdings = holdSnap.docs.map(d=>({id:d.id,...d.data()})).filter(h=>h.tokens>0.0001);
+  await ensureCoinsCached(holdings.map(h=>h.id));
   const open = [];
   for(const h of holdings){
-    let coin = state.coinsCache.get(h.id);
-    if(!coin){ const cs = await getDoc(doc(db,'coins',h.id)); if(cs.exists()){ coin = {id:cs.id, ...cs.data()}; state.coinsCache.set(h.id, coin); } }
+    const coin = state.coinsCache.get(h.id);
     const val = coin? sellValue(coin, h.tokens) : 0;
     open.push({ h, coin, val, pnl: val-(h.costBasis||0) });
   }
