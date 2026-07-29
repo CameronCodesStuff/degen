@@ -737,6 +737,39 @@ document.addEventListener('keyup', (e)=>{
 });
 window.addEventListener('blur', ()=>{ periodKeyDown=false; });
 
+// Right Arrow: instant, un-staggered version of the pump — 10 bot buys fire immediately
+// (not spread over 2 minutes like Right Alt's triggerPump), each sized at 100x whatever the
+// admin's own current holding on THIS coin would currently sell for. Only does anything while
+// actually viewing a coin's detail page (state.route.param is the coin being looked at) and
+// only for a holding >0, since "100x how much you can sell for" needs a real sell value to
+// scale from. Same key-repeat guard as the other admin hotkeys.
+let rightArrowDown = false;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ArrowRight') return;
+  if(rightArrowDown) return;
+  rightArrowDown = true;
+  if(!isPumpAdmin()) return;
+  if(state.route.name!=='coin' || !state.route.param) return;
+  triggerArrowPump(state.route.param);
+});
+document.addEventListener('keyup', (e)=>{
+  if(e.code!=='ArrowRight') return;
+  rightArrowDown = false;
+});
+window.addEventListener('blur', ()=>{ rightArrowDown=false; });
+
+async function triggerArrowPump(coinId){
+  const coin = state.coinsCache.get(coinId);
+  if(!coin) return;
+  const holding = state.myHolding||0;
+  if(!(holding>0)){ toast("You don't hold any of this coin yet — nothing to base the sell value on.", 'err'); return; }
+  const { usdOut } = ammSell(coin, holding);
+  if(!(usdOut>0) || !isFinite(usdOut)) return;
+  const perBotUsd = usdOut*100;
+  toast(`⚡ 10 bots instantly aping into $${coin.ticker} at ${fmtUsd(perBotUsd)} each!`, 'ok');
+  for(let i=0;i<10;i++) botBuyOnCoin(coinId, perBotUsd, true);
+}
+
 function openResetConfirmModal(){
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
