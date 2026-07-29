@@ -168,8 +168,6 @@ label.flabel{font-size:12px;color:var(--txt-dim);font-weight:600;letter-spacing:
 .grad-badge.rug-badge{background:rgba(255,77,109,.16);color:var(--down);border-color:rgba(255,77,109,.4);}
 .grad-badge.guaranteed-badge{background:rgba(198,255,61,.16);color:var(--lime);border-color:rgba(198,255,61,.4);}
 .grad-badge.risky-badge{background:rgba(255,165,0,.16);color:#FFA500;border-color:rgba(255,165,0,.4);}
-.grad-badge.abyss-badge{background:rgba(139,0,0,.25);color:#FF4444;border-color:rgba(255,68,68,.5);}
-.grad-badge.singularity-badge{background:linear-gradient(90deg,rgba(139,107,255,.25),rgba(0,201,255,.25));color:#B8A8FF;border-color:rgba(139,107,255,.5);}
 .cat-blurb{font-size:12.5px;color:var(--txt-dim);margin:-6px 0 16px;line-height:1.5;}
 .coin-card-mid{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:10px;}
 .coin-price{font-family:var(--mono);font-weight:600;font-size:16px;}

@@ -384,7 +384,6 @@ onAuthStateChanged(auth, async (user)=>{
     applyBankGrowth();
     refreshNetWorthSnapshot(); // also catches Hall of Legends crossings from passive gains (bank interest, held coins appreciating) — not just right after a trade
     listenCopyOrders();
-    listenSingularityMirror();
     navigate('home');
     if(!document.hidden) startBots(); // a tab that starts already hidden shouldn't run the bot economy either — visibilitychange only fires on a transition, not the initial state
     startConsoleAutoClear();
@@ -405,19 +404,6 @@ function listenUserDoc(){
     document.getElementById('topAvatar').src = avatarFor(state.userDoc.username, state.userDoc.avatarURL);
     if(state.route.name==='profile') renderProfile();
     if(state.route.name==='portfolio') renderPortfolio();
-    const nw = state.userDoc.netWorth ?? state.userDoc.balance ?? 0;
-    const navAbyss = document.getElementById('navAbyss');
-    const abyssUnlocked = nw >= ABYSS_UNLOCK_NET_WORTH;
-    if(navAbyss) navAbyss.style.display = abyssUnlocked ? '' : 'none';
-    if(state.route.name==='abyss' && !abyssUnlocked) navigate('home'); // dropped below the threshold mid-visit
-    const navSingularity = document.getElementById('navSingularity');
-    const singularityUnlocked = nw >= SINGULARITY_UNLOCK_NET_WORTH;
-    if(navSingularity) navSingularity.style.display = singularityUnlocked ? '' : 'none';
-    if(state.route.name==='singularity' && !singularityUnlocked) navigate('home');
-    const navMystery = document.getElementById('navMystery');
-    const mysteryUnlocked = nw >= MYSTERY_UNLOCK_NET_WORTH;
-    if(navMystery) navMystery.style.display = mysteryUnlocked ? '' : 'none';
-    if(state.route.name==='mystery' && !mysteryUnlocked) navigate('home');
   });
   state.unsubs.push(un);
 }
@@ -443,9 +429,6 @@ function navigate(name, param=null){
   state.route = {name, param};
   if(name!=='coin'){ stopViewerCount(); stopHolderCount(); stopViewingMicroTick(); }
   if(name!=='home'){ if(riskyScheduleUnsub){ riskyScheduleUnsub(); riskyScheduleUnsub=null; } if(riskyCoinUnsub){ riskyCoinUnsub(); riskyCoinUnsub=null; } }
-  if(name!=='abyss') stopAbyssListener();
-  if(name!=='singularity') stopSingularityListener();
-  if(name!=='mystery') stopMysteryListener();
   if(name!=='insights'){ stopInsightsCountdown(); if(insightsUnsub){ insightsUnsub(); insightsUnsub=null; } }
   document.querySelectorAll('.nav-item,.bn-item').forEach(el=>{
     el.classList.toggle('active', el.dataset.nav===name);
@@ -454,9 +437,6 @@ function navigate(name, param=null){
   else if(name==='create') renderCreate();
   else if(name==='portfolio') renderPortfolio();
   else if(name==='bank') renderBank();
-  else if(name==='abyss') renderAbyss();
-  else if(name==='singularity') renderSingularity();
-  else if(name==='mystery') renderMystery();
   else if(name==='leaderboard') renderLeaderboard();
   else if(name==='profile') renderProfile();
   else if(name==='coin') renderCoinDetail(param);
@@ -570,7 +550,7 @@ async function instantMoonBoost(coinId){
 // executes it as one closing trade. price = solReserve/tokenReserve; buying dUSD raises
 // solReserve by dUSD and (via the k=solReserve*tokenReserve invariant) raises price to
 // (solReserve+dUSD)^2/k — so dUSD = sqrt(targetPrice*k) - solReserve solves for exactly that.
-const REALITY_WARP_UNLOCK_NET_WORTH = 1e18; // Qi — same tier as the Singularity
+const REALITY_WARP_UNLOCK_NET_WORTH = 1e18; // Qi
 const HALL_OF_LEGENDS_NET_WORTH = 1e18; // Qi — a permanent record, distinct from the live wealth-tier badge
 // A personal, scaled-down version of the admin's Right Alt pump — any Qi+ user can trigger it,
 // once per real calendar day, on any coin they choose. Reuses the same underlying mechanics
@@ -870,7 +850,7 @@ function loadHomeCoins(){
     let coins = snap.docs.map(d=>({id:d.id,...d.data()}));
     coins.forEach(c=> state.coinsCache.set(c.id,c));
     if(homeCategory==='user') coins = coins.filter(c=> !c.isBotCoin);
-    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky && !c.isAbyss && !c.isSingularity && !c.isMystery); // each has its own dedicated tab
+    if(homeCategory==='bot') coins = coins.filter(c=> !c.isRisky); // Risky has its own dedicated tab
     const term = (document.getElementById('homeSearch')?.value||'').toLowerCase();
     if(term) coins = coins.filter(c=> c.ticker.toLowerCase().includes(term) || c.name.toLowerCase().includes(term));
     if(homeSort==='gainers') coins = coins.slice().sort((a,b)=> pctChange(b.priceHistory)-pctChange(a.priceHistory));
@@ -900,117 +880,6 @@ function sparklineSvg(history, up){
 // doc directly. Reuses renderCoinGrid so the card looks and behaves identically to every other
 // coin card, just with a single-element array and its own badge (see the ⚠️ RISKY badge logic).
 let riskyScheduleUnsub = null, riskyCoinUnsub = null;
-let abyssScheduleUnsub = null, abyssCoinUnsub = null;
-function stopAbyssListener(){
-  if(abyssScheduleUnsub){ abyssScheduleUnsub(); abyssScheduleUnsub = null; }
-  if(abyssCoinUnsub){ abyssCoinUnsub(); abyssCoinUnsub = null; }
-}
-function renderAbyss(){
-  const view = document.getElementById('view');
-  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
-  if(netWorth < ABYSS_UNLOCK_NET_WORTH){
-    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div>The Abyss unlocks at ${fmtUsd(ABYSS_UNLOCK_NET_WORTH)}+ net worth. You're not there yet.</div>`;
-    return;
-  }
-  view.innerHTML = `
-    <div class="section-title">💀 The Abyss</div>
-    <div class="panel" style="margin-bottom:16px;border-color:rgba(255,68,68,.35);">
-      <div style="font-size:13px;color:#FF6B6B;font-weight:700;margin-bottom:6px;">⚠️ Read before you touch this</div>
-      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.6;">One coin. The fastest-moving, most violent market in the entire app — bigger and more frequent swings than even the Risky tab. It can never be rugged, but that's not a mercy: the odds are deliberately stacked against you. Roughly 4 in 5 people who hold this end up losing money. The upside spikes are real and sometimes huge — but the house wins on net, by design. You unlocked this by crossing $1B net worth; that's the only gate here.</div>
-    </div>
-    <div id="abyssGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>
-  `;
-  stopAbyssListener();
-  abyssScheduleUnsub = onSnapshot(doc(db,'meta','abyssCoin'), snap=>{
-    const coinId = snap.exists() ? snap.data().coinId : null;
-    if(abyssCoinUnsub){ abyssCoinUnsub(); abyssCoinUnsub = null; }
-    const grid = document.getElementById('abyssGrid');
-    if(!coinId){
-      if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">💀</div>Hasn't been spawned yet — check back shortly.</div>`;
-      return;
-    }
-    abyssCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
-      const g = document.getElementById('abyssGrid');
-      if(!g) return;
-      if(!cSnap.exists()){ g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Gone.</div>`; return; }
-      const coin = {id:cSnap.id, ...cSnap.data()};
-      state.coinsCache.set(coin.id, coin);
-      renderCoinGrid([coin]);
-    });
-  }, ()=>{ const g=document.getElementById('abyssGrid'); if(g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load it.</div>`; });
-}
-
-let singularityScheduleUnsub = null, singularityCoinUnsub = null;
-function stopSingularityListener(){
-  if(singularityScheduleUnsub){ singularityScheduleUnsub(); singularityScheduleUnsub = null; }
-  if(singularityCoinUnsub){ singularityCoinUnsub(); singularityCoinUnsub = null; }
-}
-function renderSingularity(){
-  const view = document.getElementById('view');
-  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
-  if(netWorth < SINGULARITY_UNLOCK_NET_WORTH){
-    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div>The Singularity unlocks at ${fmtUsd(SINGULARITY_UNLOCK_NET_WORTH)}+ net worth. You're not there yet.</div>`;
-    return;
-  }
-  view.innerHTML = `
-    <div class="section-title">🌀 The Singularity</div>
-    <div class="panel" style="margin-bottom:16px;border-color:rgba(139,107,255,.35);">
-      <div style="font-size:13px;color:#B8A8FF;font-weight:700;margin-bottom:6px;">This coin has no behavior of its own</div>
-      <div style="font-size:12.5px;color:var(--txt-dim);line-height:1.6;">Every other coin in this app — even the wildest ones — trades on some kind of internal logic, random or otherwise. This one doesn't. Its price only ever moves as an echo of real trades happening anywhere else in the app, right now, scaled down. No bot randomization drives it. What that means in practice: nobody can predict it, including whoever built this — it depends entirely on what real people actually do elsewhere, at this exact moment.</div>
-    </div>
-    <div id="singularityGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>
-  `;
-  stopSingularityListener();
-  singularityScheduleUnsub = onSnapshot(doc(db,'meta','singularityCoin'), snap=>{
-    const coinId = snap.exists() ? snap.data().coinId : null;
-    if(singularityCoinUnsub){ singularityCoinUnsub(); singularityCoinUnsub = null; }
-    const grid = document.getElementById('singularityGrid');
-    if(!coinId){
-      if(grid) grid.innerHTML = `<div class="empty" style="grid-column:1/-1;"><div class="em-ic">🌀</div>Hasn't been spawned yet — check back shortly.</div>`;
-      return;
-    }
-    singularityCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
-      const g = document.getElementById('singularityGrid');
-      if(!g) return;
-      if(!cSnap.exists()){ g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Gone.</div>`; return; }
-      const coin = {id:cSnap.id, ...cSnap.data()};
-      state.coinsCache.set(coin.id, coin);
-      renderCoinGrid([coin]);
-    });
-  }, ()=>{ const g=document.getElementById('singularityGrid'); if(g) g.innerHTML = `<div class="empty" style="grid-column:1/-1;">Couldn't load it.</div>`; });
-}
-
-// Deliberately no description panel, no warning, no explanation of odds — just the coin. That's
-// the entire design brief for this one.
-let mysteryScheduleUnsub = null, mysteryCoinUnsub = null;
-function stopMysteryListener(){
-  if(mysteryScheduleUnsub){ mysteryScheduleUnsub(); mysteryScheduleUnsub = null; }
-  if(mysteryCoinUnsub){ mysteryCoinUnsub(); mysteryCoinUnsub = null; }
-}
-function renderMystery(){
-  const view = document.getElementById('view');
-  const netWorth = state.userDoc?.netWorth ?? state.userDoc?.balance ?? 0;
-  if(netWorth < MYSTERY_UNLOCK_NET_WORTH){
-    view.innerHTML = `<div class="empty"><div class="em-ic">🔒</div></div>`;
-    return;
-  }
-  view.innerHTML = `<div id="mysteryGrid" class="coin-grid"><div class="spinner" style="margin-top:20px;grid-column:1/-1;"></div></div>`;
-  stopMysteryListener();
-  mysteryScheduleUnsub = onSnapshot(doc(db,'meta','mysteryCoin'), snap=>{
-    const coinId = snap.exists() ? snap.data().coinId : null;
-    if(mysteryCoinUnsub){ mysteryCoinUnsub(); mysteryCoinUnsub = null; }
-    const grid = document.getElementById('mysteryGrid');
-    if(!coinId){ if(grid) grid.innerHTML = ''; return; }
-    mysteryCoinUnsub = onSnapshot(doc(db,'coins',coinId), cSnap=>{
-      const g = document.getElementById('mysteryGrid');
-      if(!g) return;
-      if(!cSnap.exists()){ g.innerHTML = ''; return; }
-      const coin = {id:cSnap.id, ...cSnap.data()};
-      state.coinsCache.set(coin.id, coin);
-      renderCoinGrid([coin]);
-    });
-  }, ()=>{});
-}
 
 function loadRiskyCoin(){
   if(homeUnsub){ homeUnsub(); homeUnsub = null; }
@@ -1059,7 +928,7 @@ function renderCoinGrid(coins){
           <div class="coin-ticker">$${esc(c.ticker)}</div>
           <div class="coin-name">${esc(c.name)}</div>
         </div>
-        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isSingularity?'<div class="grad-badge singularity-badge">🌀 SINGULARITY</div>':(c.isAbyss?'<div class="grad-badge abyss-badge">💀 ABYSS</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))))))}
+        ${c.ruggedAt?'<div class="grad-badge rug-badge">💀 RUGGED</div>':(c.isRisky?'<div class="grad-badge risky-badge">⚠️ RISKY</div>':(c.guaranteedGrowth?'<div class="grad-badge guaranteed-badge">🚀 GUARANTEED</div>':(c.isBotCoin?'<div class="grad-badge bot-badge">🤖 BOT</div>':(mc>=GRAD_MARKET_CAP?'<div class="grad-badge">🎓 GRAD</div>':''))))}
       </div>
       ${sparklineSvg(c.priceHistory, up)}
       <div class="coin-card-mid">
@@ -1117,7 +986,7 @@ function buildCoinDetailShell(coin){
         <div class="detail-head">
           <img class="detail-logo" src="${coinLogoFor(coin.ticker,coin.imageURL)}">
           <div>
-            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isSingularity?'<span class="grad-badge singularity-badge">🌀 THE SINGULARITY</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))))}</div>
+            <div class="detail-ticker" id="detailTicker">$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}</div>
             <div class="detail-name">${coin.isBotCoin? `${esc(coin.name)} · fully automated, trades 24/7 · live for ${ageText(coin.createdAt)} · ${(coin.tradeCount||0).toLocaleString()} trades so far` : `${esc(coin.name)} · launched by @${esc(coin.creatorUsername)} · ${timeAgo(coin.createdAt)}`}</div>
           </div>
         </div>
@@ -1334,7 +1203,7 @@ function updateCoinDetailLive(coin){
   const gradFill = document.getElementById('gradFill'); if(gradFill) gradFill.style.width = gradPct+'%';
   const gradPctText = document.getElementById('gradPctText'); if(gradPctText) gradPctText.textContent = `${gradPct.toFixed(1)}% to $${(GRAD_MARKET_CAP/1000)}K`;
   const tickerEl = document.getElementById('detailTicker');
-  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isSingularity?'<span class="grad-badge singularity-badge">🌀 THE SINGULARITY</span>':(coin.isAbyss?'<span class="grad-badge abyss-badge">💀 THE ABYSS</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))))}`;
+  if(tickerEl) tickerEl.innerHTML = `$${esc(coin.ticker)} ${coin.ruggedAt?'<span class="grad-badge rug-badge">💀 RUGGED</span>':(coin.isRisky?'<span class="grad-badge risky-badge">⚠️ RISKY — replaced daily</span>':(coin.guaranteedGrowth?'<span class="grad-badge guaranteed-badge">🚀 GUARANTEED GROWTH</span>':(coin.isBotCoin?'<span class="grad-badge bot-badge">🤖 BOT MARKET</span>':(mc>=GRAD_MARKET_CAP?'<span class="grad-badge">🎓 GRADUATED</span>':''))))}`;
   const tradesEl = document.getElementById('recentTradesList');
   if(tradesEl){ tradesEl.innerHTML = recentTradesHtml((coin.recentTrades||[]).slice().reverse()); wireUserLinks(tradesEl); }
 
@@ -2142,38 +2011,6 @@ const RISKY_RUG_CHANCE = 0.035;      // ~23x the normal bot-coin rug chance — 
 const RISKY_RUG_MIN_AGE_MS = 5*60*1000; // short grace period so it can't rug the instant it's picked
 const RISKY_MEGA_CHANCE = 0.55; // 55% of trades are genuinely violent, sized off the coin's own reserve — was 0.4
 
-// The Abyss: a single permanent coin, gated behind $1B+ net worth, deliberately tuned to be the
-// single most extreme thing in the app. Distinct from Risky on purpose: Risky is unbiased chaos
-// (50/50, can get rugged entirely); the Abyss never rugs, but the odds are stacked against you —
-// it trades on a heavy, sustained sell bias, so holding it for any random stretch of time is a
-// losing bet more often than not. The occasional huge upward spike is real and can be caught, but
-// the house wins on net over time by design.
-const ABYSS_UNLOCK_NET_WORTH = 1e9;
-const ABYSS_TICK_MS = 3500;          // walked back from 900ms — that rate, multiplied across every open tab, was directly causing real slowness and load failures across the whole app. Still much faster than Risky's 9000ms.
-const ABYSS_TRADE_CHANCE = 0.98;
-const ABYSS_SELL_BIAS = 0.68;        // ~68% of trades lean sell — this sustained drift is what actually produces "80% chance of losing"
-const ABYSS_MEGA_CHANCE = 0.6;
-const ABYSS_MIN_SWING = 1500;
-const ABYSS_MAX_SWING = 20000;
-
-// The Singularity: unlike every other bot-driven coin (which trades on its own internal random
-// logic), this one has no independent behavior of its own at all — its price only ever moves as
-// an echo of REAL trades happening anywhere else in the app, scaled down. Genuinely emergent:
-// nobody, including the person who built this, can predict its path in advance, since it depends
-// entirely on what real people actually do elsewhere.
-const SINGULARITY_UNLOCK_NET_WORTH = 1e18; // Qi
-const SINGULARITY_MIRROR_CHANCE = 0.4;     // not every real trade gets echoed — keeps write volume sane
-const SINGULARITY_MIRROR_FRAC_MIN = 0.05, SINGULARITY_MIRROR_FRAC_MAX = 0.2;
-
-// The unnamed one: unlocked one tier above the Singularity, with zero in-app explanation of odds
-// or mechanics by design — no warning panel, no description, just the coin. Structurally
-// unpredictable rather than just big: each tick randomly picks a completely different behavior
-// mode from the ones already built elsewhere in this file, so there's no single pattern to learn.
-const MYSTERY_UNLOCK_NET_WORTH = 1e21; // Sx
-const MYSTERY_TICK_MS = 3500;
-const SINGULARITY_TICK_MS = 2000; // walked back from 450ms — same reasoning as the Abyss above
-let abyssIntervalId = null, singularityIntervalId = null;
-
 const BOT_COIN_ADJ = ['Turbo','Quantum','Galactic','Feral','Based','Chunky','Radioactive','Crimson','Velvet','Salty','Cosmic','Rusty','Electric','Ancient','Sneaky','Wobbly','Frozen','Spicy','Glitchy','Lucky','Rabid','Molten','Cursed','Giga'];
 const BOT_COIN_NOUN = ['Frog','Kebab','Yeti','Sock','Wizard','Hamster','Toaster','Falcon','Pickle','Ninja','Goblin','Turtle','Rocket','Panda','Wolf','Potato','Dragon','Otter','Cactus','Robot','Gremlin','Waffle','Moose','Shrimp'];
 
@@ -2282,7 +2119,7 @@ async function makeUniqueBotTicker(){
   return null; // give up quietly this round — next spawn check will try again
 }
 
-async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRisky=false, isAbyss=false){
+async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRisky=false){
   try{
     const picked = preset || await makeUniqueBotTicker();
     if(!picked) return;
@@ -2312,8 +2149,6 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRi
         ? "Fully automated market. Quietly seeded ahead of time — no rug risk, built to hold up for the long haul."
         : isRisky
         ? "Today's risky pick. No bias, no guarantees — could double, could get rugged. Extremely unpredictable on purpose."
-        : isAbyss
-        ? "The single most extreme market here. Never gets rugged — the odds are just stacked against you. Moves faster than anything else in the app."
         : 'Fully automated market — no creator, no roadmap, just a chaotic 24/7 chart. Real trades are still real, only the counterparty is a bot.',
       imageURL:'', creatorUid:'bot', creatorUsername:'BotNet', isBotCoin:true, totalSupply,
       solReserve, tokenReserve,
@@ -2327,7 +2162,6 @@ async function spawnBotCoin(forceSpawn=false, preset=null, isInsider=false, isRi
       ...(forceSpawn ? { guaranteedHolderRampStart: Date.now() } : {}),
       ...(isInsider ? { isInsider: true } : {}),
       ...(isRisky ? { isRisky: true } : {}),
-      ...(isAbyss ? { isAbyss: true } : {}),
       createdAt: serverTimestamp(), lastTickAt: Date.now()
     };
     await setDoc(coinRef, coinData);
@@ -2444,171 +2278,6 @@ async function checkRiskySchedule(){
     const newCoin = await spawnBotCoin(false, picked, false, true);
     if(newCoin) await setDoc(ref, { dayKey: today, coinId: newCoin.id });
   }catch(err){ /* ignore — e.g. a rare ticker/scheduling race, next check will just retry */ }
-}
-
-// Unlike Risky (replaced daily), the Abyss is a single PERMANENT coin — spawned exactly once,
-// ever, the first time any tab checks and finds meta/abyssCoin empty. Same once-a-minute
-// throttle as the other scheduling checks.
-let abyssCheckCounter = 0;
-async function checkAbyssSchedule(){
-  abyssCheckCounter++;
-  if(abyssCheckCounter!==1 && abyssCheckCounter%4!==0) return;
-  try{
-    const ref = doc(db,'meta','abyssCoin');
-    const snap = await getDoc(ref);
-    if(snap.exists() && snap.data().coinId) return; // already spawned, permanently — nothing to do, ever again
-    const picked = await makeUniqueBotTicker();
-    if(!picked) return;
-    const newCoin = await spawnBotCoin(false, picked, false, false, true);
-    if(newCoin) await setDoc(ref, { coinId: newCoin.id });
-  }catch(err){ /* ignore — e.g. a rare ticker/scheduling race, next check will just retry */ }
-}
-
-async function abyssCoinTick(){
-  try{
-    const snap = await getDoc(doc(db,'meta','abyssCoin'));
-    if(!snap.exists() || !snap.data().coinId) return;
-    const coinId = snap.data().coinId;
-    if(coinsWithPendingUserTrade.has(coinId)) return;
-    const coinSnap = await getDoc(doc(db,'coins',coinId));
-    if(!coinSnap.exists()) return;
-    const coin = coinSnap.data();
-    if(Math.random() >= ABYSS_TRADE_CHANCE) return;
-    // Same "mega" idea as Risky — sizing relative to the coin's own current reserve guarantees a
-    // genuinely violent move regardless of depth — but skewed hard toward sells, which is what
-    // actually produces the sustained losing odds rather than just occasional big dumps.
-    const isMega = Math.random() < ABYSS_MEGA_CHANCE;
-    const usd = isMega
-      ? coin.solReserve * (0.7+Math.random()*1.8) // 70%-250% of current liquidity — even more violent than Risky's mega mode
-      : ABYSS_MIN_SWING + Math.random()*(ABYSS_MAX_SWING-ABYSS_MIN_SWING);
-    const isSell = Math.random() < ABYSS_SELL_BIAS;
-    if(coinsWithPendingUserTrade.has(coinId)) return; // re-check right before firing — no stagger delay at this tick rate, it would eat into the per-second guarantee
-    if(!isSell) botBuyOnCoin(coinId, usd, true);
-    else botSellOnCoin(coinId, usd, true, isMega?0.5:0.05); // mega sells relax the normal 5% cap, same idea as Risky
-  }catch(err){ /* non-critical */ }
-}
-
-/* ===================== THE SINGULARITY (emergent, driven by real activity elsewhere) ===================== */
-let singularityCheckCounter = 0;
-async function checkSingularitySchedule(){
-  singularityCheckCounter++;
-  if(singularityCheckCounter!==1 && singularityCheckCounter%4!==0) return;
-  try{
-    const ref = doc(db,'meta','singularityCoin');
-    const snap = await getDoc(ref);
-    if(snap.exists() && snap.data().coinId) return; // spawned once, permanently, same as the Abyss
-    const picked = await makeUniqueBotTicker();
-    if(!picked) return;
-    const newCoin = await spawnBotCoin(false, picked, false, false, false);
-    if(newCoin){
-      await setDoc(ref, { coinId: newCoin.id });
-      await updateDoc(doc(db,'coins',newCoin.id), { isSingularity: true });
-    }
-  }catch(err){ /* ignore — next check retries */ }
-}
-// Watches the global activity feed for REAL trades (bots are always tagged uid:'bot' and never
-// match) happening on any OTHER coin, and echoes a scaled-down version onto the Singularity.
-// This is its entire behavior — it has no independent randomization of its own at all, which is
-// what makes it genuinely emergent rather than just another flavor of randomized volatility.
-let singularityListenerReady = false;
-function listenSingularityMirror(){
-  singularityListenerReady = false;
-  const q = query(collection(db,'activity'), orderBy('createdAt','desc'), limit(20));
-  const un = onSnapshot(q, snap=>{
-    if(!singularityListenerReady){ singularityListenerReady = true; return; } // skip the initial existing batch
-    snap.docChanges().forEach(change=>{
-      if(change.type!=='added') return;
-      const t = change.doc.data();
-      if(t.uid==='bot') return; // only real trades feed it — that's the whole point
-      if(t.type!=='buy' && t.type!=='sell') return; // skip giveaway-type entries etc
-      mirrorToSingularity(t);
-    });
-  }, ()=>{ /* silent — non-critical */ });
-  state.unsubs.push(un);
-}
-let lastSingularityActivityAt = 0;
-async function mirrorToSingularity(t){
-  if(Math.random() >= SINGULARITY_MIRROR_CHANCE) return; // not every real trade gets echoed
-  try{
-    const schedSnap = await getDoc(doc(db,'meta','singularityCoin'));
-    if(!schedSnap.exists() || !schedSnap.data().coinId) return;
-    const coinId = schedSnap.data().coinId;
-    if(t.coinId===coinId) return; // don't mirror trades on the Singularity itself — avoids a feedback loop
-    if(coinsWithPendingUserTrade.has(coinId)) return;
-    const frac = SINGULARITY_MIRROR_FRAC_MIN + Math.random()*(SINGULARITY_MIRROR_FRAC_MAX-SINGULARITY_MIRROR_FRAC_MIN);
-    const usd = Math.max(10, (t.usdAmount||0)*frac);
-    lastSingularityActivityAt = Date.now();
-    if(t.type==='buy') botBuyOnCoin(coinId, usd, usd>800);
-    else botSellOnCoin(coinId, usd, usd>800);
-  }catch(err){ /* non-critical */ }
-}
-// A small friends app realistically won't produce two real trades every second for the mirror
-// mechanism above to echo — so on its own, "at least twice a second" isn't achievable purely
-// from real activity without abandoning the Singularity's whole premise. This is the honest
-// compromise: real mirrored trades still drive the bulk of its behavior and direction whenever
-// they're actually happening (this baseline stays silent for a beat after any real mirror
-// fires); a small, low-key filler trade only kicks in when real activity has gone quiet for a
-// moment, purely to sustain the requested pace rather than to add its own opinion about
-// direction — it's a 50/50 coin-flip, not biased either way.
-async function singularityBaselineTick(){
-  try{
-    if(Date.now()-lastSingularityActivityAt < 400) return; // recent real-mirror activity already covered this window
-    const schedSnap = await getDoc(doc(db,'meta','singularityCoin'));
-    if(!schedSnap.exists() || !schedSnap.data().coinId) return;
-    const coinId = schedSnap.data().coinId;
-    if(coinsWithPendingUserTrade.has(coinId)) return;
-    const usd = 20+Math.random()*200; // small and low-key — real mirrored trades are still what actually drives it
-    if(Math.random()<0.5) botBuyOnCoin(coinId, usd, false);
-    else botSellOnCoin(coinId, usd, false);
-  }catch(err){ /* non-critical */ }
-}
-
-/* ===================== THE UNNAMED ONE (deliberately unexplained) ===================== */
-let mysteryCheckCounter = 0;
-async function checkMysterySchedule(){
-  mysteryCheckCounter++;
-  if(mysteryCheckCounter!==1 && mysteryCheckCounter%4!==0) return;
-  try{
-    const ref = doc(db,'meta','mysteryCoin');
-    const snap = await getDoc(ref);
-    if(snap.exists() && snap.data().coinId) return;
-    const picked = await makeUniqueBotTicker();
-    if(!picked) return;
-    const newCoin = await spawnBotCoin(false, picked, false, false, false);
-    if(newCoin){
-      await setDoc(ref, { coinId: newCoin.id });
-      await updateDoc(doc(db,'coins',newCoin.id), { isMystery: true });
-    }
-  }catch(err){ /* ignore — next check retries */ }
-}
-// Each tick randomly picks a completely different behavior mode already built elsewhere in this
-// file — sometimes it acts rug-recovery-slow, sometimes Abyss-style sell-biased, sometimes
-// Risky-style unbiased chaos, sometimes guaranteed-growth-style bullish. No single pattern to
-// learn by watching it, which is deliberately the entire point.
-async function mysteryCoinTick(){
-  try{
-    const snap = await getDoc(doc(db,'meta','mysteryCoin'));
-    if(!snap.exists() || !snap.data().coinId) return;
-    const coinId = snap.data().coinId;
-    if(coinsWithPendingUserTrade.has(coinId)) return;
-    const coinSnap = await getDoc(doc(db,'coins',coinId));
-    if(!coinSnap.exists()) return;
-    const coin = coinSnap.data();
-    if(Math.random() >= 0.95) return;
-    const mode = Math.floor(Math.random()*4);
-    const isMega = Math.random() < 0.5;
-    const usd = isMega ? coin.solReserve*(0.5+Math.random()*2) : (500+Math.random()*10000);
-    let buyChance;
-    if(mode===0) buyChance = 0.5;        // unbiased chaos
-    else if(mode===1) buyChance = 0.25;  // heavy sell lean
-    else if(mode===2) buyChance = 0.9;   // heavy buy lean
-    else buyChance = Math.random();      // fully random each tick — no lean at all
-    setTimeout(()=>{
-      if(coinsWithPendingUserTrade.has(coinId)) return;
-      if(Math.random()<buyChance) botBuyOnCoin(coinId, usd, true);
-      else botSellOnCoin(coinId, usd, true, isMega?0.45:0.05);
-    }, Math.random()*2500);
-  }catch(err){ /* non-critical */ }
 }
 
 
@@ -2772,9 +2441,6 @@ async function botCoinTick(){
       if(coinsWithPendingUserTrade.has(d.id)) return; // don't fight a real trade in flight
       const coin = d.data();
       if(coin.isRisky) return; // handled entirely by its own dedicated riskyCoinTick loop instead
-      if(coin.isAbyss) return; // handled entirely by its own dedicated abyssCoinTick loop instead
-      if(coin.isSingularity) return; // has no independent tick at all — only ever moves via listenSingularityMirror()
-      if(coin.isMystery) return; // handled entirely by its own dedicated mysteryCoinTick loop instead
       const hot = isCoinHot(coin);
       const hotStagger = (ms)=> hot ? ms*0.35 : ms; // hot coins fire sooner, not just more often
       if(coin.guaranteedGrowth){
@@ -2847,9 +2513,6 @@ async function botCoinTick(){
   maybeSpawnBotCoin();
   checkInsiderSchedule();
   checkRiskySchedule();
-  checkAbyssSchedule();
-  checkSingularitySchedule();
-  checkMysterySchedule();
 }
 
 async function ruggedCoinEvent(coinId){
@@ -2954,25 +2617,12 @@ function startBots(){
   setTimeout(botTick, 3000);       // one early tick shortly after load
   setTimeout(botCoinTick, 4500);
   setTimeout(riskyCoinTick, 6000);
-  setTimeout(mysteryCoinTick, 8000);
   scheduleNext(botTick, BOT_TICK_MS);
   scheduleNext(botCoinTick, BOT_TICK_MS);
   scheduleNext(riskyCoinTick, RISKY_TICK_MS);
-  scheduleNext(mysteryCoinTick, MYSTERY_TICK_MS);
-  // Abyss and the Singularity run on plain setInterval instead of scheduleNext's jitter — that
-  // jitter (base ± 3000ms) is fine at tick rates measured in seconds-to-minutes, but at
-  // sub-second timescales it could delay an individual tick by several seconds or even land
-  // negative, which would break the "at least once a second" / "at least twice a second"
-  // guarantees these two specifically need. Precise fixed intervals instead.
-  if(abyssIntervalId) clearInterval(abyssIntervalId);
-  if(singularityIntervalId) clearInterval(singularityIntervalId);
-  abyssIntervalId = setInterval(()=>{ if(botRunning) abyssCoinTick(); }, ABYSS_TICK_MS);
-  singularityIntervalId = setInterval(()=>{ if(botRunning) singularityBaselineTick(); }, SINGULARITY_TICK_MS);
 }
 function stopBots(){
   botRunning = false;
-  if(abyssIntervalId){ clearInterval(abyssIntervalId); abyssIntervalId = null; }
-  if(singularityIntervalId){ clearInterval(singularityIntervalId); singularityIntervalId = null; }
 }
 
 // The entire ambient bot economy — every tick loop in this file — only actually does anything
