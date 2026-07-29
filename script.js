@@ -121,11 +121,23 @@ function clearUnsubs(){ state.unsubs.forEach(u=>u()); state.unsubs = []; }
 // Shared by fmtUsd and fmtTok — extended well past the old M/B cap since compounding growth
 // mechanics (guaranteed-growth, pump, bank interest, etc.) can realistically put some numbers
 // in this app into the billions and beyond. Ordered largest-first so the first match wins.
-const NUM_TIERS = [
-  { v: 1e33, s: 'Dc' }, { v: 1e30, s: 'No' }, { v: 1e27, s: 'Oc' }, { v: 1e24, s: 'Sp' },
-  { v: 1e21, s: 'Sx' }, { v: 1e18, s: 'Qi' }, { v: 1e15, s: 'Qa' }, { v: 1e12, s: 'T' },
-  { v: 1e9,  s: 'B'  }, { v: 1e6,  s: 'M'  }, { v: 1e3,  s: 'K'  }
-];
+// Named tiers up through decillion (1e33), same as before. Beyond that we programmatically
+// generate 'e36', 'e39', 'e42' ... tiers every 3 orders of magnitude, all the way out to 1e306 —
+// that's 90+ additional tiers on top of the 11 named ones below (100+ total), which covers
+// every value a JS double can represent (doubles top out around 1.8e308, so 1e306 is as far as
+// it's meaningful to go — anything past that isn't a "bigger number", it's just Infinity).
+// Named tiers were kept short/pronounceable (Dc, No, Oc...); past that, plain scientific-notation
+// suffixes are clearer than inventing more made-up abbreviations for numbers nobody will recite.
+const NUM_TIERS = (function(){
+  const named = [
+    { v: 1e33, s: 'Dc' }, { v: 1e30, s: 'No' }, { v: 1e27, s: 'Oc' }, { v: 1e24, s: 'Sp' },
+    { v: 1e21, s: 'Sx' }, { v: 1e18, s: 'Qi' }, { v: 1e15, s: 'Qa' }, { v: 1e12, s: 'T' },
+    { v: 1e9,  s: 'B'  }, { v: 1e6,  s: 'M'  }, { v: 1e3,  s: 'K'  }
+  ];
+  const extended = [];
+  for(let exp=306; exp>=36; exp-=3) extended.push({ v: Number('1e'+exp), s: 'e'+exp });
+  return extended.concat(named); // largest-first so the first match in fmtUsd/fmtTok wins
+})();
 // Wealth-tier badges — same magnitude ladder as NUM_TIERS, starting at $1M (below that just isn't
 // interesting enough to badge). Shown next to a username wherever one appears: leaderboard,
 // activity feed, and both profile pages.
@@ -2973,6 +2985,16 @@ async function toggleBotNotifications(){
   try{ await updateDoc(doc(db,'users',state.uid), { 'notifPrefs.botNotifications': !current }); }
   catch(err){ toast("Couldn't update: "+err.message, 'err'); }
 }
+// Full-screen "billionaire explosion" overlay — default is ON (matches existing behavior)
+// unless the user has explicitly turned it off.
+function billionaireAlertsEnabled(){
+  return state.userDoc?.notifPrefs?.billionaireAlerts !== false;
+}
+async function toggleBillionaireAlerts(){
+  const current = billionaireAlertsEnabled();
+  try{ await updateDoc(doc(db,'users',state.uid), { 'notifPrefs.billionaireAlerts': !current }); }
+  catch(err){ toast("Couldn't update: "+err.message, 'err'); }
+}
 
 function listenWhaleAlerts(){
   whaleAlertsReady = false;
@@ -2983,9 +3005,10 @@ function listenWhaleAlerts(){
       if(change.type!=='added') return;
       const t = change.doc.data();
       // Billionaire+ trades get a full-screen moment for everyone, real money moving at that
-      // scale — always shown regardless of the bot-notifications setting (that toggle is
-      // specifically for ambient bot noise; this is real trades from real people).
-      if((t.type==='buy'||t.type==='sell') && t.netWorth>=1e9) showBillionaireExplosion(t);
+      // scale — shown regardless of the bot-notifications setting (that toggle is specifically
+      // for ambient bot noise; this is real trades from real people), but suppressible on its
+      // own via billionaireAlertsEnabled() for anyone who just doesn't want the screen takeover.
+      if((t.type==='buy'||t.type==='sell') && t.netWorth>=1e9 && billionaireAlertsEnabled()) showBillionaireExplosion(t);
       if(!(t.usdAmount>=WHALE_THRESHOLD)) return;
       if(t.uid==='bot' && !botNotificationsEnabled()) return; // ambient bot noise, suppressible — real user whale alerts are unaffected
       const verb = t.type==='buy' ? 'dropped' : 'pulled';
@@ -4229,6 +4252,7 @@ function renderProfile(){
       <div class="settings-row"><span>Avatar image URL</span><button class="btn btn-ghost" id="changeAvatarBtn">Edit</button></div>
       <div class="settings-row"><span>Bio</span><button class="btn btn-ghost" id="editBioBtn">Edit</button></div>
       <div class="settings-row"><span>🔔 Bot notifications</span><button class="btn ${botNotificationsEnabled()?'btn-lime':'btn-ghost'}" id="botNotifToggleBtn">${botNotificationsEnabled()?'On':'Off'}</button></div>
+      <div class="settings-row"><span>💰 Billionaire full-screen alerts</span><button class="btn ${billionaireAlertsEnabled()?'btn-lime':'btn-ghost'}" id="billionaireAlertToggleBtn">${billionaireAlertsEnabled()?'On':'Off'}</button></div>
       <div class="settings-row"><span>Overall account balance</span><b class="mono">${fmtUsd(u.netWorth ?? u.balance)}</b></div>
       <div class="settings-row"><span>Cash</span><b class="mono">${fmtUsd(u.balance)}</b></div>
       <div class="settings-row"><span>Bank</span><b class="mono">${fmtUsd(u.bank?.balance||0)}</b></div>
@@ -4346,6 +4370,7 @@ function renderProfile(){
   document.getElementById('logoutBtn').addEventListener('click', ()=> signOut(auth));
   document.getElementById('editBioBtn').addEventListener('click', ()=> openBioModal());
   document.getElementById('botNotifToggleBtn').addEventListener('click', ()=> toggleBotNotifications().then(()=> renderProfile()));
+  document.getElementById('billionaireAlertToggleBtn').addEventListener('click', ()=> toggleBillionaireAlerts().then(()=> renderProfile()));
   document.getElementById('saveBuyDefaultsBtn').addEventListener('click', ()=>{
     updateBuyDefaults(
       parseFloat(document.getElementById('buyDefault1').value),
