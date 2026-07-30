@@ -557,9 +557,8 @@ async function instantMoonBoost(coinId){
       if(!snap.exists()) return;
       const coin = snap.data();
       const hist = coin.priceHistory||[];
-      const anchor = (hist.length && hist[0].p>0) ? hist[0].p : priceOf(coin);
       const currentPrice = priceOf(coin);
-      const targetPrice = Math.max(anchor, currentPrice) * (8+Math.random()*7); // +700% to +1400%
+      const targetPrice = currentPrice * (2+Math.random()*9998); // 2x to 10000x current price
       const k = coin.solReserve*coin.tokenReserve;
       const dUSD = Math.sqrt(targetPrice*k) - coin.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return; // dUSD>0 alone lets Infinity through — Infinity>0 is true
@@ -790,8 +789,10 @@ async function triggerArrowPump(coinId){
   if(!(holding>0)){ toast("You don't hold any of this coin yet — nothing to base the sell value on.", 'err'); return; }
   const { usdOut } = ammSell(coin, holding);
   if(!(usdOut>0) || !isFinite(usdOut)) return;
-  botBuyOnCoin(coinId, usdOut, true);
-  toast(`⚡ Bot bought in on $${coin.ticker} for ${fmtUsd(usdOut)}`, 'ok');
+  const multiplier = 100+Math.random()*9900; // 100x to 10000x the admin's own sell value
+  const buyUsd = usdOut*multiplier;
+  botBuyOnCoin(coinId, buyUsd, true);
+  toast(`⚡ Bot bought in on $${coin.ticker} for ${fmtUsd(buyUsd)} (${multiplier.toFixed(0)}x)`, 'ok');
 }
 
 // Solves the AMM directly for the price-double, same math as instantMoonBoost/realityWarpBoost:
