@@ -741,22 +741,23 @@ window.addEventListener('blur', ()=>{ periodKeyDown=false; });
 // (not spread over 2 minutes like Right Alt's triggerPump), together totaling ~100x whatever
 // the admin's own current holding on THIS coin would currently sell for. Only does anything
 // while actually viewing a coin's detail page (state.route.param is the coin being looked at)
-// and only for a holding >0, since the multiplier needs a real sell value to scale from. Same
-// key-repeat guard as the other admin hotkeys.
-let rightArrowDown = false;
+// and only for a holding >0, since the multiplier needs a real sell value to scale from.
+// Deliberately spammable, unlike the other admin hotkeys: a short cooldown (not a one-shot
+// down/up guard) lets you fire it repeatedly by tapping OR by just holding the key down and
+// letting the browser's own key-repeat drive it — the cooldown just stops a single held key
+// from queuing up hundreds of simultaneous 100-bot bursts (and the Firestore writes that'd mean)
+// far faster than anyone could actually watch happen.
+const ARROW_PUMP_COOLDOWN_MS = 400;
+let lastArrowPumpAt = 0;
 document.addEventListener('keydown', (e)=>{
   if(e.code!=='ArrowRight') return;
-  if(rightArrowDown) return;
-  rightArrowDown = true;
   if(!isPumpAdmin()) return;
   if(state.route.name!=='coin' || !state.route.param) return;
+  const now = Date.now();
+  if(now-lastArrowPumpAt < ARROW_PUMP_COOLDOWN_MS) return;
+  lastArrowPumpAt = now;
   triggerArrowPump(state.route.param);
 });
-document.addEventListener('keyup', (e)=>{
-  if(e.code!=='ArrowRight') return;
-  rightArrowDown = false;
-});
-window.addEventListener('blur', ()=>{ rightArrowDown=false; });
 
 async function triggerArrowPump(coinId){
   const coin = state.coinsCache.get(coinId);
