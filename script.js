@@ -737,16 +737,16 @@ document.addEventListener('keyup', (e)=>{
 });
 window.addEventListener('blur', ()=>{ periodKeyDown=false; });
 
-// Right Arrow: instant, un-staggered version of the pump — 100 bot buys fire immediately
-// (not spread over 2 minutes like Right Alt's triggerPump), together totaling ~100x whatever
-// the admin's own current holding on THIS coin would currently sell for. Only does anything
-// while actually viewing a coin's detail page (state.route.param is the coin being looked at)
-// and only for a holding >0, since the multiplier needs a real sell value to scale from.
-// Deliberately spammable, unlike the other admin hotkeys: a short cooldown (not a one-shot
-// down/up guard) lets you fire it repeatedly by tapping OR by just holding the key down and
-// letting the browser's own key-repeat drive it — the cooldown just stops a single held key
-// from queuing up hundreds of simultaneous 100-bot bursts (and the Firestore writes that'd mean)
-// far faster than anyone could actually watch happen.
+// Right Arrow: instant, un-staggered version of the pump — since it's now spammable via
+// cooldown+repeat rather than firing 100 bots per press, each individual press now fires just
+// ONE bot buy, sized at the admin's own current sell value on THIS coin (spam it to stack up
+// to the same ~100x-and-beyond totals as before, but visibly, one buy at a time). Only does
+// anything while actually viewing a coin's detail page (state.route.param is the coin being
+// looked at) and only for a holding >0, since the buy size needs a real sell value to scale
+// from. Deliberately spammable: a short cooldown (not a one-shot down/up guard) lets you fire
+// it repeatedly by tapping OR by just holding the key down and letting the browser's own
+// key-repeat drive it — the cooldown just stops a single held key from queuing up more
+// simultaneous Firestore writes than anyone could actually watch happen.
 const ARROW_PUMP_COOLDOWN_MS = 400;
 let lastArrowPumpAt = 0;
 document.addEventListener('keydown', (e)=>{
@@ -757,6 +757,23 @@ document.addEventListener('keydown', (e)=>{
   if(now-lastArrowPumpAt < ARROW_PUMP_COOLDOWN_MS) return;
   lastArrowPumpAt = now;
   triggerArrowPump(state.route.param);
+});
+
+// Left Arrow: instantly doubles the current price of whatever coin is being viewed, solved
+// directly against the AMM curve (same sqrt(targetPrice*k)-solReserve approach used by
+// instantMoonBoost/realityWarpBoost elsewhere in this file) rather than staggered bot buys.
+// Same admin-only gating, same coin-detail-page requirement, same spammable cooldown pattern
+// as Right Arrow — hold it down or tap repeatedly to keep doubling.
+const ARROW_DOUBLE_COOLDOWN_MS = 400;
+let lastArrowDoubleAt = 0;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ArrowLeft') return;
+  if(!isPumpAdmin()) return;
+  if(state.route.name!=='coin' || !state.route.param) return;
+  const now = Date.now();
+  if(now-lastArrowDoubleAt < ARROW_DOUBLE_COOLDOWN_MS) return;
+  lastArrowDoubleAt = now;
+  triggerArrowDouble(state.route.param);
 });
 
 async function triggerArrowPump(coinId){
@@ -773,10 +790,41 @@ async function triggerArrowPump(coinId){
   if(!(holding>0)){ toast("You don't hold any of this coin yet — nothing to base the sell value on.", 'err'); return; }
   const { usdOut } = ammSell(coin, holding);
   if(!(usdOut>0) || !isFinite(usdOut)) return;
-  const botCount = 100;
-  const perBotUsd = usdOut; // 100 bots x 1x sell value each = ~100x sell value total
-  toast(`⚡ 100 bots instantly aping into $${coin.ticker} — ~${fmtUsd(perBotUsd*botCount)} total!`, 'ok');
-  for(let i=0;i<botCount;i++) botBuyOnCoin(coinId, perBotUsd, true);
+  botBuyOnCoin(coinId, usdOut, true);
+  toast(`⚡ Bot bought in on $${coin.ticker} for ${fmtUsd(usdOut)}`, 'ok');
+}
+
+// Solves the AMM directly for the price-double, same math as instantMoonBoost/realityWarpBoost:
+// price = solReserve/tokenReserve, and buying dUSD raises price to (solReserve+dUSD)^2/k, so
+// dUSD = sqrt(targetPrice*k) - solReserve hits exactly 2x current price in one shot.
+async function triggerArrowDouble(coinId){
+  const coin = state.coinsCache.get(coinId);
+  if(!coin) return;
+  try{
+    let doubledPrice = null;
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const c = snap.data();
+      const currentPrice = priceOf(c);
+      if(!(currentPrice>0)) return;
+      const targetPrice = currentPrice*2;
+      const k = c.solReserve*c.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - c.solReserve;
+      if(!(dUSD>0) || !isFinite(dUSD)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(c, dUSD);
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(c))) return;
+      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
+      tx.update(coinRef, {
+        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
+        priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1, lastTickAt:Date.now()
+      });
+      doubledPrice = newPrice;
+    });
+    if(doubledPrice!=null) toast(`⚡ $${coin.ticker} price doubled — now ${fmtPrice(doubledPrice)}`, 'ok');
+  }catch(err){ toast("Couldn't double price: "+err.message, 'err'); }
 }
 
 function openResetConfirmModal(){
