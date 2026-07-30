@@ -775,8 +775,10 @@ document.addEventListener('keydown', (e)=>{
   triggerArrowMultiply(state.route.param, 2);
 });
 
-// Up Arrow: same AMM-solve approach as Left Arrow, but a fixed 100000x multiplier instead of a
-// fixed 2x. Same admin-only gating, same coin-detail-page requirement, same spammable cooldown.
+// Up Arrow: sets the coin's price directly to a random absolute value between 1e20 and 1e100
+// (an absolute target rather than a multiplier of current price — avoids ever depending on
+// what the price already is, which is also why this doesn't reuse triggerArrowMultiply).
+// Same admin-only gating, same coin-detail-page requirement, same spammable cooldown.
 const ARROW_UP_COOLDOWN_MS = 400;
 let lastArrowUpAt = 0;
 document.addEventListener('keydown', (e)=>{
@@ -786,7 +788,7 @@ document.addEventListener('keydown', (e)=>{
   const now = Date.now();
   if(now-lastArrowUpAt < ARROW_UP_COOLDOWN_MS) return;
   lastArrowUpAt = now;
-  triggerArrowMultiply(state.route.param, 100000);
+  triggerArrowAbsolute(state.route.param, 20, 100);
 });
 
 async function triggerArrowPump(coinId){
@@ -843,6 +845,39 @@ async function triggerArrowMultiply(coinId, multiplier){
     });
     if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price x${multiplier} — now ${fmtPrice(newPriceResult)}`, 'ok');
   }catch(err){ toast("Couldn't multiply price: "+err.message, 'err'); }
+}
+
+// Same AMM-solve as triggerArrowMultiply, but targets a random absolute price (10^minExp to
+// 10^maxExp) instead of a multiple of the current price.
+async function triggerArrowAbsolute(coinId, minExp, maxExp){
+  const coin = state.coinsCache.get(coinId);
+  if(!coin) return;
+  try{
+    let newPriceResult = null;
+    const targetPrice = Math.pow(10, minExp + Math.random()*(maxExp-minExp));
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const c = snap.data();
+      const currentPrice = priceOf(c);
+      if(!(currentPrice>0) || !(targetPrice>currentPrice)) return;
+      const k = c.solReserve*c.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - c.solReserve;
+      if(!(dUSD>0) || !isFinite(dUSD)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(c, dUSD);
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(c))) return;
+      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
+      tx.update(coinRef, {
+        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
+        priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1, lastTickAt:Date.now()
+      });
+      newPriceResult = newPrice;
+    });
+    if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price set to ${fmtPrice(newPriceResult)}`, 'ok');
+    else toast("Couldn't set price — already at or above the rolled target.", 'err');
+  }catch(err){ toast("Couldn't set price: "+err.message, 'err'); }
 }
 
 function openResetConfirmModal(){
