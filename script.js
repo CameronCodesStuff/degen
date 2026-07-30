@@ -772,10 +772,22 @@ document.addEventListener('keydown', (e)=>{
   const now = Date.now();
   if(now-lastArrowDoubleAt < ARROW_DOUBLE_COOLDOWN_MS) return;
   lastArrowDoubleAt = now;
-  triggerArrowDouble(state.route.param);
+  triggerArrowMultiply(state.route.param, 2);
 });
 
-async function triggerArrowPump(coinId){
+// Up Arrow: same AMM-solve approach as Left Arrow, but a fixed 100000x multiplier instead of a
+// fixed 2x. Same admin-only gating, same coin-detail-page requirement, same spammable cooldown.
+const ARROW_UP_COOLDOWN_MS = 400;
+let lastArrowUpAt = 0;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ArrowUp') return;
+  if(!isPumpAdmin()) return;
+  if(state.route.name!=='coin' || !state.route.param) return;
+  const now = Date.now();
+  if(now-lastArrowUpAt < ARROW_UP_COOLDOWN_MS) return;
+  lastArrowUpAt = now;
+  triggerArrowMultiply(state.route.param, 100000);
+});
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
   // Fetch the holding directly rather than trusting state.myHolding — that field is only ever
@@ -798,11 +810,14 @@ async function triggerArrowPump(coinId){
 // Solves the AMM directly for the price-double, same math as instantMoonBoost/realityWarpBoost:
 // price = solReserve/tokenReserve, and buying dUSD raises price to (solReserve+dUSD)^2/k, so
 // dUSD = sqrt(targetPrice*k) - solReserve hits exactly 2x current price in one shot.
-async function triggerArrowDouble(coinId){
+// Solves the AMM directly for the target multiplier, same math as instantMoonBoost/realityWarpBoost:
+// price = solReserve/tokenReserve, and buying dUSD raises price to (solReserve+dUSD)^2/k, so
+// dUSD = sqrt(targetPrice*k) - solReserve hits exactly `multiplier`x current price in one shot.
+async function triggerArrowMultiply(coinId, multiplier){
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
   try{
-    let doubledPrice = null;
+    let newPriceResult = null;
     await runTransaction(db, async (tx)=>{
       const coinRef = doc(db,'coins',coinId);
       const snap = await tx.get(coinRef);
@@ -810,7 +825,7 @@ async function triggerArrowDouble(coinId){
       const c = snap.data();
       const currentPrice = priceOf(c);
       if(!(currentPrice>0)) return;
-      const targetPrice = currentPrice*2;
+      const targetPrice = currentPrice*multiplier;
       const k = c.solReserve*c.tokenReserve;
       const dUSD = Math.sqrt(targetPrice*k) - c.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return;
@@ -822,10 +837,10 @@ async function triggerArrowDouble(coinId){
         solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
         priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1, lastTickAt:Date.now()
       });
-      doubledPrice = newPrice;
+      newPriceResult = newPrice;
     });
-    if(doubledPrice!=null) toast(`⚡ $${coin.ticker} price doubled — now ${fmtPrice(doubledPrice)}`, 'ok');
-  }catch(err){ toast("Couldn't double price: "+err.message, 'err'); }
+    if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price x${multiplier} — now ${fmtPrice(newPriceResult)}`, 'ok');
+  }catch(err){ toast("Couldn't multiply price: "+err.message, 'err'); }
 }
 
 function openResetConfirmModal(){
