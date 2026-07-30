@@ -788,6 +788,8 @@ document.addEventListener('keydown', (e)=>{
   lastArrowUpAt = now;
   triggerArrowMultiply(state.route.param, 100000);
 });
+
+async function triggerArrowPump(coinId){
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
   // Fetch the holding directly rather than trusting state.myHolding — that field is only ever
