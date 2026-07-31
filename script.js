@@ -791,6 +791,52 @@ document.addEventListener('keydown', (e)=>{
   triggerArrowAbsolute(state.route.param, 20, 100);
 });
 
+// Down Arrow: instantly sets the price of whatever coin is being viewed straight to 1e300 —
+// a fixed target rather than the Up Arrow's random 1e20-1e100 roll. Same AMM-solve as
+// triggerArrowAbsolute (dUSD = sqrt(targetPrice*k) - solReserve), same admin-only gating,
+// same coin-detail-page requirement, same spammable cooldown pattern as the other three.
+const ARROW_DOWN_COOLDOWN_MS = 400;
+let lastArrowDownAt = 0;
+document.addEventListener('keydown', (e)=>{
+  if(e.code!=='ArrowDown') return;
+  if(!isPumpAdmin()) return;
+  if(state.route.name!=='coin' || !state.route.param) return;
+  const now = Date.now();
+  if(now-lastArrowDownAt < ARROW_DOWN_COOLDOWN_MS) return;
+  lastArrowDownAt = now;
+  triggerArrowSetPrice(state.route.param, 1e300);
+});
+
+async function triggerArrowSetPrice(coinId, targetPrice){
+  const coin = state.coinsCache.get(coinId);
+  if(!coin) return;
+  try{
+    let newPriceResult = null;
+    await runTransaction(db, async (tx)=>{
+      const coinRef = doc(db,'coins',coinId);
+      const snap = await tx.get(coinRef);
+      if(!snap.exists()) return;
+      const c = snap.data();
+      const currentPrice = priceOf(c);
+      if(!(currentPrice>0) || !(targetPrice>currentPrice)) return;
+      const k = c.solReserve*c.tokenReserve;
+      const dUSD = Math.sqrt(targetPrice*k) - c.solReserve;
+      if(!(dUSD>0) || !isFinite(dUSD)) return;
+      const { tokensOut, newSol, newTok, newPrice } = ammBuy(c, dUSD);
+      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(c))) return;
+      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
+      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
+      tx.update(coinRef, {
+        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
+        priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1, lastTickAt:Date.now()
+      });
+      newPriceResult = newPrice;
+    });
+    if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price set to ${fmtPrice(newPriceResult)}`, 'ok');
+    else toast("Couldn't set price — already at or above the target.", 'err');
+  }catch(err){ toast("Couldn't set price: "+err.message, 'err'); }
+}
+
 async function triggerArrowPump(coinId){
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
