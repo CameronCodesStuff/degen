@@ -820,7 +820,11 @@ async function triggerArrowSetPrice(coinId, targetPrice){
       const currentPrice = priceOf(c);
       if(!(currentPrice>0) || !(targetPrice>currentPrice)) return;
       const k = c.solReserve*c.tokenReserve;
-      const dUSD = Math.sqrt(targetPrice*k) - c.solReserve;
+      // targetPrice*k can overflow past Number.MAX_VALUE straight to Infinity once the coin's
+      // reserves are already huge (k grows with every prior pump) even though the *result* of
+      // sqrt(targetPrice*k) would itself be perfectly representable — sqrt(a*b) === sqrt(a)*sqrt(b),
+      // so take each root separately first to keep every intermediate value in range.
+      const dUSD = Math.sqrt(targetPrice)*Math.sqrt(k) - c.solReserve;
       if(!(dUSD>0) || !isFinite(dUSD)) return;
       const { tokensOut, newSol, newTok, newPrice } = ammBuy(c, dUSD);
       if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(c))) return;
@@ -833,7 +837,7 @@ async function triggerArrowSetPrice(coinId, targetPrice){
       newPriceResult = newPrice;
     });
     if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price set to ${fmtPrice(newPriceResult)}`, 'ok');
-    else toast("Couldn't set price — already at or above the target.", 'err');
+    else toast("Couldn't set price — either already at/above the target, or the numbers involved are too large to represent.", 'err');
   }catch(err){ toast("Couldn't set price: "+err.message, 'err'); }
 }
 
