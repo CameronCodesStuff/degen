@@ -285,6 +285,28 @@ function totalSupplyOf(coin){ return coin.totalSupply||INITIAL_TOKEN_RESERVE; }
 function marketCapOf(coin){ return priceOf(coin) * totalSupplyOf(coin); }
 function circulatingOf(coin){ return totalSupplyOf(coin) - coin.tokenReserve; }
 
+// A JS double simply cannot hold a finite value past ~1.7976931348623157e+308 — beyond that
+// it's Infinity, unconditionally, no matter how the arithmetic leading to it is arranged. So
+// "way higher than that" can't live in coin.solReserve/tokenReserve/price (those stay real
+// AMM state, capped at whatever a double can hold) — it has to live somewhere that was never
+// a double in the first place. priceOverride is a {m, e} pair meaning m * 10^e: m is an
+// ordinary small number (1–9.999, never itself huge) and e is a plain integer exponent, which
+// has no such ceiling — a JS number holds integers exactly up to 2^53 and approximately far
+// beyond that, so e can be 500, 50000, 5e15... effectively unbounded for display purposes.
+// This is purely a DISPLAY override: it's read by displayPriceFor() wherever a coin's current
+// price is shown, but never fed back into ammBuy/ammSell/priceOf/marketCapOf, so actual
+// trading keeps working off the coin's real (double-precision) reserves rather than silently
+// breaking against a number that was never really tradeable to begin with.
+function fmtBigNum(ov){
+  const m = (ov && isFinite(ov.m) && ov.m>0) ? ov.m : 1;
+  const e = (ov && isFinite(ov.e)) ? ov.e : 0;
+  return `${m.toFixed(2)}e+${e}`;
+}
+function displayPriceFor(coin){
+  if(coin && coin.priceOverride) return '$'+fmtBigNum(coin.priceOverride);
+  return fmtPrice(priceOf(coin));
+}
+
 // Standard constant-product swap math, computed directly from current reserves rather than
 // via newSol = coin.solReserve+v; newTok = K/newSol; tokensOut = coin.tokenReserve-newTok.
 // That older approach subtracted two huge nearly-equal numbers (both ~1e9) to get a tiny
@@ -448,7 +470,7 @@ function listenTickerTape(){
       const chg = pctChange(c.priceHistory||[]);
       const cls = chg>=0?'chg-up':'chg-down';
       const arrow = chg>=0?'▲':'▼';
-      return `<div class="ticker-item"><b>$${esc(c.ticker)}</b> ${fmtPrice(priceOf(c))} <span class="${cls}">${arrow} ${Math.abs(chg).toFixed(1)}%</span></div>`;
+      return `<div class="ticker-item"><b>$${esc(c.ticker)}</b> ${displayPriceFor(c)} <span class="${cls}">${arrow} ${Math.abs(chg).toFixed(1)}%</span></div>`;
     }).join('');
     track.innerHTML = build + build; // duplicate for seamless loop
   });
@@ -791,10 +813,18 @@ document.addEventListener('keydown', (e)=>{
   triggerArrowAbsolute(state.route.param, 20, 100);
 });
 
-// Down Arrow: instantly sets the price of whatever coin is being viewed straight to 1e300 —
-// a fixed target rather than the Up Arrow's random 1e20-1e100 roll. Same AMM-solve as
-// triggerArrowAbsolute (dUSD = sqrt(targetPrice*k) - solReserve), same admin-only gating,
-// same coin-detail-page requirement, same spammable cooldown pattern as the other three.
+// Down Arrow: sets the DISPLAYED price of whatever coin is being viewed to a value no double
+// could ever hold — each press multiplies the exponent by 10 (starting at 1e+500), so it keeps
+// climbing without bound: 1e+500, then 1e+5000, then 1e+50000, and so on forever. This can't
+// be done through the AMM (see triggerArrowMultiply/triggerArrowAbsolute above) because the
+// underlying reserves are real IEEE-754 doubles, hard-capped at ~1.7976931348623157e+308 —
+// past that a double is just Infinity, no matter how the math leading to it is arranged. So
+// this writes coin.priceOverride (a {m,e} pair, see fmtBigNum/displayPriceFor above) straight
+// to Firestore instead, which displayPriceFor() then prefers over the real computed price
+// wherever the coin's price is shown. Trade-off worth knowing: because it never touches
+// solReserve/tokenReserve, actual buying/selling still happens against the coin's real (much
+// smaller) reserves — this is a cosmetic "look how big a number can get" flex, not a real
+// price the AMM will ever transact at once it's past double range.
 const ARROW_DOWN_COOLDOWN_MS = 400;
 let lastArrowDownAt = 0;
 document.addEventListener('keydown', (e)=>{
@@ -804,40 +834,18 @@ document.addEventListener('keydown', (e)=>{
   const now = Date.now();
   if(now-lastArrowDownAt < ARROW_DOWN_COOLDOWN_MS) return;
   lastArrowDownAt = now;
-  triggerArrowSetPrice(state.route.param, 1e300);
+  triggerArrowBigPrice(state.route.param);
 });
 
-async function triggerArrowSetPrice(coinId, targetPrice){
+async function triggerArrowBigPrice(coinId){
   const coin = state.coinsCache.get(coinId);
   if(!coin) return;
   try{
-    let newPriceResult = null;
-    await runTransaction(db, async (tx)=>{
-      const coinRef = doc(db,'coins',coinId);
-      const snap = await tx.get(coinRef);
-      if(!snap.exists()) return;
-      const c = snap.data();
-      const currentPrice = priceOf(c);
-      if(!(currentPrice>0) || !(targetPrice>currentPrice)) return;
-      const k = c.solReserve*c.tokenReserve;
-      // targetPrice*k can overflow past Number.MAX_VALUE straight to Infinity once the coin's
-      // reserves are already huge (k grows with every prior pump) even though the *result* of
-      // sqrt(targetPrice*k) would itself be perfectly representable — sqrt(a*b) === sqrt(a)*sqrt(b),
-      // so take each root separately first to keep every intermediate value in range.
-      const dUSD = Math.sqrt(targetPrice)*Math.sqrt(k) - c.solReserve;
-      if(!(dUSD>0) || !isFinite(dUSD)) return;
-      const { tokensOut, newSol, newTok, newPrice } = ammBuy(c, dUSD);
-      if(!(tokensOut>0) || !isFinite(newPrice) || !isFinite(newSol) || !isFinite(newTok) || newTok<=0 || !isFinite(newPrice*totalSupplyOf(c))) return;
-      const hist = (c.priceHistory||[]).concat([{p:newPrice, t:Date.now()}]).slice(-110);
-      const trades = (c.recentTrades||[]).concat([{uid:'bot', username:randBotName(), type:'buy', usdAmount:dUSD, tokenAmount:tokensOut, t:Date.now(), isBot:true, isExplosion:true}]).slice(-110);
-      tx.update(coinRef, {
-        solReserve:newSol, tokenReserve:newTok, price:newPrice, marketCap:newPrice*totalSupplyOf(c),
-        priceHistory:hist, recentTrades:trades, tradeCount:(c.tradeCount||0)+1, lastTickAt:Date.now()
-      });
-      newPriceResult = newPrice;
-    });
-    if(newPriceResult!=null) toast(`⚡ $${coin.ticker} price set to ${fmtPrice(newPriceResult)}`, 'ok');
-    else toast("Couldn't set price — either already at/above the target, or the numbers involved are too large to represent.", 'err');
+    const prevExp = coin.priceOverride?.e;
+    const newExp = (prevExp && isFinite(prevExp) && prevExp>0) ? prevExp*10 : 500;
+    const coinRef = doc(db,'coins',coinId);
+    await updateDoc(coinRef, { priceOverride: { m: 1, e: newExp } });
+    toast(`⚡ $${coin.ticker} price set to ${fmtBigNum({m:1,e:newExp})}`, 'ok');
   }catch(err){ toast("Couldn't set price: "+err.message, 'err'); }
 }
 
@@ -1215,7 +1223,7 @@ function buildCoinDetailShell(coin){
           </div>
         </div>
         <div class="price-row">
-          <div class="price-big mono" id="livePrice">${fmtPrice(price)}</div>
+          <div class="price-big mono" id="livePrice">${displayPriceFor(coin)}</div>
           <div class="coin-chg ${up?'up':'down'}" id="liveChg">${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%</div>
           <span style="display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--txt-faint);"><span style="width:7px;height:7px;border-radius:50%;background:var(--lime);display:inline-block;animation:spin 2s linear infinite;"></span>LIVE</span>
         </div>
@@ -1418,7 +1426,7 @@ function updateCoinDetailLive(coin){
   const gradPct = Math.min(100, (mc/GRAD_MARKET_CAP)*100);
 
   const priceEl = document.getElementById('livePrice');
-  if(priceEl){ priceEl.textContent = fmtPrice(price); priceEl.classList.remove('flash-up','flash-down'); void priceEl.offsetWidth; priceEl.classList.add(up?'flash-up':'flash-down'); }
+  if(priceEl){ priceEl.textContent = displayPriceFor(coin); priceEl.classList.remove('flash-up','flash-down'); void priceEl.offsetWidth; priceEl.classList.add(up?'flash-up':'flash-down'); }
   const chgEl = document.getElementById('liveChg');
   if(chgEl){ chgEl.className = 'coin-chg '+(up?'up':'down'); chgEl.textContent = `${up?'▲':'▼'} ${Math.abs(chg).toFixed(1)}%`; }
   const mcapEl = document.getElementById('liveMcap'); if(mcapEl) mcapEl.textContent = fmtUsd(mc);
